@@ -34,6 +34,7 @@ export const SettingsView: React.FC = () => {
   const [rcpUrl, setRcpUrl] = useState("");
   const [rcpKey, setRcpKey] = useState("");
   const [rcpModel, setRcpModel] = useState("");
+  const [graphToken, setGraphToken] = useState("");
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
@@ -41,10 +42,16 @@ export const SettingsView: React.FC = () => {
     setRcpUrl(settings.baseUrl);
     setRcpKey(settings.apiKey);
     setRcpModel(settings.model);
+    setGraphToken(localStorage.getItem("graph_dev_token") || "");
   }, []);
 
   const handleSave = () => {
     saveRcpSettings(rcpUrl, rcpKey, rcpModel);
+    if (graphToken.trim()) {
+      localStorage.setItem("graph_dev_token", graphToken.trim());
+    } else {
+      localStorage.removeItem("graph_dev_token");
+    }
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -86,6 +93,29 @@ export const SettingsView: React.FC = () => {
             Se déconnecter
           </Button>
         )}
+      </div>
+
+      {/* Graph Dev Token */}
+      <div className={styles.section}>
+        <Text weight="semibold" size={200}>
+          Token Graph API (dev)
+        </Text>
+        <Text size={100}>
+          Collez un token depuis Graph Explorer pour tester sans Azure AD App Registration.
+          Laissez vide pour utiliser l'auth MSAL normale.
+        </Text>
+        <div className={styles.field}>
+          <Label htmlFor="graph-token" size="small">
+            Access Token
+          </Label>
+          <Input
+            id="graph-token"
+            type="password"
+            placeholder="eyJ0eXAiOiJKV1Qi..."
+            value={graphToken}
+            onChange={(_, data) => setGraphToken(data.value)}
+          />
+        </div>
       </div>
 
       {/* RCP API settings */}

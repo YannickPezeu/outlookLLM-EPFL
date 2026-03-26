@@ -9,15 +9,15 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import {
-  PeopleChat24Regular,
+  CalendarLtr24Regular,
   Mail24Regular,
-  FolderArrowRight24Regular,
+  PeopleChat24Regular,
   Settings24Regular,
 } from "@fluentui/react-icons";
 import { initAuth, isAuthenticated, getAccount } from "../services/authService";
-import { InteractionsView } from "../components/InteractionsView";
+import { MeetingPrepView } from "../components/MeetingPrepView";
 import { SummarizeView } from "../components/SummarizeView";
-import { OrganizeView } from "../components/OrganizeView";
+import { InteractionsView } from "../components/InteractionsView";
 import { SettingsView } from "../components/SettingsView";
 
 const useStyles = makeStyles({
@@ -51,11 +51,11 @@ const useStyles = makeStyles({
   },
 });
 
-type TabType = "interactions" | "summarize" | "organize" | "settings";
+type TabType = "meeting" | "summarize" | "interactions" | "settings";
 
 export const App: React.FC = () => {
   const styles = useStyles();
-  const [activeTab, setActiveTab] = useState<TabType>("interactions");
+  const [activeTab, setActiveTab] = useState<TabType>("meeting");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -92,14 +92,14 @@ export const App: React.FC = () => {
           onTabSelect={(_, data) => setActiveTab(data.value as TabType)}
           size="small"
         >
-          <Tab value="interactions" icon={<PeopleChat24Regular />}>
-            Interactions
+          <Tab value="meeting" icon={<CalendarLtr24Regular />}>
+            Réunion
           </Tab>
           <Tab value="summarize" icon={<Mail24Regular />}>
             Résumé
           </Tab>
-          <Tab value="organize" icon={<FolderArrowRight24Regular />}>
-            Organiser
+          <Tab value="interactions" icon={<PeopleChat24Regular />}>
+            Interactions
           </Tab>
           <Tab value="settings" icon={<Settings24Regular />}>
             Config
@@ -114,9 +114,9 @@ export const App: React.FC = () => {
           </MessageBar>
         )}
 
-        {activeTab === "interactions" && <InteractionsView />}
+        {activeTab === "meeting" && <MeetingPrepView />}
         {activeTab === "summarize" && <SummarizeView />}
-        {activeTab === "organize" && <OrganizeView />}
+        {activeTab === "interactions" && <InteractionsView />}
         {activeTab === "settings" && <SettingsView />}
       </div>
     </div>

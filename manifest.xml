@@ -12,7 +12,7 @@
   <ProviderName>EPFL</ProviderName>
   <DefaultLocale>fr-FR</DefaultLocale>
   <DisplayName DefaultValue="EPFL Mail AI" />
-  <Description DefaultValue="Résumé et organisation des emails avec l'IA - Propulsé par RCP EPFL" />
+  <Description DefaultValue="Préparation de réunions et résumé d'emails avec l'IA - Propulsé par RCP EPFL" />
   <IconUrl DefaultValue="https://localhost:3000/assets/icon-64.png" />
   <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/icon-128.png" />
   <SupportUrl DefaultValue="https://github.com/your-org/outlookLLM-EPFL" />
@@ -37,12 +37,12 @@
     </Form>
   </FormSettings>
 
-  <!-- ReadWriteMailbox: highest permission, allows folder creation and mail moves -->
-  <Permissions>ReadWriteMailbox</Permissions>
+  <!-- ReadWriteItem needed for AppointmentOrganizerCommandSurface extension point -->
+  <Permissions>ReadWriteItem</Permissions>
 
   <Rule xsi:type="RuleCollection" Mode="Or">
     <Rule xsi:type="ItemIs" ItemType="Message" FormType="Read" />
-    <Rule xsi:type="ItemIs" ItemType="Message" FormType="Edit" />
+    <Rule xsi:type="ItemIs" ItemType="Appointment" FormType="Read" />
   </Rule>
 
   <DisableEntityHighlighting>false</DisableEntityHighlighting>
@@ -81,12 +81,36 @@
             </OfficeTab>
           </ExtensionPoint>
 
-          <!-- Extension point: also available in compose mode -->
-          <ExtensionPoint xsi:type="MessageComposeCommandSurface">
+          <!-- Extension point: calendar event — when user is an attendee -->
+          <ExtensionPoint xsi:type="AppointmentAttendeeCommandSurface">
             <OfficeTab id="TabDefault">
-              <Group id="epflMailAiComposeGroup">
+              <Group id="epflMailAiAttendeeGroup">
                 <Label resid="GroupLabel" />
-                <Control xsi:type="Button" id="openTaskPaneComposeBtn">
+                <Control xsi:type="Button" id="openTaskPaneAttendeeBtn">
+                  <Label resid="TaskPaneBtn.Label" />
+                  <Supertip>
+                    <Title resid="TaskPaneBtn.Label" />
+                    <Description resid="TaskPaneBtn.Tooltip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon.16x16" />
+                    <bt:Image size="32" resid="Icon.32x32" />
+                    <bt:Image size="80" resid="Icon.80x80" />
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <SourceLocation resid="TaskPane.Url" />
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+
+          <!-- Extension point: calendar event — when user is the organizer -->
+          <ExtensionPoint xsi:type="AppointmentOrganizerCommandSurface">
+            <OfficeTab id="TabDefault">
+              <Group id="epflMailAiOrganizerGroup">
+                <Label resid="GroupLabel" />
+                <Control xsi:type="Button" id="openTaskPaneOrganizerBtn">
                   <Label resid="TaskPaneBtn.Label" />
                   <Supertip>
                     <Title resid="TaskPaneBtn.Label" />
@@ -122,7 +146,7 @@
         <bt:String id="TaskPaneBtn.Label" DefaultValue="EPFL Mail AI" />
       </bt:ShortStrings>
       <bt:LongStrings>
-        <bt:String id="TaskPaneBtn.Tooltip" DefaultValue="Ouvrir l'assistant IA pour résumer et organiser vos emails" />
+        <bt:String id="TaskPaneBtn.Tooltip" DefaultValue="Ouvrir l'assistant IA pour préparer vos réunions et résumer vos emails" />
       </bt:LongStrings>
     </Resources>
   </VersionOverrides>

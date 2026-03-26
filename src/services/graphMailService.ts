@@ -16,6 +16,18 @@ export interface EmailMessage {
   sentDateTime?: string;
   parentFolderId: string;
   isRead: boolean;
+  hasAttachments?: boolean;
+  attachmentTexts?: Array<{ name: string; text: string }>;
+}
+
+export interface GraphAttachment {
+  id: string;
+  name: string;
+  contentType: string;
+  size: number;
+  isInline: boolean;
+  contentBytes?: string;
+  "@odata.type"?: string;
 }
 
 export interface MailFolder {
@@ -25,6 +37,34 @@ export interface MailFolder {
   childFolderCount: number;
   totalItemCount: number;
   unreadItemCount: number;
+}
+
+export interface LightEmail {
+  id: string;
+  subject: string;
+  bodyPreview: string;
+  from?: { emailAddress: { name: string; address: string } };
+  toRecipients?: Array<{ emailAddress: { name: string; address: string } }>;
+  receivedDateTime: string;
+  conversationId: string;
+}
+
+export interface CalendarEvent {
+  id: string;
+  subject: string;
+  body?: { contentType: string; content: string };
+  bodyPreview: string;
+  start: { dateTime: string; timeZone: string };
+  end: { dateTime: string; timeZone: string };
+  location?: { displayName: string };
+  attendees: Array<{
+    emailAddress: { name: string; address: string };
+    type: string;
+    status?: { response: string };
+  }>;
+  isOrganizer: boolean;
+  organizer?: { emailAddress: { name: string; address: string } };
+  seriesMasterId?: string;
 }
 
 interface GraphPagedResponse<T> {
@@ -78,9 +118,8 @@ export async function searchEmailsFromSender(
   senderEmail: string,
   maxResults = config.defaults.maxEmailsToFetch
 ): Promise<EmailMessage[]> {
-  const filter = encodeURIComponent(`from/emailAddress/address eq '${senderEmail}'`);
   const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead";
-  const url = `${GRAPH}/me/messages?$filter=${filter}&$select=${select}&$orderby=receivedDateTime desc&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
 
   return fetchAllPages<EmailMessage>(url, maxResults);
 }
@@ -93,7 +132,7 @@ export async function searchEmailsSentTo(
   maxResults = config.defaults.maxEmailsToFetch
 ): Promise<EmailMessage[]> {
   // Use $search for sent items (OData $filter on toRecipients is limited)
-  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId&$orderby=sentDateTime desc&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId&$top=${Math.min(maxResults, 50)}`;
 
   return fetchAllPages<EmailMessage>(url, maxResults);
 }
@@ -160,6 +199,111 @@ export async function moveMessage(messageId: string, destinationFolderId: string
  * Get a single email by ID with full body.
  */
 export async function getEmail(messageId: string): Promise<EmailMessage> {
-  const url = `${GRAPH}/me/messages/${messageId}?$select=id,subject,body,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,parentFolderId,isRead`;
+  const url = `${GRAPH}/me/messages/${messageId}?$select=id,subject,body,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,parentFolderId,isRead,hasAttachments`;
   return graphFetch<EmailMessage>(url);
+}
+
+/**
+ * Get attachments for a message (file attachments only, max 5MB).
+ */
+export async function getMessageAttachments(messageId: string): Promise<GraphAttachment[]> {
+  const url = `${GRAPH}/me/messages/${messageId}/attachments`;
+  const response = await graphFetch<{ value: GraphAttachment[] }>(url);
+  return response.value;
+}
+
+// ─── Calendar ───────────────────────────────────────────────────────
+
+/**
+ * Get a single calendar event by ID.
+ */
+export async function getCalendarEvent(eventId: string): Promise<CalendarEvent> {
+  const url = `${GRAPH}/me/events/${eventId}?$select=id,subject,body,bodyPreview,start,end,location,attendees,isOrganizer,organizer,seriesMasterId`;
+  return graphFetch<CalendarEvent>(url);
+}
+
+/**
+ * Get calendar events in a time range.
+ */
+export async function getCalendarView(
+  startDateTime: string,
+  endDateTime: string,
+  maxResults = 50
+): Promise<CalendarEvent[]> {
+  const url = `${GRAPH}/me/calendarView?startDateTime=${startDateTime}&endDateTime=${endDateTime}&$select=id,subject,bodyPreview,start,end,attendees,isOrganizer,organizer,seriesMasterId&$orderby=start/dateTime desc&$top=${Math.min(maxResults, 50)}`;
+  return fetchAllPages<CalendarEvent>(url, maxResults);
+}
+
+// ─── Light Email Search (for embedding pipeline) ────────────────────
+
+/**
+ * Search emails FROM a sender — light fields only (no body, for embedding phase).
+ * Uses conversationId for deduplication.
+ */
+export async function searchEmailsFromSenderLight(
+  senderEmail: string,
+  maxResults = config.defaults.maxEmailsPerParticipant
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
+
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+/**
+ * Search emails SENT TO a recipient — light fields only.
+ */
+export async function searchEmailsSentToLight(
+  recipientEmail: string,
+  maxResults = config.defaults.maxEmailsPerParticipant
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,toRecipients,receivedDateTime,conversationId";
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
+
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+/**
+ * Collect all light emails exchanged with a participant, deduplicated by conversationId.
+ * Keeps only the most recent email per conversation thread.
+ */
+export async function collectEmailsWithParticipant(
+  email: string,
+  maxPerDirection = config.defaults.maxEmailsPerParticipant
+): Promise<LightEmail[]> {
+  const received = await searchEmailsFromSenderLight(email, maxPerDirection);
+  const sent = await searchEmailsSentToLight(email, maxPerDirection);
+
+  // Deduplicate by conversationId — keep most recent per thread
+  const byConversation = new Map<string, LightEmail>();
+  const allEmails = [...received, ...sent].sort(
+    (a, b) => new Date(b.receivedDateTime).getTime() - new Date(a.receivedDateTime).getTime()
+  );
+
+  for (const email of allEmails) {
+    if (!byConversation.has(email.conversationId)) {
+      byConversation.set(email.conversationId, email);
+    }
+  }
+
+  return Array.from(byConversation.values());
+}
+
+/**
+ * Get multiple emails by ID with full body (for the final reading phase).
+ * Parallelized with concurrency limit.
+ */
+export async function getEmailsBatch(
+  messageIds: string[],
+  concurrency = 2
+): Promise<EmailMessage[]> {
+  const results: EmailMessage[] = [];
+
+  for (let i = 0; i < messageIds.length; i += concurrency) {
+    const batch = messageIds.slice(i, i + concurrency);
+    const batchResults = await Promise.all(batch.map((id) => getEmail(id)));
+    results.push(...batchResults);
+  }
+
+  return results;
 }

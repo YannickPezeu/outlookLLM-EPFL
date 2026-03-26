@@ -55,8 +55,15 @@ export function getAccount(): AccountInfo | null {
 
 /**
  * Acquire a Graph API access token silently, with interactive fallback.
+ * In dev mode, uses a manually pasted Graph Explorer token from localStorage.
  */
 export async function getGraphToken(): Promise<string> {
+  // Dev mode: use manually pasted token (from Graph Explorer)
+  const devToken = localStorage.getItem("graph_dev_token");
+  if (devToken) {
+    return devToken;
+  }
+
   if (!msalInstance) {
     await initAuth();
   }

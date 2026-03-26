@@ -1,6 +1,8 @@
 const path = require("path");
+const webpack = require("webpack");
 const HtmlWebpackPlugin = require("html-webpack-plugin");
 const CopyWebpackPlugin = require("copy-webpack-plugin");
+require("dotenv").config();
 
 module.exports = async (env, argv) => {
   const isDev = argv.mode === "development";
@@ -25,6 +27,7 @@ module.exports = async (env, argv) => {
   const config = {
     entry: {
       taskpane: "./src/taskpane/index.tsx",
+      test: "./src/test/index.tsx",
     },
     output: {
       path: path.resolve(__dirname, "dist"),
@@ -46,6 +49,13 @@ module.exports = async (env, argv) => {
           test: /\.css$/,
           use: ["style-loader", "css-loader"],
         },
+        {
+          // react-markdown v10+ and dependencies are ESM-only
+          test: /\.js$/,
+          resolve: { fullySpecified: false },
+          include: /node_modules/,
+          type: "javascript/auto",
+        },
       ],
     },
     plugins: [
@@ -54,11 +64,20 @@ module.exports = async (env, argv) => {
         filename: "taskpane.html",
         chunks: ["taskpane"],
       }),
+      new HtmlWebpackPlugin({
+        template: "./src/test/test.html",
+        filename: "test.html",
+        chunks: ["test"],
+      }),
       new CopyWebpackPlugin({
         patterns: [
           { from: "assets", to: "assets", noErrorOnMissing: true },
           { from: "manifest.xml", to: "manifest.xml" },
         ],
+      }),
+      new webpack.DefinePlugin({
+        "process.env.ENTRA_CLIENT_ID": JSON.stringify(process.env.ENTRA_CLIENT_ID || ""),
+        "process.env.ENTRA_TENANT_ID": JSON.stringify(process.env.ENTRA_TENANT_ID || ""),
       }),
     ],
     devServer: {

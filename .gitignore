@@ -6,3 +6,6 @@ dist/
 .DS_Store
 Thumbs.db
 .claude/
+.venv/
+data/
+ADMIN_REQUEST.pdf
