@@ -9,12 +9,14 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import {
+  Bot24Regular,
   CalendarLtr24Regular,
   Mail24Regular,
   PeopleChat24Regular,
   Settings24Regular,
 } from "@fluentui/react-icons";
 import { initAuth, isAuthenticated, getAccount } from "../services/authService";
+import { AssistantView } from "../components/AssistantView";
 import { MeetingPrepView } from "../components/MeetingPrepView";
 import { SummarizeView } from "../components/SummarizeView";
 import { InteractionsView } from "../components/InteractionsView";
@@ -51,11 +53,11 @@ const useStyles = makeStyles({
   },
 });
 
-type TabType = "meeting" | "summarize" | "interactions" | "settings";
+type TabType = "assistant" | "meeting" | "summarize" | "interactions" | "settings";
 
 export const App: React.FC = () => {
   const styles = useStyles();
-  const [activeTab, setActiveTab] = useState<TabType>("meeting");
+  const [activeTab, setActiveTab] = useState<TabType>("assistant");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -92,6 +94,9 @@ export const App: React.FC = () => {
           onTabSelect={(_, data) => setActiveTab(data.value as TabType)}
           size="small"
         >
+          <Tab value="assistant" icon={<Bot24Regular />}>
+            Assistant
+          </Tab>
           <Tab value="meeting" icon={<CalendarLtr24Regular />}>
             Réunion
           </Tab>
@@ -114,6 +119,7 @@ export const App: React.FC = () => {
           </MessageBar>
         )}
 
+        {activeTab === "assistant" && <AssistantView />}
         {activeTab === "meeting" && <MeetingPrepView />}
         {activeTab === "summarize" && <SummarizeView />}
         {activeTab === "interactions" && <InteractionsView />}

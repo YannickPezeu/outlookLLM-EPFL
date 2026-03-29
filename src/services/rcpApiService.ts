@@ -7,10 +7,45 @@ export interface ChatMessage {
   content: string;
 }
 
+// Extended message type for agent loop (supports tool calling)
+export interface AgentMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string; // required when role === "tool"
+}
+
+export interface ToolDefinition {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>; // JSON Schema
+  };
+}
+
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
 export interface ChatCompletionResponse {
   id: string;
   choices: Array<{
     message: { role: string; content: string; reasoning_content?: string };
+    finish_reason: string;
+  }>;
+}
+
+export interface ToolCallResponse {
+  id: string;
+  choices: Array<{
+    message: {
+      role: string;
+      content: string | null;
+      tool_calls?: ToolCall[];
+    };
     finish_reason: string;
   }>;
 }
@@ -154,6 +189,65 @@ export async function chatCompletionStream(
   }
 
   return fullText;
+}
+
+/**
+ * Send a chat completion request with tool definitions (for agent loop).
+ * Non-streaming — we need to parse tool_calls from the response.
+ */
+export async function chatCompletionWithTools(
+  messages: AgentMessage[],
+  tools: ToolDefinition[],
+  model?: string
+): Promise<ToolCallResponse> {
+  const cfg = getRcpConfig();
+
+  if (!cfg.apiKey) {
+    throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
+  }
+
+  const body: Record<string, unknown> = {
+    model: model || cfg.model,
+    messages,
+    temperature: 0.3,
+    max_tokens: 2048,
+    stream: false,
+  };
+
+  if (tools.length > 0) {
+    body.tools = tools;
+    body.tool_choice = "auto";
+  }
+
+  console.log("[RCP] Tool-calling request, tools:", tools.map((t) => t.function.name));
+
+  const response = await fetch(`${cfg.baseUrl}${config.rcp.completionsEndpoint}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${cfg.apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`RCP API error ${response.status}: ${errorText}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Streaming chat completion that accepts AgentMessage[] (for final agent response).
+ */
+export async function chatCompletionStreamAgent(
+  messages: AgentMessage[],
+  onChunk: (text: string) => void,
+  model?: string
+): Promise<string> {
+  // Reuse the existing streaming logic by casting — AgentMessage is a superset of ChatMessage
+  return chatCompletionStream(messages as ChatMessage[], onChunk, model);
 }
 
 // ─── High-level functions ────────────────────────────────────────────

@@ -307,3 +307,149 @@ export async function getEmailsBatch(
 
   return results;
 }
+
+// ─── Contact & Full-text Search (for agent) ─────────────────────────
+
+/**
+ * Search for contacts by name using Graph $search on messages.
+ * Looks in both received and sent emails, deduplicates by email address.
+ * Handles partial names, missing accents, etc. (Graph search is fuzzy).
+ * Falls back to general search if from:/to: returns nothing.
+ */
+export async function searchContactsByName(
+  query: string
+): Promise<Array<{ name: string; email: string }>> {
+  const encodedQuery = encodeURIComponent(query);
+  const select = "from";
+
+  // Strategy 1: search from: and to: fields
+  const receivedUrl = `${GRAPH}/me/messages?$search="from:${encodedQuery}"&$select=${select}&$top=30`;
+  const sentUrl = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${encodedQuery}"&$select=toRecipients&$top=30`;
+
+  console.log(`[searchContacts] Searching for "${query}" (encoded: ${encodedQuery})`);
+  console.log(`[searchContacts] Received URL: ${receivedUrl}`);
+  console.log(`[searchContacts] Sent URL: ${sentUrl}`);
+
+  const [received, sent] = await Promise.all([
+    graphFetch<GraphPagedResponse<EmailMessage>>(receivedUrl).catch((err) => {
+      console.warn(`[searchContacts] from: search failed:`, err.message);
+      return { value: [] as EmailMessage[] };
+    }),
+    graphFetch<GraphPagedResponse<EmailMessage>>(sentUrl).catch((err) => {
+      console.warn(`[searchContacts] to: search failed:`, err.message);
+      return { value: [] as EmailMessage[] };
+    }),
+  ]);
+
+  console.log(`[searchContacts] from: returned ${received.value.length} messages, to: returned ${sent.value.length} messages`);
+
+  // Extract unique contacts by email (case-insensitive)
+  const seen = new Map<string, { name: string; email: string; count: number }>();
+
+  for (const msg of received.value) {
+    if (msg.from?.emailAddress) {
+      const addr = msg.from.emailAddress.address.toLowerCase();
+      const existing = seen.get(addr);
+      if (existing) {
+        existing.count++;
+      } else {
+        seen.set(addr, {
+          name: msg.from.emailAddress.name,
+          email: msg.from.emailAddress.address,
+          count: 1,
+        });
+      }
+    }
+  }
+
+  for (const msg of sent.value) {
+    for (const recipient of msg.toRecipients || []) {
+      const addr = recipient.emailAddress.address.toLowerCase();
+      const existing = seen.get(addr);
+      if (existing) {
+        existing.count++;
+      } else {
+        seen.set(addr, {
+          name: recipient.emailAddress.name,
+          email: recipient.emailAddress.address,
+          count: 1,
+        });
+      }
+    }
+  }
+
+  // Strategy 2: if no results, fallback to general search and extract contacts
+  if (seen.size === 0) {
+    console.log(`[searchContacts] No results from from:/to:, trying general search`);
+    const fallbackUrl = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=from,toRecipients&$top=30`;
+    console.log(`[searchContacts] Fallback URL: ${fallbackUrl}`);
+
+    try {
+      const fallback = await graphFetch<GraphPagedResponse<EmailMessage>>(fallbackUrl);
+      console.log(`[searchContacts] Fallback returned ${fallback.value.length} messages`);
+
+      for (const msg of fallback.value) {
+        // Check from field
+        if (msg.from?.emailAddress) {
+          const fromName = msg.from.emailAddress.name?.toLowerCase() || "";
+          const fromAddr = msg.from.emailAddress.address?.toLowerCase() || "";
+          if (fromName.includes(query.toLowerCase()) || fromAddr.includes(query.toLowerCase())) {
+            const addr = msg.from.emailAddress.address.toLowerCase();
+            const existing = seen.get(addr);
+            if (existing) {
+              existing.count++;
+            } else {
+              seen.set(addr, {
+                name: msg.from.emailAddress.name,
+                email: msg.from.emailAddress.address,
+                count: 1,
+              });
+            }
+          }
+        }
+        // Check toRecipients
+        for (const recipient of msg.toRecipients || []) {
+          const rName = recipient.emailAddress.name?.toLowerCase() || "";
+          const rAddr = recipient.emailAddress.address?.toLowerCase() || "";
+          if (rName.includes(query.toLowerCase()) || rAddr.includes(query.toLowerCase())) {
+            const addr = recipient.emailAddress.address.toLowerCase();
+            const existing = seen.get(addr);
+            if (existing) {
+              existing.count++;
+            } else {
+              seen.set(addr, {
+                name: recipient.emailAddress.name,
+                email: recipient.emailAddress.address,
+                count: 1,
+              });
+            }
+          }
+        }
+      }
+      console.log(`[searchContacts] Fallback extracted ${seen.size} unique contacts`);
+    } catch (err) {
+      console.warn(`[searchContacts] Fallback search also failed:`, (err as Error).message);
+    }
+  }
+
+  const results = Array.from(seen.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10)
+    .map(({ name, email }) => ({ name, email }));
+
+  console.log(`[searchContacts] Final results:`, results);
+  return results;
+}
+
+/**
+ * Full-text search across all messages.
+ */
+export async function searchEmails(
+  query: string,
+  maxResults = 20
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+  const encodedQuery = encodeURIComponent(query);
+  const url = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
