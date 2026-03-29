@@ -13,8 +13,8 @@
   <DefaultLocale>fr-FR</DefaultLocale>
   <DisplayName DefaultValue="EPFL Mail AI" />
   <Description DefaultValue="Préparation de réunions et résumé d'emails avec l'IA - Propulsé par RCP EPFL" />
-  <IconUrl DefaultValue="https://yannickpezeu.github.io/outlookLLM-EPFL/assets/icon-64.png" />
-  <HighResolutionIconUrl DefaultValue="https://yannickpezeu.github.io/outlookLLM-EPFL/assets/icon-128.png" />
+  <IconUrl DefaultValue="https://localhost:3000/assets/icon-64.png" />
+  <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/icon-128.png" />
   <SupportUrl DefaultValue="https://github.com/YannickPezeu/outlookLLM-EPFL" />
   <!-- END: Add-in metadata -->
 
@@ -31,7 +31,7 @@
   <FormSettings>
     <Form xsi:type="ItemRead">
       <DesktopSettings>
-        <SourceLocation DefaultValue="https://yannickpezeu.github.io/outlookLLM-EPFL/taskpane.html" />
+        <SourceLocation DefaultValue="https://localhost:3000/taskpane.html" />
         <RequestedHeight>450</RequestedHeight>
       </DesktopSettings>
     </Form>
@@ -137,12 +137,12 @@
 
     <Resources>
       <bt:Images>
-        <bt:Image id="Icon.16x16" DefaultValue="https://yannickpezeu.github.io/outlookLLM-EPFL/assets/icon-16.png" />
-        <bt:Image id="Icon.32x32" DefaultValue="https://yannickpezeu.github.io/outlookLLM-EPFL/assets/icon-32.png" />
-        <bt:Image id="Icon.80x80" DefaultValue="https://yannickpezeu.github.io/outlookLLM-EPFL/assets/icon-80.png" />
+        <bt:Image id="Icon.16x16" DefaultValue="https://localhost:3000/assets/icon-16.png" />
+        <bt:Image id="Icon.32x32" DefaultValue="https://localhost:3000/assets/icon-32.png" />
+        <bt:Image id="Icon.80x80" DefaultValue="https://localhost:3000/assets/icon-80.png" />
       </bt:Images>
       <bt:Urls>
-        <bt:Url id="TaskPane.Url" DefaultValue="https://yannickpezeu.github.io/outlookLLM-EPFL/taskpane.html" />
+        <bt:Url id="TaskPane.Url" DefaultValue="https://localhost:3000/taskpane.html" />
       </bt:Urls>
       <bt:ShortStrings>
         <bt:String id="GroupLabel" DefaultValue="EPFL Mail AI" />
