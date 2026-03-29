@@ -16,6 +16,16 @@ export type StreamCallback = (chunk: string) => void;
 
 export type LogCallback = (message: string) => void;
 
+export interface EmailListItem {
+  id: string;
+  subject: string;
+  date: string;
+  from: string;
+  direction: "received" | "sent";
+}
+
+export type EmailListCallback = (name: string, emails: EmailListItem[]) => void;
+
 // ─── System Prompt ──────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Tu es un assistant intelligent intégré dans Outlook pour les collaborateurs EPFL.
@@ -27,9 +37,10 @@ Règles importantes :
 - Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Ne demande confirmation que si tu hésites vraiment entre deux contacts plausibles.
 - Si search_contacts ne retourne aucun résultat pertinent, utilise search_contacts_in_servicedesk pour chercher dans les tickets ServiceNow (certains échanges passent par le ServiceDesk et le vrai nom de la personne n'apparaît que dans le corps du mail).
 - Si aucun outil ne trouve le contact, dis-le à l'utilisateur et suggère de reformuler.
+- Quand l'utilisateur veut VOIR, MONTRER ou AFFICHER ses emails avec quelqu'un, utilise show_emails (pas summarize_email_interactions). Quand il veut un RÉSUMÉ, utilise summarize_email_interactions.
 - Réponds toujours en français.
 - Sois concis et structuré dans tes réponses.
-- Utilise le format Markdown pour structurer tes réponses (listes, titres, gras).`;
+- Utilise le format Markdown pour structurer tes réponses. Quand show_emails retourne un lien, inclus-le en Markdown cliquable.`;
 
 const MAX_ITERATIONS = 8;
 
@@ -44,7 +55,8 @@ export async function runAgent(
   conversationHistory: AgentMessage[],
   onToolProgress: ToolProgressCallback,
   onStream: StreamCallback,
-  onLog?: LogCallback
+  onLog?: LogCallback,
+  onEmailList?: EmailListCallback
 ): Promise<{ response: string; updatedHistory: AgentMessage[] }> {
   const log = (msg: string) => {
     console.log(`[Agent] ${msg}`);
@@ -135,6 +147,16 @@ export async function runAgent(
           const result = await executeTool(toolName, args, onLog);
           log(`Tool ${toolName} OK — résultat: ${result.slice(0, 200)}${result.length > 200 ? '...' : ''}`);
           onToolProgress(toolName, "done");
+
+          // Intercept show_emails to push email list to UI
+          if (toolName === "show_emails" && onEmailList) {
+            try {
+              const parsed = JSON.parse(result);
+              if (parsed.type === "email_list" && parsed.emails) {
+                onEmailList(parsed.name, parsed.emails);
+              }
+            } catch { /* ignore parse errors */ }
+          }
 
           // Add tool result to conversation
           messages.push({

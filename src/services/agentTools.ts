@@ -148,6 +148,30 @@ export const AGENT_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "show_emails",
+      description:
+        "Ouvre la recherche Outlook filtrée dans un nouvel onglet pour afficher les emails d'un contact. " +
+        "Utiliser quand l'utilisateur veut VOIR/AFFICHER/MONTRER ses échanges (pas les résumer). " +
+        "Retourne un lien cliquable que l'utilisateur peut ouvrir.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Le nom complet du contact",
+          },
+          email: {
+            type: "string",
+            description: "L'adresse email du contact",
+          },
+        },
+        required: ["name", "email"],
+      },
+    },
+  },
 ];
 
 // ─── Tool Executors ─────────────────────────────────────────────────
@@ -306,6 +330,51 @@ const executors: Record<string, ToolExecutor> = {
     }));
 
     return JSON.stringify({ results, count: emails.length });
+  },
+
+  async show_emails(args, log) {
+    const name = args.name as string;
+    const email = args.email as string;
+
+    const [{ received, sent }, serviceDeskEmails] = await Promise.all([
+      email ? getAllInteractions(email) : Promise.resolve({ received: [], sent: [] }),
+      getServiceDeskEmailsForPerson(name),
+    ]);
+
+    // Build a unified list sorted by date
+    const allEmails = [
+      ...received.map((e) => ({
+        id: e.id,
+        subject: e.subject,
+        date: e.receivedDateTime,
+        from: e.from?.emailAddress?.name || e.from?.emailAddress?.address || "?",
+        direction: "received" as const,
+      })),
+      ...sent.map((e) => ({
+        id: e.id,
+        subject: e.subject,
+        date: e.sentDateTime || e.receivedDateTime,
+        from: "Moi",
+        direction: "sent" as const,
+      })),
+      ...serviceDeskEmails.map((e) => ({
+        id: e.id,
+        subject: `[ServiceNow] ${e.subject}`,
+        date: e.receivedDateTime,
+        from: "ServiceDesk",
+        direction: "received" as const,
+      })),
+    ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    log(`show_emails: ${allEmails.length} emails (${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk)`);
+
+    return JSON.stringify({
+      type: "email_list",
+      name,
+      email,
+      emails: allEmails,
+      count: allEmails.length,
+    });
   },
 
   async search_contacts_in_servicedesk(args, _log) {

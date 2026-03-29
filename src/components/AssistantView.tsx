@@ -10,18 +10,24 @@ import {
   Badge,
 } from "@fluentui/react-components";
 import { Send24Regular, Bot24Regular, Info24Regular } from "@fluentui/react-icons";
-import { runAgent, type ToolProgressCallback, type StreamCallback, type LogCallback } from "../services/agentService";
+import { runAgent, type ToolProgressCallback, type StreamCallback, type LogCallback, type EmailListCallback, type EmailListItem } from "../services/agentService";
+import { Mail24Regular } from "@fluentui/react-icons";
 import { type AgentMessage } from "../services/rcpApiService";
 
 // ─── Markdown config ────────────────────────────────────────────────
 
-marked.setOptions({ breaks: true, gfm: true });
+const renderer = new marked.Renderer();
+renderer.link = ({ href, text }: { href: string; text: string }) => {
+  return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+};
+marked.setOptions({ breaks: true, gfm: true, renderer });
 
 // ─── Types ──────────────────────────────────────────────────────────
 
 interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  emailList?: { name: string; emails: EmailListItem[] };
 }
 
 interface ToolProgress {
@@ -129,6 +135,47 @@ const useStyles = makeStyles({
     padding: "4px 0",
     userSelect: "none",
   },
+  emailList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "2px",
+    maxHeight: "300px",
+    overflow: "auto",
+    alignSelf: "flex-start",
+    width: "100%",
+  },
+  emailItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "6px 10px",
+    borderRadius: tokens.borderRadiusMedium,
+    backgroundColor: tokens.colorNeutralBackground2,
+    cursor: "pointer",
+    fontSize: tokens.fontSizeBase200,
+    lineHeight: tokens.lineHeightBase200,
+    "&:hover": {
+      backgroundColor: tokens.colorNeutralBackground2Hover,
+    },
+  },
+  emailItemIcon: {
+    flexShrink: 0,
+    color: tokens.colorNeutralForeground3,
+  },
+  emailItemContent: {
+    flex: 1,
+    overflow: "hidden",
+  },
+  emailItemSubject: {
+    fontWeight: tokens.fontWeightSemibold,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  emailItemMeta: {
+    fontSize: tokens.fontSizeBase100,
+    color: tokens.colorNeutralForeground3,
+  },
   logPanel: {
     maxHeight: "150px",
     overflow: "auto",
@@ -151,6 +198,7 @@ const TOOL_LABELS: Record<string, string> = {
   summarize_email_interactions: "Résumé des échanges",
   get_calendar_events: "Consultation du calendrier",
   search_emails: "Recherche dans les emails",
+  show_emails: "Affichage des emails",
 };
 
 // ─── Markdown renderer ──────────────────────────────────────────────
@@ -193,6 +241,7 @@ export const AssistantView: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
   const conversationRef = useRef<AgentMessage[]>([]);
+  const pendingEmailListRef = useRef<{ name: string; emails: EmailListItem[] } | null>(null);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -231,17 +280,24 @@ export const AssistantView: React.FC = () => {
       setLogs((prev) => [...prev, `${timestamp} ${message}`]);
     };
 
+    const onEmailList: EmailListCallback = (name, emails) => {
+      pendingEmailListRef.current = { name, emails };
+    };
+
     try {
       const { response, updatedHistory } = await runAgent(
         text,
         conversationRef.current,
         onToolProgress,
         onStream,
-        onLog
+        onLog,
+        onEmailList
       );
 
       conversationRef.current = updatedHistory;
-      setMessages((prev) => [...prev, { role: "assistant", content: response }]);
+      const emailList = pendingEmailListRef.current;
+      pendingEmailListRef.current = null;
+      setMessages((prev) => [...prev, { role: "assistant", content: response, emailList: emailList || undefined }]);
       setStreamingContent("");
       setToolProgress([]);
     } catch (err: any) {
@@ -257,6 +313,20 @@ export const AssistantView: React.FC = () => {
 
   const handleSuggestion = (suggestion: string) => {
     setInput(suggestion);
+  };
+
+  const handleEmailClick = (emailId: string) => {
+    try {
+      // Office.js API to open an email in Outlook
+      const mailbox = (window as any).Office?.context?.mailbox;
+      if (mailbox?.displayMessageForm) {
+        mailbox.displayMessageForm(emailId);
+      } else {
+        console.warn("[AssistantView] Office.context.mailbox.displayMessageForm not available");
+      }
+    } catch (err) {
+      console.error("[AssistantView] Error opening email:", err);
+    }
   };
 
   const isEmpty = messages.length === 0;
@@ -286,7 +356,36 @@ export const AssistantView: React.FC = () => {
             {msg.role === "user" ? (
               <div className={styles.userBubble}>{msg.content}</div>
             ) : (
-              <MarkdownContent content={msg.content} className={styles.assistantBubble} />
+              <>
+                {msg.content && (
+                  <MarkdownContent content={msg.content} className={styles.assistantBubble} />
+                )}
+                {msg.emailList && (
+                  <div className={styles.emailList}>
+                    {msg.emailList.emails.map((email, j) => (
+                      <div
+                        key={j}
+                        className={styles.emailItem}
+                        onClick={() => handleEmailClick(email.id)}
+                      >
+                        <span className={styles.emailItemIcon}>
+                          {email.direction === "sent" ? (
+                            <Send24Regular style={{ fontSize: "16px" }} />
+                          ) : (
+                            <Mail24Regular style={{ fontSize: "16px" }} />
+                          )}
+                        </span>
+                        <div className={styles.emailItemContent}>
+                          <div className={styles.emailItemSubject}>{email.subject}</div>
+                          <div className={styles.emailItemMeta}>
+                            {email.direction === "sent" ? "→" : "←"} {email.from} · {new Date(email.date).toLocaleDateString("fr-FR")}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
             )}
           </div>
         ))}
