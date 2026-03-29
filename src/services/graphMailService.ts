@@ -492,15 +492,19 @@ async function getContactCache(): Promise<CachedContact[]> {
 
 /**
  * Search for contacts by name.
- * Strategy 1: Graph $search (fast, works well for exact/close matches).
+ * Strategy 1: Graph $search on from/to fields (fast, exact/close matches).
  * Strategy 2: Local cache + Levenshtein fuzzy matching (handles typos, missing accents).
+ * Strategy 3: ServiceDesk emails (for contacts who only appear in ServiceNow tickets).
+ * All strategies run, results are merged and tagged with their source.
  */
 export async function searchContactsByName(
   query: string
-): Promise<Array<{ name: string; email: string }>> {
+): Promise<Array<{ name: string; email: string; source?: string }>> {
   console.log(`[searchContacts] Searching for "${query}"`);
 
-  // --- Strategy 1: Graph $search ---
+  const results: Array<{ name: string; email: string; source: string; score: number }> = [];
+
+  // --- Strategy 1: Graph $search on from/to ---
   const encodedQuery = encodeURIComponent(query);
   const receivedUrl = `${GRAPH}/me/messages?$search="from:${encodedQuery}"&$select=from&$top=30`;
   const sentUrl = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${encodedQuery}"&$select=toRecipients&$top=30`;
@@ -516,56 +520,74 @@ export async function searchContactsByName(
     }),
   ]);
 
-  const seen = new Map<string, { name: string; email: string; count: number }>();
+  const graphSeen = new Map<string, { name: string; email: string; count: number }>();
 
   for (const msg of received.value) {
     if (msg.from?.emailAddress?.address) {
       const addr = msg.from.emailAddress.address.toLowerCase();
-      const existing = seen.get(addr);
+      const existing = graphSeen.get(addr);
       if (existing) existing.count++;
-      else seen.set(addr, { name: msg.from.emailAddress.name, email: msg.from.emailAddress.address, count: 1 });
+      else graphSeen.set(addr, { name: msg.from.emailAddress.name, email: msg.from.emailAddress.address, count: 1 });
     }
   }
   for (const msg of sent.value) {
     for (const r of msg.toRecipients || []) {
       if (r.emailAddress?.address) {
         const addr = r.emailAddress.address.toLowerCase();
-        const existing = seen.get(addr);
+        const existing = graphSeen.get(addr);
         if (existing) existing.count++;
-        else seen.set(addr, { name: r.emailAddress.name, email: r.emailAddress.address, count: 1 });
+        else graphSeen.set(addr, { name: r.emailAddress.name, email: r.emailAddress.address, count: 1 });
       }
     }
   }
 
-  if (seen.size > 0) {
-    const results = Array.from(seen.values())
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10)
-      .map(({ name, email }) => ({ name, email }));
-    console.log(`[searchContacts] Graph $search found ${results.length} contacts`);
-    return results;
+  for (const contact of graphSeen.values()) {
+    // Score Graph results with fuzzy to filter out false positives
+    const fScore = fuzzyScore(query, { name: contact.name, email: contact.email, count: contact.count });
+    if (fScore > 0) {
+      results.push({ name: contact.name, email: contact.email, source: "email", score: fScore });
+    } else {
+      console.log(`[searchContacts] Graph result filtered out (low fuzzy score): ${contact.name} <${contact.email}>`);
+    }
   }
 
-  // --- Strategy 2: Fuzzy search on local contact cache ---
-  console.log(`[searchContacts] Graph $search returned nothing, falling back to fuzzy cache search`);
-  const cache = await getContactCache();
+  console.log(`[searchContacts] Strategy 1 (Graph $search): ${results.length} contacts after fuzzy filter`);
 
+  // --- Strategy 2: Fuzzy search on local contact cache ---
+  const cache = await getContactCache();
   const scored = cache
     .map((contact) => ({ contact, score: fuzzyScore(query, contact) }))
-    .filter((x) => x.score > 0)
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return b.contact.count - a.contact.count;
-    })
-    .slice(0, 10);
+    .filter((x) => x.score > 30) // Higher threshold to avoid noise
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
 
-  const results = scored.map(({ contact, score }) => {
-    console.log(`[searchContacts]   ${contact.name} <${contact.email}> — score=${score.toFixed(1)}, freq=${contact.count}`);
-    return { name: contact.name, email: contact.email };
-  });
+  for (const { contact, score } of scored) {
+    // Don't add if already found via Graph
+    if (!results.some((r) => r.email.toLowerCase() === contact.email.toLowerCase())) {
+      results.push({ name: contact.name, email: contact.email, source: "email", score });
+    }
+  }
 
-  console.log(`[searchContacts] Fuzzy search found ${results.length} matches for "${query}"`);
-  return results;
+  console.log(`[searchContacts] Strategy 2 (fuzzy cache): ${scored.length} additional matches`);
+
+  // --- Strategy 3: ServiceDesk emails ---
+  try {
+    const sdContacts = await searchContactsInServiceDesk(query);
+    for (const sd of sdContacts) {
+      // ServiceDesk contacts don't have an email, tag them as servicedesk
+      results.push({ name: sd.name, email: "", source: "servicedesk", score: 70 + sd.ticketCount });
+    }
+    console.log(`[searchContacts] Strategy 3 (ServiceDesk): ${sdContacts.length} contacts`);
+  } catch (err) {
+    console.warn(`[searchContacts] ServiceDesk search failed:`, (err as Error).message);
+  }
+
+  // Sort by score desc, deduplicate, return top 10
+  results.sort((a, b) => b.score - a.score);
+  const final = results.slice(0, 10).map(({ name, email, source }) => ({ name, email, source }));
+
+  console.log(`[searchContacts] Final results:`, final);
+  return final;
 }
 
 /**
@@ -579,4 +601,160 @@ export async function searchEmails(
   const encodedQuery = encodeURIComponent(query);
   const url = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
   return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+// ─── ServiceDesk / ServiceNow Integration ───────────────────────────
+
+const SERVICEDESK_EMAIL = "1234@epfl.ch";
+
+/**
+ * Strip HTML tags from a string, returning plain text.
+ */
+function stripHtml(html: string): string {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#?\w+;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Extract person names from email body text using a sliding window + fuzzy match.
+ * Returns matching name strings found in the text.
+ */
+function extractNamesFromBody(bodyText: string, query: string): string[] {
+  const words = bodyText.split(/\s+/).filter((w) => w.length > 1);
+  const normalizedQuery = removeDiacritics(query.toLowerCase());
+  const queryWords = normalizedQuery.split(/\s+/).filter(Boolean);
+  const found: string[] = [];
+
+  // Sliding window of 2-4 words (typical name length)
+  for (let windowSize = 2; windowSize <= 4; windowSize++) {
+    for (let i = 0; i <= words.length - windowSize; i++) {
+      const window = words.slice(i, i + windowSize);
+      const windowText = window.join(" ");
+      const normalizedWindow = removeDiacritics(windowText.toLowerCase());
+      const windowParts = normalizedWindow.split(/\s+/);
+
+      // Check if every query word fuzzy-matches a window word
+      let allMatch = true;
+      for (const qw of queryWords) {
+        let wordMatched = false;
+        for (const wp of windowParts) {
+          const dist = levenshtein(qw, wp);
+          const threshold = qw.length <= 3 ? 1 : qw.length <= 6 ? 2 : 3;
+          if (dist <= threshold) {
+            wordMatched = true;
+            break;
+          }
+        }
+        if (!wordMatched) {
+          allMatch = false;
+          break;
+        }
+      }
+
+      if (allMatch) {
+        // Clean up: capitalize each word properly
+        const cleanName = window
+          .map((w) => w.replace(/[^a-zA-ZÀ-ÿ\-]/g, ""))
+          .filter((w) => w.length > 1)
+          .join(" ");
+        if (cleanName && !found.includes(cleanName)) {
+          found.push(cleanName);
+        }
+      }
+    }
+  }
+
+  return found;
+}
+
+/**
+ * Search for contacts in ServiceDesk/ServiceNow emails.
+ * Uses Graph $search to find ServiceDesk emails mentioning the query,
+ * then extracts the actual person name from the email body.
+ */
+export async function searchContactsInServiceDesk(
+  query: string
+): Promise<Array<{ name: string; ticketCount: number }>> {
+  const encodedQuery = encodeURIComponent(query);
+  const url = `${GRAPH}/me/messages?$search="from:${SERVICEDESK_EMAIL} ${encodedQuery}"&$select=id,subject,body,bodyPreview&$top=20`;
+
+  console.log(`[serviceDeskSearch] Searching ServiceDesk emails for "${query}"`);
+
+  let messages: EmailMessage[];
+  try {
+    messages = await fetchAllPages<EmailMessage>(url, 20);
+  } catch (err) {
+    console.warn(`[serviceDeskSearch] Search failed:`, (err as Error).message);
+    return [];
+  }
+
+  console.log(`[serviceDeskSearch] Found ${messages.length} ServiceDesk emails`);
+
+  // Extract names from email bodies
+  const nameCounts = new Map<string, number>();
+
+  for (const msg of messages) {
+    const bodyText = msg.body?.content
+      ? stripHtml(msg.body.content)
+      : msg.bodyPreview || "";
+
+    const names = extractNamesFromBody(bodyText, query);
+    for (const name of names) {
+      nameCounts.set(name, (nameCounts.get(name) || 0) + 1);
+    }
+  }
+
+  const results = Array.from(nameCounts.entries())
+    .map(([name, ticketCount]) => ({ name, ticketCount }))
+    .sort((a, b) => b.ticketCount - a.ticketCount)
+    .slice(0, 5);
+
+  console.log(`[serviceDeskSearch] Extracted names:`, results);
+  return results;
+}
+
+/**
+ * Get ServiceDesk emails that mention a specific person by name.
+ * Used to include ServiceNow ticket exchanges in interaction summaries.
+ */
+export async function getServiceDeskEmailsForPerson(
+  personName: string,
+  maxResults = 30
+): Promise<EmailMessage[]> {
+  // Split name into words and search each independently (no quotes)
+  // so "Pablo Tanner" matches "Pablo Sidney Tanner" or "Tanner, Pablo"
+  const nameWords = personName.trim().split(/\s+/);
+  const searchTerms = nameWords.map((w) => encodeURIComponent(w)).join(" ");
+  const url = `${GRAPH}/me/messages?$search="from:${SERVICEDESK_EMAIL} ${searchTerms}"&$select=id,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isRead&$top=${Math.min(maxResults, 50)}`;
+
+  console.log(`[serviceDeskEmails] Fetching ServiceDesk emails mentioning "${personName}" (words: ${nameWords.join(", ")})`);
+
+  try {
+    const allMessages = await fetchAllPages<EmailMessage>(url, maxResults);
+
+    // Post-filter: verify the person's name actually appears in the body
+    // (Graph $search without quotes can return loose matches)
+    const filtered = allMessages.filter((msg) => {
+      const bodyText = msg.body?.content
+        ? stripHtml(msg.body.content).toLowerCase()
+        : (msg.bodyPreview || "").toLowerCase();
+      // Check that all name words appear somewhere in the body
+      return nameWords.every((w) => bodyText.includes(w.toLowerCase()));
+    });
+
+    console.log(`[serviceDeskEmails] Found ${allMessages.length} emails, ${filtered.length} after name verification`);
+    return filtered;
+  } catch (err) {
+    console.warn(`[serviceDeskEmails] Search failed:`, (err as Error).message);
+    return [];
+  }
 }

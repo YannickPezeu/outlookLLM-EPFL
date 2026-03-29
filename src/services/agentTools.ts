@@ -1,7 +1,9 @@
 import { ToolDefinition } from "./rcpApiService";
 import {
   searchContactsByName,
+  searchContactsInServiceDesk,
   getAllInteractions,
+  getServiceDeskEmailsForPerson,
   searchEmails,
   getCalendarView,
 } from "./graphMailService";
@@ -36,17 +38,21 @@ export const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "get_email_interactions",
       description:
-        "Récupère la liste des emails échangés avec un contact (reçus et envoyés). " +
-        "Retourne les sujets, dates et comptages. Nécessite l'adresse email exacte.",
+        "Récupère la liste des emails échangés avec un contact (reçus, envoyés, et tickets ServiceDesk). " +
+        "Retourne les sujets, dates et comptages. Nécessite le nom et l'adresse email.",
       parameters: {
         type: "object",
         properties: {
+          name: {
+            type: "string",
+            description: "Le nom complet du contact (pour chercher dans les tickets ServiceDesk)",
+          },
           email: {
             type: "string",
             description: "L'adresse email exacte du contact",
           },
         },
-        required: ["email"],
+        required: ["name", "email"],
       },
     },
   },
@@ -120,14 +126,37 @@ export const AGENT_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "search_contacts_in_servicedesk",
+      description:
+        "Recherche un contact dans les emails ServiceNow/ServiceDesk. " +
+        "Utile quand search_contacts ne trouve pas la personne, car certains échanges " +
+        "passent par le ServiceDesk (expéditeur: 1234@epfl.ch) et le vrai nom de la personne " +
+        "n'apparaît que dans le corps du mail. " +
+        "Retourne les noms trouvés et le nombre de tickets associés.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Le nom (ou partie du nom) de la personne à rechercher dans les tickets ServiceDesk",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
 ];
 
 // ─── Tool Executors ─────────────────────────────────────────────────
 
-type ToolExecutor = (args: Record<string, unknown>) => Promise<string>;
+type LogFn = (msg: string) => void;
+type ToolExecutor = (args: Record<string, unknown>, log: LogFn) => Promise<string>;
 
 const executors: Record<string, ToolExecutor> = {
-  async search_contacts(args) {
+  async search_contacts(args, log) {
     const query = args.query as string;
     const contacts = await searchContactsByName(query);
     if (contacts.length === 0) {
@@ -136,11 +165,27 @@ const executors: Record<string, ToolExecutor> = {
     return JSON.stringify({ contacts });
   },
 
-  async get_email_interactions(args) {
+  async get_email_interactions(args, log) {
+    const name = args.name as string;
     const email = args.email as string;
-    const { received, sent } = await getAllInteractions(email);
 
-    // Return summary info (subjects, dates) — not full bodies to stay within token limits
+    // Skip direct email search if no email address (ServiceDesk-only contacts)
+    const [{ received, sent }, serviceDeskEmails] = await Promise.all([
+      email ? getAllInteractions(email) : Promise.resolve({ received: [], sent: [] }),
+      getServiceDeskEmailsForPerson(name),
+    ]);
+
+    log(`Emails collectés: ${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk`);
+    for (const e of received.slice(0, 10)) {
+      log(`  [reçu] ${e.receivedDateTime?.slice(0, 10)} | ${e.from?.emailAddress?.name || "?"} | ${e.subject}`);
+    }
+    for (const e of sent.slice(0, 10)) {
+      log(`  [envoyé] ${(e.sentDateTime || e.receivedDateTime)?.slice(0, 10)} | ${e.subject}`);
+    }
+    for (const e of serviceDeskEmails.slice(0, 10)) {
+      log(`  [ServiceNow] ${e.receivedDateTime?.slice(0, 10)} | ${e.subject}`);
+    }
+
     const receivedSummary = received.slice(0, 20).map((e) => ({
       subject: e.subject,
       date: e.receivedDateTime,
@@ -151,21 +196,43 @@ const executors: Record<string, ToolExecutor> = {
       date: e.sentDateTime || e.receivedDateTime,
       preview: e.bodyPreview?.slice(0, 150),
     }));
+    const serviceDeskSummary = serviceDeskEmails.slice(0, 20).map((e) => ({
+      subject: `[ServiceNow] ${e.subject}`,
+      date: e.receivedDateTime,
+      preview: e.bodyPreview?.slice(0, 150),
+    }));
 
     return JSON.stringify({
       received_count: received.length,
       sent_count: sent.length,
+      servicedesk_count: serviceDeskEmails.length,
       recent_received: receivedSummary,
       recent_sent: sentSummary,
+      recent_servicedesk: serviceDeskSummary,
     });
   },
 
-  async summarize_email_interactions(args) {
+  async summarize_email_interactions(args, log) {
     const name = args.name as string;
     const email = args.email as string;
-    const { received, sent } = await getAllInteractions(email);
 
-    if (received.length === 0 && sent.length === 0) {
+    const [{ received, sent }, serviceDeskEmails] = await Promise.all([
+      email ? getAllInteractions(email) : Promise.resolve({ received: [], sent: [] }),
+      getServiceDeskEmailsForPerson(name),
+    ]);
+
+    log(`Résumé — emails collectés: ${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk`);
+    for (const e of received) {
+      log(`  [reçu] ${e.receivedDateTime?.slice(0, 10)} | ${e.from?.emailAddress?.name || "?"} | ${e.subject}`);
+    }
+    for (const e of sent) {
+      log(`  [envoyé] ${(e.sentDateTime || e.receivedDateTime)?.slice(0, 10)} | ${e.subject}`);
+    }
+    for (const e of serviceDeskEmails) {
+      log(`  [ServiceNow] ${e.receivedDateTime?.slice(0, 10)} | ${e.subject}`);
+    }
+
+    if (received.length === 0 && sent.length === 0 && serviceDeskEmails.length === 0) {
       return JSON.stringify({ message: `Aucun email trouvé avec ${name} (${email}).` });
     }
 
@@ -174,21 +241,34 @@ const executors: Record<string, ToolExecutor> = {
       body: e.body?.content || e.bodyPreview || "",
       date: e.receivedDateTime,
     }));
+
+    const serviceDeskData = serviceDeskEmails.map((e) => ({
+      subject: `[ServiceNow] ${e.subject}`,
+      body: e.body?.content || e.bodyPreview || "",
+      date: e.receivedDateTime,
+    }));
+
     const sentData = sent.map((e) => ({
       subject: e.subject,
       body: e.body?.content || e.bodyPreview || "",
       date: e.sentDateTime || e.receivedDateTime,
     }));
 
-    // Non-streaming call — we're inside the agent loop
-    const summary = await summarizeInteractions(name, email, receivedData, sentData);
+    const allReceived = [...receivedData, ...serviceDeskData];
+    log(`Total emails envoyés au LLM pour résumé: ${allReceived.length + sentData.length}`);
+
+    const summary = await summarizeInteractions(name, email, allReceived, sentData);
     return JSON.stringify({
       summary,
-      email_count: { received: received.length, sent: sent.length },
+      email_count: {
+        received: received.length,
+        sent: sent.length,
+        servicedesk: serviceDeskEmails.length,
+      },
     });
   },
 
-  async get_calendar_events(args) {
+  async get_calendar_events(args, _log) {
     const now = new Date();
     const startDate = (args.start_date as string) || now.toISOString();
     const endDate =
@@ -212,7 +292,7 @@ const executors: Record<string, ToolExecutor> = {
     return JSON.stringify({ events: eventSummaries, count: events.length });
   },
 
-  async search_emails(args) {
+  async search_emails(args, _log) {
     const query = args.query as string;
     const maxResults = (args.max_results as number) || 20;
     const emails = await searchEmails(query, maxResults);
@@ -227,6 +307,18 @@ const executors: Record<string, ToolExecutor> = {
 
     return JSON.stringify({ results, count: emails.length });
   },
+
+  async search_contacts_in_servicedesk(args, _log) {
+    const query = args.query as string;
+    const results = await searchContactsInServiceDesk(query);
+    if (results.length === 0) {
+      return JSON.stringify({
+        message: `Aucun contact trouvé pour "${query}" dans les emails ServiceDesk.`,
+        contacts: [],
+      });
+    }
+    return JSON.stringify({ contacts: results });
+  },
 };
 
 /**
@@ -235,15 +327,21 @@ const executors: Record<string, ToolExecutor> = {
  */
 export async function executeTool(
   toolName: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  log?: LogFn
 ): Promise<string> {
   const executor = executors[toolName];
   if (!executor) {
     return JSON.stringify({ error: `Outil inconnu: ${toolName}` });
   }
 
+  const toolLog: LogFn = (msg) => {
+    console.log(`[Tool:${toolName}] ${msg}`);
+    log?.(`[${toolName}] ${msg}`);
+  };
+
   try {
-    return await executor(args);
+    return await executor(args, toolLog);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[Agent] Tool ${toolName} error:`, message);

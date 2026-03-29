@@ -25,7 +25,8 @@ Règles importantes :
 - Quand l'utilisateur mentionne un contact par nom (ex: "Dupont", "Martin"), utilise TOUJOURS l'outil search_contacts d'abord pour trouver l'adresse email exacte avant d'appeler d'autres outils.
 - Si search_contacts retourne un seul résultat, utilise-le directement sans demander confirmation.
 - Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Ne demande confirmation que si tu hésites vraiment entre deux contacts plausibles.
-- Si search_contacts ne retourne aucun résultat, dis-le à l'utilisateur et suggère de reformuler.
+- Si search_contacts ne retourne aucun résultat pertinent, utilise search_contacts_in_servicedesk pour chercher dans les tickets ServiceNow (certains échanges passent par le ServiceDesk et le vrai nom de la personne n'apparaît que dans le corps du mail).
+- Si aucun outil ne trouve le contact, dis-le à l'utilisateur et suggère de reformuler.
 - Réponds toujours en français.
 - Sois concis et structuré dans tes réponses.
 - Utilise le format Markdown pour structurer tes réponses (listes, titres, gras).`;
@@ -90,8 +91,12 @@ export async function runAgent(
       const regex = /([a-z_]+)(\{[^}]*(?:\{[^}]*\}[^}]*)*\})/gi;
       let match;
       while ((match = regex.exec(toolCallsText)) !== null) {
+        // ID must be exactly 9 alphanumeric chars (API requirement)
+        const id = Array.from({ length: 9 }, () =>
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.floor(Math.random() * 62)]
+        ).join("");
         parsed.push({
-          id: `text_call_${parsed.length}`,
+          id,
           type: "function",
           function: { name: match[1], arguments: match[2] },
         });
@@ -127,7 +132,7 @@ export async function runAgent(
         onToolProgress(toolName, "calling", JSON.stringify(args));
 
         try {
-          const result = await executeTool(toolName, args);
+          const result = await executeTool(toolName, args, onLog);
           log(`Tool ${toolName} OK — résultat: ${result.slice(0, 200)}${result.length > 200 ? '...' : ''}`);
           onToolProgress(toolName, "done");
 

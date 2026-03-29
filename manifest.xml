@@ -49,7 +49,7 @@
 
   <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides" xsi:type="VersionOverridesV1_0">
     <Requirements>
-      <bt:Sets DefaultMinVersion="1.5">
+      <bt:Sets DefaultMinVersion="1.13">
         <bt:Set Name="Mailbox" />
       </bt:Sets>
     </Requirements>
@@ -75,6 +75,7 @@
                   </Icon>
                   <Action xsi:type="ShowTaskpane">
                     <SourceLocation resid="TaskPane.Url" />
+                    <SupportsPinning>true</SupportsPinning>
                   </Action>
                 </Control>
               </Group>
@@ -99,6 +100,7 @@
                   </Icon>
                   <Action xsi:type="ShowTaskpane">
                     <SourceLocation resid="TaskPane.Url" />
+                    <SupportsPinning>true</SupportsPinning>
                   </Action>
                 </Control>
               </Group>
@@ -123,6 +125,7 @@
                   </Icon>
                   <Action xsi:type="ShowTaskpane">
                     <SourceLocation resid="TaskPane.Url" />
+                    <SupportsPinning>true</SupportsPinning>
                   </Action>
                 </Control>
               </Group>
