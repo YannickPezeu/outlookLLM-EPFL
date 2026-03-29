@@ -1,7 +1,6 @@
 import {
   AgentMessage,
   chatCompletionWithTools,
-  chatCompletionStreamAgent,
 } from "./rcpApiService";
 import { AGENT_TOOLS, executeTool } from "./agentTools";
 
@@ -24,7 +23,8 @@ Tu aides à chercher des emails, résumer des échanges, préparer des réunions
 
 Règles importantes :
 - Quand l'utilisateur mentionne un contact par nom (ex: "Dupont", "Martin"), utilise TOUJOURS l'outil search_contacts d'abord pour trouver l'adresse email exacte avant d'appeler d'autres outils.
-- Si search_contacts retourne plusieurs résultats, demande à l'utilisateur de préciser quel contact il veut.
+- Si search_contacts retourne un seul résultat, utilise-le directement sans demander confirmation.
+- Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Ne demande confirmation que si tu hésites vraiment entre deux contacts plausibles.
 - Si search_contacts ne retourne aucun résultat, dis-le à l'utilisateur et suggère de reformuler.
 - Réponds toujours en français.
 - Sois concis et structuré dans tes réponses.
@@ -74,6 +74,34 @@ export async function runAgent(
     const finishReason = choice.finish_reason;
 
     log(`finish_reason=${finishReason}, tool_calls=${assistantMessage.tool_calls?.length || 0}, content=${assistantMessage.content ? assistantMessage.content.slice(0, 80) + '...' : '(vide)'}`);
+
+    // Mistral sometimes puts tool calls in content as text instead of structured format:
+    // "[TOOL_CALLS]func_name{"arg":"val"}func_name2{"arg":"val"}"
+    // Parse these and convert to structured tool_calls
+    if (
+      !assistantMessage.tool_calls?.length &&
+      assistantMessage.content?.includes("[TOOL_CALLS]")
+    ) {
+      log("Detected text-format tool calls from Mistral, parsing...");
+      const textContent = assistantMessage.content;
+      const toolCallsText = textContent.slice(textContent.indexOf("[TOOL_CALLS]") + "[TOOL_CALLS]".length);
+      const parsed: import("./rcpApiService").ToolCall[] = [];
+      // Match patterns like: func_name{"key":"value"} or func_name{"key":"value","key2":"value2"}
+      const regex = /([a-z_]+)(\{[^}]*(?:\{[^}]*\}[^}]*)*\})/gi;
+      let match;
+      while ((match = regex.exec(toolCallsText)) !== null) {
+        parsed.push({
+          id: `text_call_${parsed.length}`,
+          type: "function",
+          function: { name: match[1], arguments: match[2] },
+        });
+      }
+      if (parsed.length > 0) {
+        log(`Parsed ${parsed.length} tool calls from text: ${parsed.map((t) => t.function.name).join(", ")}`);
+        assistantMessage.tool_calls = parsed;
+        assistantMessage.content = null;
+      }
+    }
 
     // Check if the LLM wants to call tools
     if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
