@@ -120,7 +120,7 @@ export async function searchEmailsFromSender(
   maxResults = config.defaults.maxEmailsToFetch
 ): Promise<EmailMessage[]> {
   const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead";
-  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=50`;
 
   return fetchAllPages<EmailMessage>(url, maxResults);
 }
@@ -133,7 +133,7 @@ export async function searchEmailsSentTo(
   maxResults = config.defaults.maxEmailsToFetch
 ): Promise<EmailMessage[]> {
   // Use $search for sent items (OData $filter on toRecipients is limited)
-  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId&$top=50`;
 
   return fetchAllPages<EmailMessage>(url, maxResults);
 }
@@ -231,7 +231,7 @@ export async function getCalendarView(
   endDateTime: string,
   maxResults = 50
 ): Promise<CalendarEvent[]> {
-  const url = `${GRAPH}/me/calendarView?startDateTime=${startDateTime}&endDateTime=${endDateTime}&$select=id,subject,bodyPreview,start,end,attendees,isOrganizer,organizer,seriesMasterId&$orderby=start/dateTime desc&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/calendarView?startDateTime=${startDateTime}&endDateTime=${endDateTime}&$select=id,subject,bodyPreview,start,end,attendees,isOrganizer,organizer,seriesMasterId&$orderby=start/dateTime desc&$top=50`;
   return fetchAllPages<CalendarEvent>(url, maxResults);
 }
 
@@ -246,7 +246,7 @@ export async function searchEmailsFromSenderLight(
   maxResults = config.defaults.maxEmailsPerParticipant
 ): Promise<LightEmail[]> {
   const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
-  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=50`;
 
   return fetchAllPages<LightEmail>(url, maxResults);
 }
@@ -259,7 +259,7 @@ export async function searchEmailsSentToLight(
   maxResults = config.defaults.maxEmailsPerParticipant
 ): Promise<LightEmail[]> {
   const select = "id,subject,bodyPreview,toRecipients,receivedDateTime,conversationId";
-  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=${select}&$top=50`;
 
   return fetchAllPages<LightEmail>(url, maxResults);
 }
@@ -599,7 +599,7 @@ export async function searchEmails(
 ): Promise<LightEmail[]> {
   const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
   const encodedQuery = encodeURIComponent(query);
-  const url = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=${select}&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=${select}&$top=50`;
   return fetchAllPages<LightEmail>(url, maxResults);
 }
 
@@ -734,7 +734,7 @@ export async function getServiceDeskEmailsForPerson(
   // so "Pablo Tanner" matches "Pablo Sidney Tanner" or "Tanner, Pablo"
   const nameWords = personName.trim().split(/\s+/);
   const searchTerms = nameWords.map((w) => encodeURIComponent(w)).join(" ");
-  const url = `${GRAPH}/me/messages?$search="from:${SERVICEDESK_EMAIL} ${searchTerms}"&$select=id,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isRead&$top=${Math.min(maxResults, 50)}`;
+  const url = `${GRAPH}/me/messages?$search="from:${SERVICEDESK_EMAIL} ${searchTerms}"&$select=id,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isRead&$top=50`;
 
   console.log(`[serviceDeskEmails] Fetching ServiceDesk emails mentioning "${personName}" (words: ${nameWords.join(", ")})`);
 
