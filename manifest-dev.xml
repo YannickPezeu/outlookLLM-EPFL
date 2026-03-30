@@ -7,11 +7,11 @@
   xsi:type="MailApp">
 
   <!-- BEGIN: Add-in metadata -->
-  <Id>e4e7f5a0-1234-4abc-9def-000000000001</Id>
+  <Id>e4e7f5a0-1234-4abc-9def-000000000002</Id>
   <Version>1.0.0.0</Version>
   <ProviderName>EPFL</ProviderName>
   <DefaultLocale>fr-FR</DefaultLocale>
-  <DisplayName DefaultValue="EPFL Mail AI" />
+  <DisplayName DefaultValue="EPFL Mail AI (Dev)" />
   <Description DefaultValue="Préparation de réunions et résumé d'emails avec l'IA - Propulsé par RCP EPFL" />
   <IconUrl DefaultValue="https://localhost:3000/assets/icon-64.png" />
   <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/icon-128.png" />
@@ -49,7 +49,7 @@
 
   <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides" xsi:type="VersionOverridesV1_0">
     <Requirements>
-      <bt:Sets DefaultMinVersion="1.13">
+      <bt:Sets DefaultMinVersion="1.5">
         <bt:Set Name="Mailbox" />
       </bt:Sets>
     </Requirements>
@@ -60,7 +60,7 @@
           <!-- Extension point: button in the reading pane -->
           <ExtensionPoint xsi:type="MessageReadCommandSurface">
             <OfficeTab id="TabDefault">
-              <Group id="epflMailAiGroup">
+              <Group id="epflMailAiDevGroup">
                 <Label resid="GroupLabel" />
                 <Control xsi:type="Button" id="openTaskPaneBtn">
                   <Label resid="TaskPaneBtn.Label" />
@@ -85,7 +85,7 @@
           <!-- Extension point: calendar event — when user is an attendee -->
           <ExtensionPoint xsi:type="AppointmentAttendeeCommandSurface">
             <OfficeTab id="TabDefault">
-              <Group id="epflMailAiAttendeeGroup">
+              <Group id="epflMailAiDevAttendeeGroup">
                 <Label resid="GroupLabel" />
                 <Control xsi:type="Button" id="openTaskPaneAttendeeBtn">
                   <Label resid="TaskPaneBtn.Label" />
@@ -110,7 +110,7 @@
           <!-- Extension point: calendar event — when user is the organizer -->
           <ExtensionPoint xsi:type="AppointmentOrganizerCommandSurface">
             <OfficeTab id="TabDefault">
-              <Group id="epflMailAiOrganizerGroup">
+              <Group id="epflMailAiDevOrganizerGroup">
                 <Label resid="GroupLabel" />
                 <Control xsi:type="Button" id="openTaskPaneOrganizerBtn">
                   <Label resid="TaskPaneBtn.Label" />
