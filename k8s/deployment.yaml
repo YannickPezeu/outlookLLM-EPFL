@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outlook-plugin
+  namespace: epfl-chatbot
+  labels:
+    app: outlook-plugin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: outlook-plugin
+  template:
+    metadata:
+      labels:
+        app: outlook-plugin
+    spec:
+      containers:
+        - name: nginx
+          image: ic-registry.epfl.ch/mr-pezeu/outlook-plugin:latest
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"

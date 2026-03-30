@@ -7,6 +7,7 @@ require("dotenv").config();
 module.exports = async (env, argv) => {
   const isDev = argv.mode === "development";
   const isGhPages = env && env.ghpages;
+  const isK8s = env && env.k8s;
 
   // HTTPS certs for dev (Office add-ins require HTTPS)
   let serverOptions = {};
@@ -33,7 +34,7 @@ module.exports = async (env, argv) => {
       path: path.resolve(__dirname, "dist"),
       filename: "[name].bundle.js",
       clean: true,
-      publicPath: isGhPages ? "/outlookLLM-EPFL/" : "/",
+      publicPath: isGhPages ? "/outlookLLM-EPFL/" : isK8s ? "/outlook/" : "/",
     },
     resolve: {
       extensions: [".ts", ".tsx", ".js", ".jsx"],
