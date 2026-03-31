@@ -16,6 +16,8 @@
     "@azure/msal-browser": "^3.6.0",
     "@fluentui/react-components": "^9.46.0",
     "@fluentui/react-icons": "^2.0.230",
+    "@types/dompurify": "^3.0.5",
+    "dompurify": "^3.3.3",
     "dotenv": "^17.3.1",
     "fastest-levenshtein": "^1.0.16",
     "mammoth": "^1.12.0",

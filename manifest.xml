@@ -7,7 +7,7 @@
   xsi:type="MailApp">
 
   <!-- BEGIN: Add-in metadata -->
-  <Id>e4e7f5a0-1234-4abc-9def-000000000001</Id>
+  <Id>e4e7f5a0-1234-4abc-9def-000000000003</Id>
   <Version>1.0.0.0</Version>
   <ProviderName>EPFL</ProviderName>
   <DefaultLocale>fr-FR</DefaultLocale>
@@ -17,6 +17,12 @@
   <HighResolutionIconUrl DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-128.png" />
   <SupportUrl DefaultValue="https://github.com/YannickPezeu/outlookLLM-EPFL" />
   <!-- END: Add-in metadata -->
+
+  <AppDomains>
+    <AppDomain>https://inference.rcp.epfl.ch</AppDomain>
+    <AppDomain>https://graph.microsoft.com</AppDomain>
+    <AppDomain>https://login.microsoftonline.com</AppDomain>
+  </AppDomains>
 
   <Hosts>
     <Host Name="Mailbox" />

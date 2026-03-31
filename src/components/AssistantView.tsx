@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { marked } from "marked";
+import DOMPurify from "dompurify";
 import {
   Button,
   Input,
@@ -213,7 +214,8 @@ const MarkdownContent: React.FC<{ content: string; className?: string }> = ({
     if (codeBlockMatch) {
       cleaned = codeBlockMatch[1];
     }
-    return marked.parse(cleaned) as string;
+    const raw = marked.parse(cleaned) as string;
+    return DOMPurify.sanitize(raw);
   }, [content]);
 
   return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;

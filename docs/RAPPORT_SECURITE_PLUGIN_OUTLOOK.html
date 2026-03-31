@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>EPFL Mail AI - Dossier de validation sécurité</title>
+<style>
+  @page { margin: 2cm; }
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    line-height: 1.6;
+    color: #333;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 40px 20px;
+  }
+  h1 { color: #c00; border-bottom: 3px solid #c00; padding-bottom: 10px; font-size: 1.8em; }
+  h2 { color: #333; border-bottom: 1px solid #ddd; padding-bottom: 5px; margin-top: 30px; font-size: 1.3em; }
+  h3 { color: #555; margin-top: 20px; font-size: 1.1em; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+  .header img { height: 50px; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }
+  .badge-green { background: #e6f4ea; color: #1e7e34; }
+  .badge-blue { background: #e3f2fd; color: #1565c0; }
+  .badge-orange { background: #fff3e0; color: #e65100; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 0.9em; }
+  th, td { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+  th { background: #f5f5f5; font-weight: 600; }
+  .diagram { background: #f8f9fa; border: 1px solid #e0e0e0; border-radius: 8px; padding: 20px; margin: 15px 0; font-family: monospace; font-size: 0.85em; white-space: pre; line-height: 1.4; }
+  .highlight { background: #fff9c4; padding: 12px 16px; border-left: 4px solid #fbc02d; margin: 15px 0; }
+  .section-security { background: #e8f5e9; padding: 12px 16px; border-left: 4px solid #43a047; margin: 15px 0; }
+  ul { padding-left: 20px; }
+  li { margin-bottom: 5px; }
+  .footer { margin-top: 40px; padding-top: 15px; border-top: 1px solid #ddd; font-size: 0.8em; color: #888; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>EPFL Mail AI</h1>
+    <p style="margin-top:-10px; color:#666;">Dossier de validation - Equipe Cybersecurite EPFL</p>
+  </div>
+  <div style="text-align:right; font-size:0.9em; color:#888;">
+    Mars 2026<br>
+    Version 1.0
+  </div>
+</div>
+
+<h2>1. Resume du projet</h2>
+<p><strong>EPFL Mail AI</strong> est un add-in Microsoft Outlook qui assiste le personnel dirigeant EPFL dans la preparation de reunions. Il analyse les emails echanges avec les participants d'une reunion et genere un briefing structure via l'API LLM interne RCP EPFL.</p>
+
+<table>
+  <tr><th>Element</th><th>Detail</th></tr>
+  <tr><td>Type</td><td>Add-in Outlook (MailApp XML manifest)</td></tr>
+  <tr><td>Sponsor</td><td>Bruce Colombet, Directeur adjoint VPO-DSI</td></tr>
+  <tr><td>Superviseur academique</td><td>Prof. Martin Rajman, LSIR</td></tr>
+  <tr><td>Developpeur</td><td>Yannick Pezeu, IC / LSIR</td></tr>
+  <tr><td>Admin IT</td><td>Carlos Perez, Chef service info faculte IC</td></tr>
+  <tr><td>Statut</td><td>Projet pilote</td></tr>
+</table>
+
+<h2>2. Architecture</h2>
+
+<div class="highlight">
+  <strong>Point cle :</strong> L'application est 100% client-side (navigateur). Il n'y a aucun backend applicatif. Les fichiers statiques sont servis par un conteneur nginx sur le cluster Kubernetes IC.
+</div>
+
+<div class="diagram">
++-------------------+      +-------------------+      +----------------------+
+|   Outlook Web     |      |  expert-finder.   |      |  inference.rcp.      |
+|   (navigateur)    |----->|  epfl.ch (k8s)    |----->|  epfl.ch             |
+|                   |      |  nginx static +   |      |  API LLM interne     |
+|  Add-in taskpane  |      |  CORS proxy       |      |  EPFL                |
++-------------------+      +-------------------+      +----------------------+
+        |
+        |  HTTPS (tokens delegues)
+        v
++-------------------+
+| graph.microsoft.  |
+| com               |
+| Microsoft Graph   |
+| API v1.0          |
++-------------------+</div>
+
+<h3>Flux de donnees</h3>
+<ol>
+  <li>L'utilisateur ouvre l'add-in dans Outlook Web</li>
+  <li>L'add-in s'authentifie via MSAL.js (OAuth 2.0 PKCE) aupres d'Entra ID</li>
+  <li>L'add-in interroge Microsoft Graph API avec le token delegue pour lire les emails/calendrier</li>
+  <li>Les emails pertinents sont envoyes a l'API RCP EPFL pour analyse LLM</li>
+  <li>Le resultat (briefing) est affiche dans le taskpane</li>
+</ol>
+
+<h2>3. Securite - Garanties</h2>
+
+<div class="section-security">
+  <strong>Lecture seule.</strong> L'add-in ne modifie, supprime, envoie ou deplace jamais aucun email ou evenement calendrier.
+</div>
+
+<table>
+  <tr><th>Garantie</th><th>Detail</th></tr>
+  <tr><td><span class="badge badge-green">Lecture seule</span></td><td>Permissions Graph API : <code>Mail.Read</code>, <code>Calendars.Read</code>, <code>User.Read</code> uniquement. Aucune permission d'ecriture.</td></tr>
+  <tr><td><span class="badge badge-green">Pas de backend</span></td><td>Aucun serveur applicatif. Le code tourne integralement dans le navigateur de l'utilisateur. Le serveur nginx ne sert que des fichiers statiques et un proxy CORS.</td></tr>
+  <tr><td><span class="badge badge-green">Donnees internes</span></td><td>Les contenus emails sont envoyes uniquement a l'API RCP EPFL (<code>inference.rcp.epfl.ch</code>), hebergee sur l'infrastructure EPFL. Aucune donnee ne quitte le perimetre EPFL.</td></tr>
+  <tr><td><span class="badge badge-green">Pas de stockage</span></td><td>Aucune donnee email n'est persistee. Les donnees existent uniquement en memoire pendant la session du navigateur. Le <code>localStorage</code> ne stocke que les preferences utilisateur (cle API, modele).</td></tr>
+  <tr><td><span class="badge badge-green">Permissions deleguees</span></td><td>Toutes les permissions sont <em>Delegated</em> (pas Application). Chaque utilisateur n'accede qu'a sa propre boite mail via son propre token OAuth.</td></tr>
+  <tr><td><span class="badge badge-green">HTTPS partout</span></td><td>Toutes les communications sont chiffrees (HTTPS/TLS).</td></tr>
+</table>
+
+<h2>4. Authentification et autorisation</h2>
+
+<h3>4.1 App Registration Entra ID</h3>
+<table>
+  <tr><th>Parametre</th><th>Valeur</th></tr>
+  <tr><td>Client ID</td><td><code>7ecc1fc6-2d9b-4bf6-aed9-12a396c9039c</code></td></tr>
+  <tr><td>Tenant ID</td><td><code>f6c2556a-c4fb-4ab1-a2c7-9e220df11c43</code> (EPFL)</td></tr>
+  <tr><td>Type d'application</td><td>SPA (Single Page Application)</td></tr>
+  <tr><td>Flux d'authentification</td><td>OAuth 2.0 Authorization Code + PKCE</td></tr>
+  <tr><td>Client Secret</td><td>Non utilise cote client (flux PKCE public)</td></tr>
+</table>
+
+<h3>4.2 Permissions Microsoft Graph (Delegated)</h3>
+<table>
+  <tr><th>Permission</th><th>Type</th><th>Justification</th></tr>
+  <tr><td><code>User.Read</code></td><td>Delegated</td><td>Identifier l'utilisateur connecte</td></tr>
+  <tr><td><code>Mail.Read</code></td><td>Delegated</td><td>Lire les emails pour la preparation de reunion et les resumes</td></tr>
+  <tr><td><code>Calendars.Read</code></td><td>Delegated</td><td>Lire les evenements calendrier pour identifier les reunions et participants</td></tr>
+</table>
+
+<div class="highlight">
+  <strong>Aucune permission d'ecriture</strong> n'est demandee. L'application ne peut pas envoyer d'emails, modifier le calendrier, acceder aux contacts, ni effectuer aucune action d'ecriture.
+</div>
+
+<h3>4.3 Redirect URIs (SPA)</h3>
+<table>
+  <tr><th>URI</th><th>Usage</th></tr>
+  <tr><td><code>https://expert-finder.epfl.ch/outlook/taskpane.html</code></td><td>Production (k8s EPFL)</td></tr>
+  <tr><td><code>brk-multihub://localhost:3000</code></td><td>Nested App Auth (Office broker)</td></tr>
+  <tr><td><code>https://localhost:3000/taskpane.html</code></td><td>Developpement local</td></tr>
+</table>
+
+<h2>5. API LLM - RCP EPFL</h2>
+
+<table>
+  <tr><th>Parametre</th><th>Valeur</th></tr>
+  <tr><td>Endpoint</td><td><code>https://inference.rcp.epfl.ch/v1</code></td></tr>
+  <tr><td>Protocole</td><td>API OpenAI-compatible (REST + SSE streaming)</td></tr>
+  <tr><td>Modeles utilises</td><td>Mistral Small 24B (resumes, tool-calling), Qwen 3 Embedding 8B (embeddings)</td></tr>
+  <tr><td>Hebergement</td><td>Infrastructure RCP EPFL (interne)</td></tr>
+  <tr><td>Authentification</td><td>Cle API personnelle (stockee dans localStorage du navigateur)</td></tr>
+</table>
+
+<div class="section-security">
+  <strong>Les donnees email envoyees au LLM restent sur l'infrastructure EPFL.</strong> Le serveur RCP est heberge et opere par l'EPFL. Aucun fournisseur cloud externe (OpenAI, Google, etc.) n'est utilise.
+</div>
+
+<h2>6. Infrastructure d'hebergement</h2>
+
+<table>
+  <tr><th>Composant</th><th>Detail</th></tr>
+  <tr><td>Cluster</td><td>Kubernetes IC (<code>ic-mr-expert-finder-k8s</code>)</td></tr>
+  <tr><td>Namespace</td><td><code>epfl-chatbot</code></td></tr>
+  <tr><td>Conteneur</td><td>nginx:alpine (image minimale ~40MB)</td></tr>
+  <tr><td>Domaine</td><td><code>expert-finder.epfl.ch/outlook/</code></td></tr>
+  <tr><td>Ingress</td><td>Traefik avec TLS</td></tr>
+  <tr><td>Registry</td><td><code>ic-registry.epfl.ch/mr-pezeu/outlook-plugin</code></td></tr>
+</table>
+
+<h3>Role du serveur nginx</h3>
+<p>Le serveur nginx a deux fonctions :</p>
+<ol>
+  <li><strong>Servir les fichiers statiques</strong> (HTML, JS, CSS) de l'add-in</li>
+  <li><strong>Proxy CORS</strong> pour l'API RCP : relayer les requetes du navigateur vers <code>inference.rcp.epfl.ch</code> en ajoutant les en-tetes CORS necessaires. Ce proxy ne stocke, ne modifie et ne log aucune donnee.</li>
+</ol>
+
+<h2>7. Donnees traitees</h2>
+
+<table>
+  <tr><th>Donnee</th><th>Source</th><th>Traitement</th><th>Stockage</th></tr>
+  <tr><td>Sujets et apercu des emails</td><td>Graph API</td><td>Envoyes au LLM RCP pour analyse</td><td>Memoire navigateur uniquement</td></tr>
+  <tr><td>Corps des emails (top 20)</td><td>Graph API</td><td>Envoyes au LLM RCP pour resume</td><td>Memoire navigateur uniquement</td></tr>
+  <tr><td>Evenements calendrier</td><td>Graph API</td><td>Extraction participants et sujet</td><td>Memoire navigateur uniquement</td></tr>
+  <tr><td>Token OAuth</td><td>Entra ID / MSAL</td><td>Authentification Graph API</td><td>Session MSAL (memoire/sessionStorage)</td></tr>
+  <tr><td>Cle API RCP</td><td>Saisie utilisateur</td><td>Authentification API LLM</td><td>localStorage navigateur</td></tr>
+</table>
+
+<div class="highlight">
+  <strong>Aucune donnee n'est transmise a des services externes a l'EPFL.</strong> Les seuls endpoints contactes sont : Microsoft Graph (avec token delegue de l'utilisateur) et RCP EPFL (infrastructure interne).
+</div>
+
+<h2>8. Surface d'attaque et mitigations</h2>
+
+<table>
+  <tr><th>Risque</th><th>Mitigation</th></tr>
+  <tr><td>Vol de token OAuth</td><td>Flux PKCE (pas de client secret expose). Tokens de courte duree. Stockage en memoire/sessionStorage (pas localStorage).</td></tr>
+  <tr><td>Cle API RCP en localStorage</td><td>Risque accepte pour l'UX. La cle est personnelle et revocable. Alternative future : stockage dans un vault.</td></tr>
+  <tr><td>XSS dans le contenu email</td><td>Le contenu email est affiche via React (echappement automatique). Le rendu Markdown des reponses LLM est sanitise avec DOMPurify avant injection HTML.</td></tr>
+  <tr><td>Injection dans les prompts LLM</td><td>Risque inherent aux LLM. Impact limite : l'add-in est en lecture seule, un prompt malveillant ne peut pas declencher d'action destructive.</td></tr>
+  <tr><td>Acces non autorise aux emails</td><td>Permissions deleguees uniquement. Chaque utilisateur n'accede qu'a ses propres emails via son token.</td></tr>
+  <tr><td>Donnees en transit</td><td>HTTPS/TLS pour toutes les communications.</td></tr>
+</table>
+
+<h2>9. Stack technique</h2>
+
+<table>
+  <tr><th>Composant</th><th>Technologie</th><th>Version</th></tr>
+  <tr><td>Frontend</td><td>React + TypeScript</td><td>18.2 / 5.3</td></tr>
+  <tr><td>UI</td><td>Fluent UI v9 (Microsoft)</td><td>9.46</td></tr>
+  <tr><td>Auth</td><td>MSAL.js (Nested App Auth + fallback PKCE)</td><td>3.6</td></tr>
+  <tr><td>Build</td><td>Webpack</td><td>5.90</td></tr>
+  <tr><td>Serveur</td><td>nginx (fichiers statiques + proxy)</td><td>alpine</td></tr>
+  <tr><td>Orchestration</td><td>Kubernetes</td><td>IC cluster</td></tr>
+</table>
+
+<h2>10. Code source</h2>
+<p>Le code source est heberge sur un depot GitHub prive :<br>
+<code>https://github.com/YannickPezeu/outlookLLM-EPFL</code></p>
+<p>Le fichier <code>.env</code> contenant les secrets est dans <code>.gitignore</code> et n'est pas commite. L'acces au code peut etre accorde sur demande.</p>
+
+<h2>11. Contact</h2>
+<table>
+  <tr><th>Role</th><th>Nom</th><th>Email</th></tr>
+  <tr><td>Developpeur</td><td>Yannick Pezeu</td><td>yannick.pezeu@epfl.ch</td></tr>
+  <tr><td>Superviseur</td><td>Prof. Martin Rajman</td><td>martin.rajman@epfl.ch</td></tr>
+  <tr><td>Sponsor VPO-DSI</td><td>Bruce Colombet</td><td>bruce.colombet@epfl.ch</td></tr>
+  <tr><td>Admin IT IC</td><td>Carlos Perez</td><td>carlos.perez@epfl.ch</td></tr>
+  <tr><td>App Registration Entra</td><td>Pascal Bangerter</td><td>pascal.bangerter@epfl.ch</td></tr>
+</table>
+
+<div class="footer">
+  EPFL Mail AI - Dossier de validation securite - Mars 2026 - Confidentiel EPFL
+</div>
+
+</body>
+</html>

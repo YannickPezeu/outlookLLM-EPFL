@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useRef, useMemo } from "react";
 import { marked } from "marked";
+import DOMPurify from "dompurify";
 import {
   Button,
   Spinner,
@@ -101,7 +102,8 @@ const MarkdownRenderer: React.FC<{ content: string; className?: string }> = ({
     if (codeBlockMatch) {
       cleaned = codeBlockMatch[1];
     }
-    return marked.parse(cleaned) as string;
+    const raw = marked.parse(cleaned) as string;
+    return DOMPurify.sanitize(raw);
   }, [content]);
   return (
     <div

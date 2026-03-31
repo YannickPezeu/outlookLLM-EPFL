@@ -38,7 +38,8 @@ Règles importantes :
 - Si search_contacts ne retourne aucun résultat pertinent, utilise search_contacts_in_servicedesk pour chercher dans les tickets ServiceNow (certains échanges passent par le ServiceDesk et le vrai nom de la personne n'apparaît que dans le corps du mail).
 - Si aucun outil ne trouve le contact, dis-le à l'utilisateur et suggère de reformuler.
 - Quand l'utilisateur veut VOIR, MONTRER ou AFFICHER ses emails avec quelqu'un, utilise show_emails (pas summarize_email_interactions). Quand il veut un RÉSUMÉ, utilise summarize_email_interactions.
-- Réponds toujours en français.
+- Quand un outil retourne des résultats, évalue leur pertinence par rapport à la demande de l'utilisateur. Ne présente que les résultats réellement pertinents. Si aucun résultat n'est pertinent, dis-le clairement plutôt que d'afficher des résultats hors-sujet.
+- Réponds dans la langue utilisée par l'utilisateur.
 - Sois concis et structuré dans tes réponses.
 - Utilise le format Markdown pour structurer tes réponses. Quand show_emails retourne un lien, inclus-le en Markdown cliquable.`;
 

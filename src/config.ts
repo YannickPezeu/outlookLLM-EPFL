@@ -18,8 +18,11 @@ export const config = {
   },
 
   // EPFL RCP API (OpenAI-compatible)
+  // Auto-detect: use CORS proxy on k8s (expert-finder.epfl.ch), direct URL otherwise
   rcp: {
-    baseUrl: "https://inference.rcp.epfl.ch/v1",
+    baseUrl: window.location.hostname === "expert-finder.epfl.ch"
+      ? "/outlook/api/rcp"
+      : "https://inference.rcp.epfl.ch/v1",
     apiKey: "", // User sets this in the UI settings, or stored in localStorage
     defaultModel: "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
     embeddingModel: "Qwen/Qwen3-Embedding-8B",
