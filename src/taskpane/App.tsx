@@ -174,7 +174,7 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
       });
   }, []);
 
-  // Taskpane: listen for item changes and update localStorage for dialog
+  // Taskpane: listen for item changes and relay to dialog via messageChild
   useEffect(() => {
     if (inDialog) return;
     try {
@@ -182,12 +182,16 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
         Office.EventType.ItemChanged,
         () => {
           setTimeout(() => {
+            if (!dialogRef.current) return;
             const itemData = readCurrentItem();
-            localStorage.setItem("popout_item_data", itemData ? JSON.stringify(itemData) : "");
-            // Also refresh the Graph token
-            getGraphToken()
-              .then((token) => localStorage.setItem("graph_popout_token", token))
-              .catch(() => {});
+            try {
+              dialogRef.current.messageChild(JSON.stringify({
+                type: "ITEM_DATA",
+                payload: itemData,
+              }));
+            } catch (err) {
+              console.warn("[App] messageChild failed:", err);
+            }
           }, 200);
         }
       );
@@ -196,23 +200,45 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
     }
   }, []);
 
-  // Dialog: read token and item data from URL hash (set by taskpane before opening)
+  // Dialog: read initial token and item data from URL hash, then listen for live updates
   useEffect(() => {
     if (!inDialog) return;
+
+    // Read initial data from URL hash (set by taskpane before opening)
     try {
-      const hash = window.location.hash.slice(1); // remove #
-      if (!hash) return;
-      const params = new URLSearchParams(hash);
-      const token = params.get("token");
-      if (token) {
-        localStorage.setItem("graph_popout_token", token);
-      }
-      const itemRaw = params.get("item");
-      if (itemRaw) {
-        setItem(JSON.parse(itemRaw));
+      const hash = window.location.hash.slice(1);
+      if (hash) {
+        const params = new URLSearchParams(hash);
+        const token = params.get("token");
+        if (token) {
+          localStorage.setItem("graph_popout_token", token);
+        }
+        const itemRaw = params.get("item");
+        if (itemRaw) {
+          setItem(JSON.parse(itemRaw));
+        }
       }
     } catch (err) {
       console.warn("[Dialog] Could not read data from URL hash:", err);
+    }
+
+    // Listen for live item updates from taskpane via messageChild
+    try {
+      Office.context.ui.addHandlerAsync(
+        Office.EventType.DialogParentMessageReceived,
+        (arg: any) => {
+          try {
+            const msg = JSON.parse(arg.message);
+            if (msg.type === "ITEM_DATA") {
+              setItem(msg.payload);
+            }
+          } catch (err) {
+            console.warn("[Dialog] Could not parse parent message:", err);
+          }
+        }
+      );
+    } catch (err) {
+      console.warn("[Dialog] Could not register parent message handler:", err);
     }
   }, [inDialog, setItem]);
 
