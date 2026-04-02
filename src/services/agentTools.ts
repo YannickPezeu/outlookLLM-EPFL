@@ -6,8 +6,9 @@ import {
   getServiceDeskEmailsForPerson,
   searchEmails,
   getCalendarView,
+  DateRange,
 } from "./graphMailService";
-import { summarizeInteractions } from "./rcpApiService";
+import { batchEmbed, rankBySimilarity } from "./embeddingService";
 
 // ─── Tool Definitions (OpenAI function-calling format) ──────────────
 
@@ -39,7 +40,9 @@ export const AGENT_TOOLS: ToolDefinition[] = [
       name: "get_email_interactions",
       description:
         "Récupère la liste des emails échangés avec un contact (reçus, envoyés, et tickets ServiceDesk). " +
-        "Retourne les sujets, dates et comptages. Nécessite le nom et l'adresse email.",
+        "Retourne les sujets, dates et comptages. Nécessite le nom et l'adresse email. " +
+        "Supporte le filtrage par période temporelle via start_date/end_date. " +
+        "Si query est fourni, les emails sont triés par pertinence sémantique (embeddings) par rapport à la query.",
       parameters: {
         type: "object",
         properties: {
@@ -51,29 +54,17 @@ export const AGENT_TOOLS: ToolDefinition[] = [
             type: "string",
             description: "L'adresse email exacte du contact",
           },
-        },
-        required: ["name", "email"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "summarize_email_interactions",
-      description:
-        "Génère un résumé structuré des échanges email avec un contact. " +
-        "Inclut les sujets principaux, actions en cours, décisions prises et points en suspens. " +
-        "Cet outil peut prendre un moment car il analyse le contenu des emails.",
-      parameters: {
-        type: "object",
-        properties: {
-          name: {
+          start_date: {
             type: "string",
-            description: "Le nom complet du contact",
+            description: "Date de début pour filtrer les emails (format ISO 8601, ex: 2023-05-01T00:00:00Z). Optionnel.",
           },
-          email: {
+          end_date: {
             type: "string",
-            description: "L'adresse email exacte du contact",
+            description: "Date de fin pour filtrer les emails (format ISO 8601, ex: 2023-06-01T00:00:00Z). Optionnel.",
+          },
+          query: {
+            type: "string",
+            description: "Recherche sémantique : filtre les emails par pertinence par rapport à cette query (ex: 'intelligence artificielle', 'budget'). Optionnel.",
           },
         },
         required: ["name", "email"],
@@ -109,7 +100,8 @@ export const AGENT_TOOLS: ToolDefinition[] = [
       name: "search_emails",
       description:
         "Recherche plein-texte dans les emails de l'utilisateur. " +
-        "Cherche dans les sujets, corps et expéditeurs.",
+        "Cherche dans les sujets, corps et expéditeurs. " +
+        "Supporte le filtrage par période temporelle via start_date/end_date.",
       parameters: {
         type: "object",
         properties: {
@@ -120,6 +112,14 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           max_results: {
             type: "number",
             description: "Nombre maximum de résultats (défaut: 20)",
+          },
+          start_date: {
+            type: "string",
+            description: "Date de début pour filtrer les emails (format ISO 8601, ex: 2023-05-01T00:00:00Z). Optionnel.",
+          },
+          end_date: {
+            type: "string",
+            description: "Date de fin pour filtrer les emails (format ISO 8601, ex: 2023-06-01T00:00:00Z). Optionnel.",
           },
         },
         required: ["query"],
@@ -155,7 +155,8 @@ export const AGENT_TOOLS: ToolDefinition[] = [
       description:
         "Ouvre la recherche Outlook filtrée dans un nouvel onglet pour afficher les emails d'un contact. " +
         "Utiliser quand l'utilisateur veut VOIR/AFFICHER/MONTRER ses échanges (pas les résumer). " +
-        "Retourne un lien cliquable que l'utilisateur peut ouvrir.",
+        "Retourne un lien cliquable que l'utilisateur peut ouvrir. " +
+        "Supporte le filtrage par période temporelle via start_date/end_date.",
       parameters: {
         type: "object",
         properties: {
@@ -166,6 +167,14 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           email: {
             type: "string",
             description: "L'adresse email du contact",
+          },
+          start_date: {
+            type: "string",
+            description: "Date de début pour filtrer les emails (format ISO 8601, ex: 2023-05-01T00:00:00Z). Optionnel.",
+          },
+          end_date: {
+            type: "string",
+            description: "Date de fin pour filtrer les emails (format ISO 8601, ex: 2023-06-01T00:00:00Z). Optionnel.",
           },
         },
         required: ["name", "email"],
@@ -178,6 +187,12 @@ export const AGENT_TOOLS: ToolDefinition[] = [
 
 type LogFn = (msg: string) => void;
 type ToolExecutor = (args: Record<string, unknown>, log: LogFn) => Promise<string>;
+
+function extractDateRange(args: Record<string, unknown>): DateRange | undefined {
+  const startDate = args.start_date as string | undefined;
+  const endDate = args.end_date as string | undefined;
+  return (startDate || endDate) ? { startDate, endDate } : undefined;
+}
 
 const executors: Record<string, ToolExecutor> = {
   async search_contacts(args, log) {
@@ -192,103 +207,81 @@ const executors: Record<string, ToolExecutor> = {
   async get_email_interactions(args, log) {
     const name = args.name as string;
     const email = args.email as string;
+    const dateRange = extractDateRange(args);
+    const query = args.query as string | undefined;
+
+    // Default to last 6 months if no date range specified
+    const effectiveDateRange = dateRange || {
+      startDate: new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString(),
+      endDate: new Date().toISOString(),
+    };
+    const usingDefault = !dateRange;
 
     // Skip direct email search if no email address (ServiceDesk-only contacts)
     const [{ received, sent }, serviceDeskEmails] = await Promise.all([
-      email ? getAllInteractions(email) : Promise.resolve({ received: [], sent: [] }),
-      getServiceDeskEmailsForPerson(name),
+      email ? getAllInteractions(email, undefined, effectiveDateRange) : Promise.resolve({ received: [], sent: [] }),
+      getServiceDeskEmailsForPerson(name, undefined, effectiveDateRange),
     ]);
 
-    log(`Emails collectés: ${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk`);
-    for (const e of received.slice(0, 10)) {
-      log(`  [reçu] ${e.receivedDateTime?.slice(0, 10)} | ${e.from?.emailAddress?.name || "?"} | ${e.subject}`);
-    }
-    for (const e of sent.slice(0, 10)) {
-      log(`  [envoyé] ${(e.sentDateTime || e.receivedDateTime)?.slice(0, 10)} | ${e.subject}`);
-    }
-    for (const e of serviceDeskEmails.slice(0, 10)) {
-      log(`  [ServiceNow] ${e.receivedDateTime?.slice(0, 10)} | ${e.subject}`);
+    log(`Emails collectés: ${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk${usingDefault ? " (limité aux 6 derniers mois par défaut)" : ""}`);
+
+    // Merge all emails into a unified list
+    const allEmails = [
+      ...received.map((e) => ({ ...e, direction: "received" as const, displayDate: e.receivedDateTime })),
+      ...sent.map((e) => ({ ...e, direction: "sent" as const, displayDate: e.sentDateTime || e.receivedDateTime })),
+      ...serviceDeskEmails.map((e) => ({ ...e, direction: "servicedesk" as const, displayDate: e.receivedDateTime, subject: `[ServiceNow] ${e.subject}` })),
+    ];
+
+    let topEmails = allEmails;
+
+    // Cap at 500 emails for embeddings
+    const MAX_EMAILS_FOR_EMBEDDINGS = 500;
+    let capped = false;
+    if (topEmails.length > MAX_EMAILS_FOR_EMBEDDINGS) {
+      topEmails.sort((a, b) => new Date(b.displayDate).getTime() - new Date(a.displayDate).getTime());
+      topEmails = topEmails.slice(0, MAX_EMAILS_FOR_EMBEDDINGS);
+      capped = true;
+      log(`Cap appliqué: ${allEmails.length} emails réduits à ${MAX_EMAILS_FOR_EMBEDDINGS} (les plus récents)`);
     }
 
-    const receivedSummary = received.slice(0, 20).map((e) => ({
+    // Semantic search via embeddings if query is provided
+    if (query && topEmails.length > 0) {
+      log(`Recherche sémantique: "${query}" sur ${topEmails.length} emails...`);
+      const texts = topEmails.map((e) => {
+        const body = e.body?.content
+          ? e.body.content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 2000)
+          : e.bodyPreview?.slice(0, 500) || "";
+        return `${e.subject} ${body}`;
+      });
+      const [queryEmbeddings, ...itemEmbeddings] = await batchEmbed([query, ...texts]);
+      const ranked = rankBySimilarity(queryEmbeddings, itemEmbeddings);
+      const topN = Math.min(30, topEmails.length);
+      topEmails = ranked.slice(0, topN).map((r) => topEmails[r.index]);
+      log(`Top ${topN} emails par pertinence sélectionnés (score max: ${ranked[0]?.score.toFixed(3)})`);
+    }
+
+    // Sort by date descending
+    topEmails.sort((a, b) => new Date(b.displayDate).getTime() - new Date(a.displayDate).getTime());
+
+    for (const e of topEmails.slice(0, 10)) {
+      const tag = e.direction === "sent" ? "envoyé" : e.direction === "servicedesk" ? "ServiceNow" : "reçu";
+      log(`  [${tag}] ${e.displayDate?.slice(0, 10)} | ${e.subject}`);
+    }
+
+    const emailSummaries = topEmails.slice(0, 30).map((e) => ({
       subject: e.subject,
-      date: e.receivedDateTime,
-      preview: e.bodyPreview?.slice(0, 150),
-    }));
-    const sentSummary = sent.slice(0, 20).map((e) => ({
-      subject: e.subject,
-      date: e.sentDateTime || e.receivedDateTime,
-      preview: e.bodyPreview?.slice(0, 150),
-    }));
-    const serviceDeskSummary = serviceDeskEmails.slice(0, 20).map((e) => ({
-      subject: `[ServiceNow] ${e.subject}`,
-      date: e.receivedDateTime,
-      preview: e.bodyPreview?.slice(0, 150),
+      date: e.displayDate,
+      direction: e.direction,
+      preview: e.bodyPreview?.slice(0, 200),
     }));
 
     return JSON.stringify({
-      received_count: received.length,
-      sent_count: sent.length,
-      servicedesk_count: serviceDeskEmails.length,
-      recent_received: receivedSummary,
-      recent_sent: sentSummary,
-      recent_servicedesk: serviceDeskSummary,
-    });
-  },
-
-  async summarize_email_interactions(args, log) {
-    const name = args.name as string;
-    const email = args.email as string;
-
-    const [{ received, sent }, serviceDeskEmails] = await Promise.all([
-      email ? getAllInteractions(email) : Promise.resolve({ received: [], sent: [] }),
-      getServiceDeskEmailsForPerson(name),
-    ]);
-
-    log(`Résumé — emails collectés: ${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk`);
-    for (const e of received) {
-      log(`  [reçu] ${e.receivedDateTime?.slice(0, 10)} | ${e.from?.emailAddress?.name || "?"} | ${e.subject}`);
-    }
-    for (const e of sent) {
-      log(`  [envoyé] ${(e.sentDateTime || e.receivedDateTime)?.slice(0, 10)} | ${e.subject}`);
-    }
-    for (const e of serviceDeskEmails) {
-      log(`  [ServiceNow] ${e.receivedDateTime?.slice(0, 10)} | ${e.subject}`);
-    }
-
-    if (received.length === 0 && sent.length === 0 && serviceDeskEmails.length === 0) {
-      return JSON.stringify({ message: `Aucun email trouvé avec ${name} (${email}).` });
-    }
-
-    const receivedData = received.map((e) => ({
-      subject: e.subject,
-      body: e.body?.content || e.bodyPreview || "",
-      date: e.receivedDateTime,
-    }));
-
-    const serviceDeskData = serviceDeskEmails.map((e) => ({
-      subject: `[ServiceNow] ${e.subject}`,
-      body: e.body?.content || e.bodyPreview || "",
-      date: e.receivedDateTime,
-    }));
-
-    const sentData = sent.map((e) => ({
-      subject: e.subject,
-      body: e.body?.content || e.bodyPreview || "",
-      date: e.sentDateTime || e.receivedDateTime,
-    }));
-
-    const allReceived = [...receivedData, ...serviceDeskData];
-    log(`Total emails envoyés au LLM pour résumé: ${allReceived.length + sentData.length}`);
-
-    const summary = await summarizeInteractions(name, email, allReceived, sentData);
-    return JSON.stringify({
-      summary,
-      email_count: {
-        received: received.length,
-        sent: sent.length,
-        servicedesk: serviceDeskEmails.length,
-      },
+      total_count: allEmails.length,
+      returned_count: emailSummaries.length,
+      query: query || null,
+      default_period: usingDefault ? "6 derniers mois" : null,
+      capped: capped ? `Limité à 500 emails sur ${allEmails.length} total` : null,
+      emails: emailSummaries,
     });
   },
 
@@ -319,7 +312,8 @@ const executors: Record<string, ToolExecutor> = {
   async search_emails(args, _log) {
     const query = args.query as string;
     const maxResults = (args.max_results as number) || 20;
-    const emails = await searchEmails(query, maxResults);
+    const dateRange = extractDateRange(args);
+    const emails = await searchEmails(query, maxResults, dateRange);
 
     const results = emails.map((e) => ({
       id: e.id,
@@ -335,10 +329,11 @@ const executors: Record<string, ToolExecutor> = {
   async show_emails(args, log) {
     const name = args.name as string;
     const email = args.email as string;
+    const dateRange = extractDateRange(args);
 
     const [{ received, sent }, serviceDeskEmails] = await Promise.all([
-      email ? getAllInteractions(email) : Promise.resolve({ received: [], sent: [] }),
-      getServiceDeskEmailsForPerson(name),
+      email ? getAllInteractions(email, undefined, dateRange) : Promise.resolve({ received: [], sent: [] }),
+      getServiceDeskEmailsForPerson(name, undefined, dateRange),
     ]);
 
     // Build a unified list sorted by date

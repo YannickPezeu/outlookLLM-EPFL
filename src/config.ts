@@ -8,7 +8,7 @@ export const config = {
     clientId: process.env.ENTRA_CLIENT_ID || "YOUR_CLIENT_ID",
     tenantId: process.env.ENTRA_TENANT_ID || "YOUR_TENANT_ID",
     authority: `https://login.microsoftonline.com/${process.env.ENTRA_TENANT_ID || "YOUR_TENANT_ID"}`,
-    redirectUri: window.location.origin + "/taskpane.html",
+    redirectUri: window.location.origin + window.location.pathname,
   },
 
   // Microsoft Graph

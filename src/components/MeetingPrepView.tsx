@@ -25,6 +25,7 @@ import {
   PipelineProgress,
   MeetingBriefing,
 } from "../services/meetingPrepService";
+import { useOutlookItem } from "./OutlookItemContext";
 
 /* global Office */
 
@@ -115,6 +116,7 @@ const MarkdownRenderer: React.FC<{ content: string; className?: string }> = ({
 
 export const MeetingPrepView: React.FC = () => {
   const styles = useStyles();
+  const { item: dialogItem } = useOutlookItem();
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<PipelineProgress | null>(null);
   const [briefingText, setBriefingText] = useState("");
@@ -136,39 +138,43 @@ export const MeetingPrepView: React.FC = () => {
     abortRef.current = false;
 
     try {
-      const item = Office.context?.mailbox?.item;
-      if (!item) {
-        setError(
-          "Aucun événement sélectionné. Ouvrez un événement calendrier dans Outlook pour préparer la réunion."
-        );
-        setLoading(false);
-        return;
+      let restId: string;
+      let subject: string;
+      let startDate: string | null;
+
+      if (dialogItem) {
+        // Dialog mode: use data relayed from taskpane
+        restId = dialogItem.itemId;
+        subject = dialogItem.subject || "Réunion";
+        startDate = dialogItem.start;
+      } else {
+        // Taskpane mode: read Office.context directly
+        const item = Office.context?.mailbox?.item;
+        if (!item || !item.itemId) {
+          setError(
+            "Aucun événement sélectionné. Ouvrez un événement calendrier dans Outlook pour préparer la réunion."
+          );
+          setLoading(false);
+          return;
+        }
+
+        restId = item.itemId;
+        try {
+          restId = Office.context.mailbox.convertToRestId(
+            item.itemId,
+            Office.MailboxEnums.RestVersion.v2_0
+          );
+        } catch {
+          // If conversion fails, use original ID
+        }
+        subject = item.subject || "Réunion";
+        startDate = item.start ? (item.start as unknown as string) : null;
       }
 
-      // Get the item ID — this works for both mail and calendar items
-      const itemId = item.itemId;
-      if (!itemId) {
-        setError("Impossible de lire l'identifiant de l'événement.");
-        setLoading(false);
-        return;
-      }
-
-      // Always convert to REST API format (works for both desktop and web)
-      let restId = itemId;
-      try {
-        restId = Office.context.mailbox.convertToRestId(
-          itemId,
-          Office.MailboxEnums.RestVersion.v2_0
-        );
-      } catch {
-        // If conversion fails, use original ID
-      }
-
-      // Try to get basic event info from Office.js
       setEventInfo({
-        subject: item.subject || "Réunion",
-        date: item.start
-          ? new Date(item.start as unknown as string).toLocaleDateString("fr-FR", {
+        subject,
+        date: startDate
+          ? new Date(startDate).toLocaleDateString("fr-FR", {
               weekday: "long",
               day: "numeric",
               month: "long",
@@ -211,7 +217,7 @@ export const MeetingPrepView: React.FC = () => {
     } finally {
       if (!abortRef.current) setLoading(false);
     }
-  }, []);
+  }, [dialogItem]);
 
   const phaseLabel: Record<string, string> = {
     extracting_context: "Contexte",

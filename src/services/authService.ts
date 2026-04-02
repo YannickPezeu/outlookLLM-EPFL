@@ -58,6 +58,12 @@ export function getAccount(): AccountInfo | null {
  * In dev mode, uses a manually pasted Graph Explorer token from localStorage.
  */
 export async function getGraphToken(): Promise<string> {
+  // Pop-out dialog: token relayed from taskpane takes priority
+  const popoutToken = localStorage.getItem("graph_popout_token");
+  if (popoutToken) {
+    return popoutToken;
+  }
+
   // Dev mode: use manually pasted token (from Graph Explorer)
   const devToken = localStorage.getItem("graph_dev_token");
   if (devToken) {

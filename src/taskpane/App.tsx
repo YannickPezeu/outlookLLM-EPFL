@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Tab,
   TabList,
@@ -7,20 +7,23 @@ import {
   MessageBarBody,
   makeStyles,
   tokens,
+  Button,
+  Tooltip,
 } from "@fluentui/react-components";
 import {
   Bot24Regular,
   CalendarLtr24Regular,
-  Mail24Regular,
-  PeopleChat24Regular,
   Settings24Regular,
+  OpenRegular,
 } from "@fluentui/react-icons";
-import { initAuth, isAuthenticated, getAccount } from "../services/authService";
+import { initAuth, isAuthenticated, getAccount, getGraphToken } from "../services/authService";
 import { AssistantView } from "../components/AssistantView";
 import { MeetingPrepView } from "../components/MeetingPrepView";
-import { SummarizeView } from "../components/SummarizeView";
-import { InteractionsView } from "../components/InteractionsView";
 import { SettingsView } from "../components/SettingsView";
+import { OutlookItemProvider, useOutlookItem } from "../components/OutlookItemContext";
+import type { OutlookItemData } from "../types/dialogMessages";
+
+/* global Office */
 
 const useStyles = makeStyles({
   container: {
@@ -34,10 +37,16 @@ const useStyles = makeStyles({
     borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
     backgroundColor: tokens.colorNeutralBackground1,
   },
+  headerRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: "8px",
+  },
   title: {
     fontSize: tokens.fontSizeBase400,
     fontWeight: tokens.fontWeightSemibold,
-    margin: "0 0 8px 0",
+    margin: "0",
     color: tokens.colorBrandForeground1,
   },
   content: {
@@ -53,29 +62,159 @@ const useStyles = makeStyles({
   },
 });
 
-type TabType = "assistant" | "meeting" | "summarize" | "interactions" | "settings";
+type TabType = "assistant" | "meeting" | "settings";
+
+const isInDialog = (): boolean => {
+  try {
+    return new URLSearchParams(window.location.search).has("popout");
+  } catch {
+    return false;
+  }
+};
+
+/** Read current Office item and convert to REST-format data */
+const readCurrentItem = (): OutlookItemData | null => {
+  try {
+    const item = Office.context?.mailbox?.item;
+    if (!item || !item.itemId) return null;
+
+    let restId = item.itemId;
+    try {
+      restId = Office.context.mailbox.convertToRestId(
+        item.itemId,
+        Office.MailboxEnums.RestVersion.v2_0
+      );
+    } catch { /* use original */ }
+
+    return {
+      itemId: restId,
+      subject: item.subject || "",
+      start: item.start ? (item.start as unknown as string) : null,
+      itemType: item.itemType?.toString() || "unknown",
+    };
+  } catch {
+    return null;
+  }
+};
 
 export const App: React.FC = () => {
+  const inDialog = useMemo(() => isInDialog(), []);
+
+  return (
+    <OutlookItemProvider>
+      <AppContent inDialog={inDialog} />
+    </OutlookItemProvider>
+  );
+};
+
+const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
   const styles = useStyles();
   const [activeTab, setActiveTab] = useState<TabType>("assistant");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const dialogRef = useRef<Office.Dialog | null>(null);
+  const { setItem } = useOutlookItem();
+
+  // Open pop-out dialog
+  const openPopout = async () => {
+    const baseUrl = window.location.origin + window.location.pathname;
+
+    // Build dialog URL with token and item data in hash (bypasses storage partitioning)
+    const hashParams = new URLSearchParams();
+    try {
+      const token = await getGraphToken();
+      hashParams.set("token", token);
+    } catch (err) {
+      console.warn("[App] Could not get Graph token for dialog:", err);
+    }
+    const itemData = readCurrentItem();
+    if (itemData) {
+      hashParams.set("item", JSON.stringify(itemData));
+    }
+
+    const dialogUrl = baseUrl + "?popout=1#" + hashParams.toString();
+
+    Office.context.ui.displayDialogAsync(
+      dialogUrl,
+      { height: 80, width: 45, displayInIframe: false },
+      (result) => {
+        if (result.status === Office.AsyncResultStatus.Failed) {
+          console.error("[App] Failed to open pop-out dialog:", result.error.message);
+          return;
+        }
+        const dialog = result.value;
+        dialogRef.current = dialog;
+        dialog.addEventHandler(Office.EventType.DialogEventReceived, () => {
+          dialogRef.current = null;
+        });
+      }
+    );
+  };
 
   useEffect(() => {
-    initAuth()
+    // In dialog mode, initAuth may hang (NAA broker unavailable), so add a timeout
+    const authPromise = initAuth();
+    const timeoutMs = inDialog ? 5000 : 30000;
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Auth timeout")), timeoutMs)
+    );
+
+    Promise.race([authPromise, timeout])
       .then(() => {
         setAuthReady(true);
         setLoading(false);
       })
       .catch((err) => {
-        // Auth failure is non-blocking: user can still configure RCP settings
-        // and test the UI. Graph API features will fail gracefully.
-        console.warn("[App] Auth init failed (expected if clientId not configured):", err.message);
-        setError(`Auth non configuree - configurez clientId dans config.ts. L'onglet Config RCP reste accessible.`);
+        console.warn("[App] Auth init failed:", err.message);
+        if (!inDialog) {
+          setError(`Auth non configuree - configurez clientId dans config.ts. L'onglet Config RCP reste accessible.`);
+        }
         setLoading(false);
       });
   }, []);
+
+  // Taskpane: listen for item changes and update localStorage for dialog
+  useEffect(() => {
+    if (inDialog) return;
+    try {
+      Office.context.mailbox.addHandlerAsync(
+        Office.EventType.ItemChanged,
+        () => {
+          setTimeout(() => {
+            const itemData = readCurrentItem();
+            localStorage.setItem("popout_item_data", itemData ? JSON.stringify(itemData) : "");
+            // Also refresh the Graph token
+            getGraphToken()
+              .then((token) => localStorage.setItem("graph_popout_token", token))
+              .catch(() => {});
+          }, 200);
+        }
+      );
+    } catch (err) {
+      console.warn("[App] Could not register ItemChanged handler:", err);
+    }
+  }, []);
+
+  // Dialog: read token and item data from URL hash (set by taskpane before opening)
+  useEffect(() => {
+    if (!inDialog) return;
+    try {
+      const hash = window.location.hash.slice(1); // remove #
+      if (!hash) return;
+      const params = new URLSearchParams(hash);
+      const token = params.get("token");
+      if (token) {
+        localStorage.setItem("graph_popout_token", token);
+      }
+      const itemRaw = params.get("item");
+      if (itemRaw) {
+        setItem(JSON.parse(itemRaw));
+      }
+    } catch (err) {
+      console.warn("[Dialog] Could not read data from URL hash:", err);
+    }
+  }, [inDialog, setItem]);
 
   if (loading) {
     return (
@@ -88,7 +227,19 @@ export const App: React.FC = () => {
   return (
     <div className={styles.container}>
       <div className={styles.header}>
-        <h1 className={styles.title}>EPFL Mail AI</h1>
+        <div className={styles.headerRow}>
+          <h1 className={styles.title}>EPFL Mail AI</h1>
+          {!inDialog && (
+            <Tooltip content="Ouvrir dans une fenêtre dédiée" relationship="label">
+              <Button
+                appearance="subtle"
+                icon={<OpenRegular />}
+                size="small"
+                onClick={openPopout}
+              />
+            </Tooltip>
+          )}
+        </div>
         <TabList
           selectedValue={activeTab}
           onTabSelect={(_, data) => setActiveTab(data.value as TabType)}
@@ -99,12 +250,6 @@ export const App: React.FC = () => {
           </Tab>
           <Tab value="meeting" icon={<CalendarLtr24Regular />}>
             Réunion
-          </Tab>
-          <Tab value="summarize" icon={<Mail24Regular />}>
-            Résumé
-          </Tab>
-          <Tab value="interactions" icon={<PeopleChat24Regular />}>
-            Interactions
           </Tab>
           <Tab value="settings" icon={<Settings24Regular />}>
             Config
@@ -121,8 +266,6 @@ export const App: React.FC = () => {
 
         {activeTab === "assistant" && <AssistantView />}
         {activeTab === "meeting" && <MeetingPrepView />}
-        {activeTab === "summarize" && <SummarizeView />}
-        {activeTab === "interactions" && <InteractionsView />}
         {activeTab === "settings" && <SettingsView />}
       </div>
     </div>

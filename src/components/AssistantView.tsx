@@ -10,8 +10,8 @@ import {
   tokens,
   Badge,
 } from "@fluentui/react-components";
-import { Send24Regular, Bot24Regular, Info24Regular } from "@fluentui/react-icons";
-import { runAgent, type ToolProgressCallback, type StreamCallback, type LogCallback, type EmailListCallback, type EmailListItem } from "../services/agentService";
+import { Send24Regular, Bot24Regular } from "@fluentui/react-icons";
+import { runAgent, type ToolProgressCallback, type StreamCallback, type EmailListCallback, type EmailListItem } from "../services/agentService";
 import { Mail24Regular } from "@fluentui/react-icons";
 import { type AgentMessage } from "../services/rcpApiService";
 
@@ -126,16 +126,6 @@ const useStyles = makeStyles({
     textAlign: "center",
     padding: "20px",
   },
-  logToggle: {
-    display: "flex",
-    alignItems: "center",
-    gap: "4px",
-    cursor: "pointer",
-    fontSize: tokens.fontSizeBase100,
-    color: tokens.colorNeutralForeground3,
-    padding: "4px 0",
-    userSelect: "none",
-  },
   emailList: {
     display: "flex",
     flexDirection: "column",
@@ -176,18 +166,6 @@ const useStyles = makeStyles({
   emailItemMeta: {
     fontSize: tokens.fontSizeBase100,
     color: tokens.colorNeutralForeground3,
-  },
-  logPanel: {
-    maxHeight: "150px",
-    overflow: "auto",
-    backgroundColor: tokens.colorNeutralBackground3,
-    borderRadius: tokens.borderRadiusMedium,
-    padding: "8px",
-    fontSize: "11px",
-    fontFamily: "monospace",
-    lineHeight: "1.4",
-    whiteSpace: "pre-wrap",
-    color: tokens.colorNeutralForeground2,
   },
 });
 
@@ -238,10 +216,7 @@ export const AssistantView: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [toolProgress, setToolProgress] = useState<ToolProgress[]>([]);
   const [streamingContent, setStreamingContent] = useState("");
-  const [logs, setLogs] = useState<string[]>([]);
-  const [showLogs, setShowLogs] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const logEndRef = useRef<HTMLDivElement>(null);
   const conversationRef = useRef<AgentMessage[]>([]);
   const pendingEmailListRef = useRef<{ name: string; emails: EmailListItem[] } | null>(null);
 
@@ -259,7 +234,6 @@ export const AssistantView: React.FC = () => {
     setLoading(true);
     setToolProgress([]);
     setStreamingContent("");
-    setLogs([]);
 
     const onToolProgress: ToolProgressCallback = (toolName, status, detail) => {
       setToolProgress((prev) => {
@@ -277,11 +251,6 @@ export const AssistantView: React.FC = () => {
       setStreamingContent((prev) => prev + chunk);
     };
 
-    const onLog: LogCallback = (message) => {
-      const timestamp = new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-      setLogs((prev) => [...prev, `${timestamp} ${message}`]);
-    };
-
     const onEmailList: EmailListCallback = (name, emails) => {
       pendingEmailListRef.current = { name, emails };
     };
@@ -292,7 +261,7 @@ export const AssistantView: React.FC = () => {
         conversationRef.current,
         onToolProgress,
         onStream,
-        onLog,
+        undefined,
         onEmailList
       );
 
@@ -393,15 +362,33 @@ export const AssistantView: React.FC = () => {
         ))}
 
         {/* Tool progress indicators */}
-        {toolProgress.map((tp, i) => (
-          <div key={`tool-${i}`} className={styles.toolIndicator}>
-            {tp.status === "calling" && <Spinner size="tiny" />}
-            {tp.status === "done" && <Badge appearance="filled" color="success" size="tiny" />}
-            {tp.status === "error" && <Badge appearance="filled" color="danger" size="tiny" />}
-            <span>{TOOL_LABELS[tp.toolName] || tp.toolName}</span>
-            {tp.status === "calling" && "..."}
-          </div>
-        ))}
+        {toolProgress.map((tp, i) => {
+          // Format tool args for display
+          let argsDisplay = "";
+          if (tp.detail) {
+            try {
+              const args = JSON.parse(tp.detail);
+              const parts: string[] = [];
+              if (args.name) parts.push(args.name);
+              if (args.query) parts.push(`"${args.query}"`);
+              if (args.start_date || args.end_date) {
+                const from = args.start_date?.slice(0, 10) || "...";
+                const to = args.end_date?.slice(0, 10) || "...";
+                parts.push(`${from} → ${to}`);
+              }
+              if (parts.length > 0) argsDisplay = ` (${parts.join(", ")})`;
+            } catch { /* ignore */ }
+          }
+          return (
+            <div key={`tool-${i}`} className={styles.toolIndicator}>
+              {tp.status === "calling" && <Spinner size="tiny" />}
+              {tp.status === "done" && <Badge appearance="filled" color="success" size="tiny" />}
+              {tp.status === "error" && <Badge appearance="filled" color="danger" size="tiny" />}
+              <span>{TOOL_LABELS[tp.toolName] || tp.toolName}{argsDisplay}</span>
+              {tp.status === "calling" && "..."}
+            </div>
+          );
+        })}
 
         {/* Streaming response */}
         {streamingContent && (
@@ -425,27 +412,6 @@ export const AssistantView: React.FC = () => {
             </Button>
           ))}
         </div>
-      )}
-
-      {/* Log panel */}
-      {logs.length > 0 && (
-        <>
-          <div
-            className={styles.logToggle}
-            onClick={() => setShowLogs((prev) => !prev)}
-          >
-            <Info24Regular style={{ fontSize: "14px" }} />
-            <span>{showLogs ? "Masquer" : "Afficher"} les logs ({logs.length})</span>
-          </div>
-          {showLogs && (
-            <div className={styles.logPanel}>
-              {logs.map((l, i) => (
-                <div key={i}>{l}</div>
-              ))}
-              <div ref={logEndRef} />
-            </div>
-          )}
-        </>
       )}
 
       <div className={styles.inputArea}>

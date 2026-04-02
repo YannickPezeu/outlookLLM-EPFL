@@ -68,14 +68,47 @@ export interface CalendarEvent {
   seriesMasterId?: string;
 }
 
+export interface DateRange {
+  startDate?: string; // ISO 8601, e.g. "2023-05-01"
+  endDate?: string;   // ISO 8601, e.g. "2023-06-01"
+}
+
 interface GraphPagedResponse<T> {
   value: T[];
   "@odata.nextLink"?: string;
 }
 
+/**
+ * Build OData $filter clause for date range.
+ * E.g. → "receivedDateTime ge 2023-10-01T00:00:00Z and receivedDateTime lt 2024-01-01T00:00:00Z"
+ */
+function buildDateFilter(dateRange?: DateRange, field = "receivedDateTime"): string {
+  if (!dateRange) return "";
+  const parts: string[] = [];
+  if (dateRange.startDate) parts.push(`${field} ge ${dateRange.startDate.slice(0, 10)}T00:00:00Z`);
+  if (dateRange.endDate) parts.push(`${field} lt ${dateRange.endDate.slice(0, 10)}T00:00:00Z`);
+  return parts.join(" and ");
+}
+
+/**
+ * Client-side sender filtering (used when $filter handles dates only).
+ */
+function filterBySender(items: EmailMessage[], senderEmail: string): EmailMessage[] {
+  const lower = senderEmail.toLowerCase();
+  return items.filter(e => e.from?.emailAddress?.address?.toLowerCase() === lower);
+}
+
+function filterByRecipient(items: EmailMessage[], recipientEmail: string): EmailMessage[] {
+  const lower = recipientEmail.toLowerCase();
+  return items.filter(e =>
+    e.toRecipients?.some(r => r.emailAddress?.address?.toLowerCase() === lower)
+  );
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 async function graphFetch<T>(url: string, options?: RequestInit): Promise<T> {
+  console.log(`[Graph] ${options?.method || "GET"} ${url}`);
   const token = await getGraphToken();
   const response = await fetch(url, {
     ...options,
@@ -88,6 +121,7 @@ async function graphFetch<T>(url: string, options?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const errorBody = await response.text();
+    console.error(`[Graph] Error ${response.status}:`, errorBody);
     throw new Error(`Graph API error ${response.status}: ${errorBody}`);
   }
 
@@ -117,11 +151,20 @@ async function fetchAllPages<T>(url: string, maxItems: number): Promise<T[]> {
  */
 export async function searchEmailsFromSender(
   senderEmail: string,
-  maxResults = config.defaults.maxEmailsToFetch
+  maxResults = config.defaults.maxEmailsToFetch,
+  dateRange?: DateRange
 ): Promise<EmailMessage[]> {
   const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead";
-  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=50`;
 
+  if (dateRange) {
+    // $filter on date only, post-filter sender client-side
+    const dateFilter = buildDateFilter(dateRange);
+    const url = `${GRAPH}/me/messages?$filter=${encodeURI(dateFilter)}&$orderby=receivedDateTime desc&$select=${select}&$top=50`;
+    const results = await fetchAllPages<EmailMessage>(url, 1000);
+    return filterBySender(results, senderEmail).slice(0, maxResults);
+  }
+
+  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=50`;
   return fetchAllPages<EmailMessage>(url, maxResults);
 }
 
@@ -130,11 +173,20 @@ export async function searchEmailsFromSender(
  */
 export async function searchEmailsSentTo(
   recipientEmail: string,
-  maxResults = config.defaults.maxEmailsToFetch
+  maxResults = config.defaults.maxEmailsToFetch,
+  dateRange?: DateRange
 ): Promise<EmailMessage[]> {
-  // Use $search for sent items (OData $filter on toRecipients is limited)
-  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId&$top=50`;
+  const select = "id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId";
 
+  if (dateRange) {
+    // $filter on date only, post-filter recipient client-side
+    const dateFilter = buildDateFilter(dateRange, "sentDateTime");
+    const url = `${GRAPH}/me/mailFolders/sentitems/messages?$filter=${encodeURI(dateFilter)}&$orderby=sentDateTime desc&$select=${select}&$top=50`;
+    const results = await fetchAllPages<EmailMessage>(url, 1000);
+    return filterByRecipient(results, recipientEmail).slice(0, maxResults);
+  }
+
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=${select}&$top=50`;
   return fetchAllPages<EmailMessage>(url, maxResults);
 }
 
@@ -143,11 +195,12 @@ export async function searchEmailsSentTo(
  */
 export async function getAllInteractions(
   email: string,
-  maxPerDirection = config.defaults.maxEmailsForSummary
+  maxPerDirection = config.defaults.maxEmailsForSummary,
+  dateRange?: DateRange
 ): Promise<{ received: EmailMessage[]; sent: EmailMessage[] }> {
   const [received, sent] = await Promise.all([
-    searchEmailsFromSender(email, maxPerDirection),
-    searchEmailsSentTo(email, maxPerDirection),
+    searchEmailsFromSender(email, maxPerDirection, dateRange),
+    searchEmailsSentTo(email, maxPerDirection, dateRange),
   ]);
 
   return { received, sent };
@@ -595,9 +648,26 @@ export async function searchContactsByName(
  */
 export async function searchEmails(
   query: string,
-  maxResults = 20
+  maxResults = 20,
+  dateRange?: DateRange
 ): Promise<LightEmail[]> {
   const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+
+  if (dateRange) {
+    // Can't combine $search + $filter on messages, so $filter date + post-filter text client-side
+    const dateFilter = buildDateFilter(dateRange);
+    const url = `${GRAPH}/me/messages?$filter=${encodeURI(dateFilter)}&$orderby=receivedDateTime desc&$select=${select}&$top=50`;
+    const results = await fetchAllPages<LightEmail>(url, 1000);
+    const lower = query.toLowerCase();
+    const filtered = results.filter(e =>
+      e.subject?.toLowerCase().includes(lower) ||
+      e.bodyPreview?.toLowerCase().includes(lower) ||
+      e.from?.emailAddress?.name?.toLowerCase().includes(lower) ||
+      e.from?.emailAddress?.address?.toLowerCase().includes(lower)
+    );
+    return filtered.slice(0, maxResults);
+  }
+
   const encodedQuery = encodeURIComponent(query);
   const url = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=${select}&$top=50`;
   return fetchAllPages<LightEmail>(url, maxResults);
@@ -728,18 +798,33 @@ export async function searchContactsInServiceDesk(
  */
 export async function getServiceDeskEmailsForPerson(
   personName: string,
-  maxResults = 30
+  maxResults = 30,
+  dateRange?: DateRange
 ): Promise<EmailMessage[]> {
   // Split name into words and search each independently (no quotes)
   // so "Pablo Tanner" matches "Pablo Sidney Tanner" or "Tanner, Pablo"
   const nameWords = personName.trim().split(/\s+/);
   const searchTerms = nameWords.map((w) => encodeURIComponent(w)).join(" ");
-  const url = `${GRAPH}/me/messages?$search="from:${SERVICEDESK_EMAIL} ${searchTerms}"&$select=id,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isRead&$top=50`;
+  let url: string;
+
+  if (dateRange) {
+    // $filter date + $search for servicedesk sender won't combine, so use $filter date only
+    // then post-filter for servicedesk sender + name in body
+    const dateFilter = buildDateFilter(dateRange);
+    url = `${GRAPH}/me/messages?$filter=${encodeURI(dateFilter)}&$orderby=receivedDateTime desc&$select=id,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isRead&$top=50`;
+  } else {
+    url = `${GRAPH}/me/messages?$search="from:${SERVICEDESK_EMAIL} ${searchTerms}"&$select=id,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isRead&$top=50`;
+  }
 
   console.log(`[serviceDeskEmails] Fetching ServiceDesk emails mentioning "${personName}" (words: ${nameWords.join(", ")})`);
 
   try {
-    const allMessages = await fetchAllPages<EmailMessage>(url, maxResults);
+    let allMessages = await fetchAllPages<EmailMessage>(url, dateRange ? 1000 : maxResults);
+
+    // When using $filter (date mode), also filter by ServiceDesk sender
+    if (dateRange) {
+      allMessages = filterBySender(allMessages, SERVICEDESK_EMAIL);
+    }
 
     // Post-filter: verify the person's name actually appears in the body
     // (Graph $search without quotes can return loose matches)
@@ -752,7 +837,7 @@ export async function getServiceDeskEmailsForPerson(
     });
 
     console.log(`[serviceDeskEmails] Found ${allMessages.length} emails, ${filtered.length} after name verification`);
-    return filtered;
+    return filtered.slice(0, maxResults);
   } catch (err) {
     console.warn(`[serviceDeskEmails] Search failed:`, (err as Error).message);
     return [];

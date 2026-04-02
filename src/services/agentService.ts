@@ -28,8 +28,11 @@ export type EmailListCallback = (name: string, emails: EmailListItem[]) => void;
 
 // ─── System Prompt ──────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `Tu es un assistant intelligent intégré dans Outlook pour les collaborateurs EPFL.
+function buildSystemPrompt(): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return `Tu es un assistant intelligent intégré dans Outlook pour les collaborateurs EPFL.
 Tu aides à chercher des emails, résumer des échanges, préparer des réunions et organiser la messagerie.
+La date actuelle est : ${today}.
 
 Règles importantes :
 - Quand l'utilisateur mentionne un contact par nom (ex: "Dupont", "Martin"), utilise TOUJOURS l'outil search_contacts d'abord pour trouver l'adresse email exacte avant d'appeler d'autres outils.
@@ -37,11 +40,19 @@ Règles importantes :
 - Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Ne demande confirmation que si tu hésites vraiment entre deux contacts plausibles.
 - Si search_contacts ne retourne aucun résultat pertinent, utilise search_contacts_in_servicedesk pour chercher dans les tickets ServiceNow (certains échanges passent par le ServiceDesk et le vrai nom de la personne n'apparaît que dans le corps du mail).
 - Si aucun outil ne trouve le contact, dis-le à l'utilisateur et suggère de reformuler.
-- Quand l'utilisateur veut VOIR, MONTRER ou AFFICHER ses emails avec quelqu'un, utilise show_emails (pas summarize_email_interactions). Quand il veut un RÉSUMÉ, utilise summarize_email_interactions.
+- Quand l'utilisateur veut VOIR, MONTRER ou AFFICHER ses emails avec quelqu'un, utilise show_emails. Quand il veut un RÉSUMÉ, utilise get_email_interactions pour récupérer les emails puis rédige toi-même le résumé structuré.
+- Quand l'utilisateur mentionne une période temporelle, convertis-la en paramètres start_date et end_date au format ISO 8601. Fais très attention à l'année mentionnée — ne remplace JAMAIS une année explicite par l'année courante. Exemples :
+  * "mai 2023" → start_date="2023-05-01T00:00:00Z", end_date="2023-06-01T00:00:00Z"
+  * "les 3 derniers mois de 2023" → start_date="2023-10-01T00:00:00Z", end_date="2024-01-01T00:00:00Z" (octobre, novembre, décembre 2023)
+  * "le mois dernier" → calcule en fonction de la date actuelle
+  * "depuis janvier" → depuis janvier de l'année courante jusqu'à aujourd'hui
+  N'utilise start_date/end_date que quand l'utilisateur mentionne explicitement une période.
+- Par défaut, get_email_interactions se limite aux 6 derniers mois. Si le résultat indique "default_period", informe l'utilisateur que la recherche couvre les 6 derniers mois et propose d'élargir si besoin.
 - Quand un outil retourne des résultats, évalue leur pertinence par rapport à la demande de l'utilisateur. Ne présente que les résultats réellement pertinents. Si aucun résultat n'est pertinent, dis-le clairement plutôt que d'afficher des résultats hors-sujet.
 - Réponds dans la langue utilisée par l'utilisateur.
 - Sois concis et structuré dans tes réponses.
 - Utilise le format Markdown pour structurer tes réponses. Quand show_emails retourne un lien, inclus-le en Markdown cliquable.`;
+}
 
 const MAX_ITERATIONS = 8;
 
@@ -65,7 +76,7 @@ export async function runAgent(
   };
   // Build message array: system + history + new user message
   const messages: AgentMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: buildSystemPrompt() },
     ...conversationHistory,
     { role: "user", content: userMessage },
   ];
@@ -146,7 +157,7 @@ export async function runAgent(
 
         try {
           const result = await executeTool(toolName, args, onLog);
-          log(`Tool ${toolName} OK — résultat: ${result.slice(0, 200)}${result.length > 200 ? '...' : ''}`);
+          log(`Tool ${toolName} OK — résultat: ${result.slice(0, 500)}${result.length > 500 ? '...' : ''}`);
           onToolProgress(toolName, "done");
 
           // Intercept show_emails to push email list to UI

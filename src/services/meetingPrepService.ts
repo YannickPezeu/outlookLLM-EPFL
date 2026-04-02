@@ -399,8 +399,16 @@ async function summarizeParticipant(
     chunks.push(currentChunk);
   }
 
+  const today = new Date().toLocaleDateString("fr-FR", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+
   const systemPrompt =
-    "Tu es un assistant qui prépare des briefings pour des réunions. " +
+    `Tu es un assistant qui prépare des briefings pour des réunions. ` +
+    `Nous sommes le ${today}. ` +
     "Résume les échanges email avec un participant de manière structurée en français. " +
     "Inclus : les sujets abordés, le ton général, les points en suspens, les engagements pris. " +
     "Si des pièces jointes sont présentes, intègre leur contenu dans l'analyse. " +
@@ -560,6 +568,7 @@ async function generateFinalBriefing(
       role: "system",
       content:
         "Tu es un assistant expert en préparation de réunions. " +
+        `Nous sommes le ${new Date().toLocaleDateString("fr-FR", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}. ` +
         "À partir des résumés d'échanges par participant, génère un briefing final structuré en français. " +
         "Le briefing doit inclure :\n" +
         "1. **Contexte** : pourquoi cette réunion a lieu\n" +
