@@ -1,16 +1,9 @@
 import { config } from "../config";
-import {
-  CalendarEvent,
-  LightEmail,
-  EmailMessage,
-  getCalendarEvent,
-  collectEmailsWithParticipant,
-  getEmailsBatch,
-  getMessageAttachments,
-} from "./graphMailService";
+import type { CalendarEvent, LightEmail, EmailMessage, MailDataSource } from "./mailTypes";
 import { batchEmbed, rankBySimilarity } from "./embeddingService";
 import { chatCompletionStream, ChatMessage } from "./rcpApiService";
-import { extractTextFromAttachments } from "./attachmentService";
+// Dynamic import to avoid pulling pdfjs-dist in Node.js eval environment
+const loadAttachmentService = () => import("./attachmentService");
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -56,6 +49,7 @@ type StreamCallback = (chunk: string) => void;
 // ─── Phase 1: Extract Context ───────────────────────────────────────
 
 async function extractContext(
+  ds: MailDataSource,
   eventId: string,
   onProgress: ProgressCallback
 ): Promise<{ event: CalendarEvent; participants: Participant[]; query: string }> {
@@ -65,7 +59,7 @@ async function extractContext(
     percent: 5,
   });
 
-  const event = await getCalendarEvent(eventId);
+  const event = await ds.getCalendarEvent(eventId);
 
   const participants: Participant[] = (event.attendees || [])
     .filter((a) => a.type !== "resource")
@@ -90,6 +84,7 @@ async function extractContext(
 // ─── Phase 2: Collect Emails ────────────────────────────────────────
 
 async function collectEmails(
+  ds: MailDataSource,
   participants: Participant[],
   onProgress: ProgressCallback
 ): Promise<Map<string, LightEmail[]>> {
@@ -110,7 +105,7 @@ async function collectEmails(
       message: `Collecte des emails : ${p.name} (${i + 1}/${participants.length})...`,
       percent: 15 + (i / participants.length) * 15,
     });
-    const emails = await collectEmailsWithParticipant(p.email);
+    const emails = await ds.collectEmailsWithParticipant(p.email);
     emailsByParticipant.set(p.email, emails);
     totalEmails += emails.length;
   }
@@ -277,6 +272,7 @@ async function rerankWithLLM(
 // ─── Phase 4: Read Full Emails ──────────────────────────────────────
 
 async function readFullEmails(
+  ds: MailDataSource,
   rankedEmails: RankedEmail[],
   onProgress: ProgressCallback
 ): Promise<Map<string, EmailMessage[]>> {
@@ -287,7 +283,7 @@ async function readFullEmails(
   });
 
   const messageIds = rankedEmails.map((r) => r.email.id);
-  const fullEmails = await getEmailsBatch(messageIds);
+  const fullEmails = await ds.getEmailsBatch(messageIds);
 
   // Extract attachments from emails that have them
   const emailsWithAttachments = fullEmails.filter((e) => e.hasAttachments);
@@ -300,8 +296,9 @@ async function readFullEmails(
 
     for (const email of emailsWithAttachments) {
       try {
-        const attachments = await getMessageAttachments(email.id);
+        const attachments = await ds.getMessageAttachments(email.id);
         if (attachments.length > 0) {
+          const { extractTextFromAttachments } = await loadAttachmentService();
           email.attachmentTexts = await extractTextFromAttachments(attachments);
         }
       } catch (err) {
@@ -613,12 +610,13 @@ async function generateFinalBriefing(
  * @returns The complete meeting briefing
  */
 export async function prepareMeeting(
+  ds: MailDataSource,
   eventId: string,
   onProgress: ProgressCallback,
   onStream: StreamCallback
 ): Promise<MeetingBriefing> {
   // Phase 1: Extract context
-  const { event, participants, query } = await extractContext(eventId, onProgress);
+  const { event, participants, query } = await extractContext(ds, eventId, onProgress);
 
   if (participants.length === 0) {
     onProgress({
@@ -635,7 +633,7 @@ export async function prepareMeeting(
   }
 
   // Phase 2: Collect emails per participant
-  const emailsByParticipant = await collectEmails(participants, onProgress);
+  const emailsByParticipant = await collectEmails(ds, participants, onProgress);
 
   // Phase 3: Embed + rank
   const rankedEmails = await embedAndRank(query, emailsByParticipant, onProgress);
@@ -644,7 +642,7 @@ export async function prepareMeeting(
   const rerankedEmails = await rerankWithLLM(query, rankedEmails, onProgress);
 
   // Phase 4: Read full body of selected emails
-  const fullEmailsByParticipant = await readFullEmails(rerankedEmails, onProgress);
+  const fullEmailsByParticipant = await readFullEmails(ds, rerankedEmails, onProgress);
 
   // Phase 5A: Per-participant summaries
   const participantBriefings = await summarizeAllParticipants(

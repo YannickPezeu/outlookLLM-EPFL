@@ -29,6 +29,7 @@ import {
   PipelineProgress,
   MeetingBriefing,
 } from "../services/meetingPrepService";
+import { GraphMailDataSource } from "../services/graphMailDataSource";
 import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
 
 const useStyles = makeStyles({
@@ -220,8 +221,9 @@ export const TestApp: React.FC = () => {
 
     try {
       const result = await prepareMeeting(
+        new GraphMailDataSource(),
         selectedEvent.id,
-        (prog) => {
+        (prog: PipelineProgress) => {
           if (!abortRef.current) setProgress(prog);
         },
         (chunk) => {

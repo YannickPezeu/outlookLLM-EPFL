@@ -19,13 +19,16 @@ import {
   Sparkle24Regular,
   People24Regular,
   Mail24Regular,
+  ArrowDownload24Regular,
 } from "@fluentui/react-icons";
 import {
   prepareMeeting,
   PipelineProgress,
   MeetingBriefing,
 } from "../services/meetingPrepService";
+import { GraphMailDataSource } from "../services/graphMailDataSource";
 import { useOutlookItem } from "./OutlookItemContext";
+import { exportToWord, exportToHtml } from "../services/exportService";
 
 /* global Office */
 
@@ -49,8 +52,6 @@ const useStyles = makeStyles({
     padding: "12px",
     backgroundColor: tokens.colorNeutralBackground2,
     borderRadius: tokens.borderRadiusMedium,
-    maxHeight: "500px",
-    overflow: "auto",
     "& h1": { fontSize: "18px", fontWeight: 600, margin: "16px 0 8px 0", borderBottom: `1px solid ${tokens.colorNeutralStroke2}`, paddingBottom: "4px" },
     "& h2": { fontSize: "16px", fontWeight: 600, margin: "14px 0 6px 0" },
     "& h3": { fontSize: "14px", fontWeight: 600, margin: "10px 0 4px 0" },
@@ -186,8 +187,9 @@ export const MeetingPrepView: React.FC = () => {
 
       // Run the pipeline
       const result = await prepareMeeting(
+        new GraphMailDataSource(),
         restId,
-        (prog) => {
+        (prog: PipelineProgress) => {
           if (!abortRef.current) setProgress(prog);
         },
         (chunk) => {
@@ -310,6 +312,36 @@ export const MeetingPrepView: React.FC = () => {
 
       {/* Streaming briefing output */}
       {briefingText && <MarkdownRenderer content={briefingText} className={styles.briefingBox} />}
+
+      {/* Export buttons */}
+      {briefingText && !loading && (
+        <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+          <Button
+            appearance="outline"
+            icon={<ArrowDownload24Regular />}
+            size="small"
+            onClick={() => {
+              const title = eventInfo?.subject || "Briefing";
+              const meta = { date: eventInfo?.date, attendees: eventInfo?.attendees };
+              exportToHtml(briefingText, title, meta);
+            }}
+          >
+            HTML
+          </Button>
+          <Button
+            appearance="outline"
+            icon={<ArrowDownload24Regular />}
+            size="small"
+            onClick={() => {
+              const title = eventInfo?.subject || "Briefing";
+              const meta = { date: eventInfo?.date, attendees: eventInfo?.attendees };
+              exportToWord(briefingText, title, meta);
+            }}
+          >
+            Word
+          </Button>
+        </div>
+      )}
     </div>
   );
 };
