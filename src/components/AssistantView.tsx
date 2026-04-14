@@ -11,7 +11,7 @@ import {
   Badge,
 } from "@fluentui/react-components";
 import { Send24Regular, Bot24Regular } from "@fluentui/react-icons";
-import { runAgent, type ToolProgressCallback, type StreamCallback, type EmailListCallback, type EmailListItem } from "../services/agentService";
+import { runAgent, resolveEmailRef, type ToolProgressCallback, type StreamCallback, type EmailListCallback, type EmailListItem } from "../services/agentService";
 import { Mail24Regular } from "@fluentui/react-icons";
 import { type AgentMessage } from "../services/rcpApiService";
 
@@ -19,6 +19,10 @@ import { type AgentMessage } from "../services/rcpApiService";
 
 const renderer = new marked.Renderer();
 renderer.link = ({ href, text }: { href: string; text: string }) => {
+  if (href && href.startsWith("email:")) {
+    const emailId = href.slice("email:".length);
+    return `<a href="#" class="email-link" data-email-id="${emailId}">📧 ${text}</a>`;
+  }
   return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
 };
 marked.setOptions({ breaks: true, gfm: true, renderer });
@@ -91,6 +95,20 @@ const useStyles = makeStyles({
     },
     "& p": {
       margin: "4px 0",
+    },
+    "& .email-link": {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "4px",
+      padding: "2px 6px",
+      borderRadius: tokens.borderRadiusSmall,
+      color: tokens.colorBrandForeground1,
+      textDecoration: "none",
+      cursor: "pointer",
+      ":hover": {
+        backgroundColor: tokens.colorNeutralBackground2Hover,
+        textDecoration: "underline",
+      },
     },
   },
   toolIndicator: {
@@ -182,10 +200,11 @@ const TOOL_LABELS: Record<string, string> = {
 
 // ─── Markdown renderer ──────────────────────────────────────────────
 
-const MarkdownContent: React.FC<{ content: string; className?: string }> = ({
-  content,
-  className,
-}) => {
+const MarkdownContent: React.FC<{
+  content: string;
+  className?: string;
+  onEmailClick?: (emailId: string) => void;
+}> = ({ content, className, onEmailClick }) => {
   const html = useMemo(() => {
     let cleaned = content;
     const codeBlockMatch = cleaned.match(/^```(?:markdown)?\s*\n([\s\S]*?)(?:\n```\s*)?$/);
@@ -193,10 +212,28 @@ const MarkdownContent: React.FC<{ content: string; className?: string }> = ({
       cleaned = codeBlockMatch[1];
     }
     const raw = marked.parse(cleaned) as string;
-    return DOMPurify.sanitize(raw);
+    return DOMPurify.sanitize(raw, { ADD_ATTR: ["data-email-id"] });
   }, [content]);
 
-  return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;
+  const handleClick = useCallback(
+    (e: React.MouseEvent) => {
+      const link = (e.target as HTMLElement).closest(".email-link") as HTMLElement | null;
+      if (link) {
+        e.preventDefault();
+        const emailId = link.dataset.emailId;
+        if (emailId && onEmailClick) onEmailClick(emailId);
+      }
+    },
+    [onEmailClick]
+  );
+
+  return (
+    <div
+      className={className}
+      dangerouslySetInnerHTML={{ __html: html }}
+      onClick={handleClick}
+    />
+  );
 };
 
 // ─── Suggestions ────────────────────────────────────────────────────
@@ -286,8 +323,11 @@ export const AssistantView: React.FC = () => {
     setInput(suggestion);
   };
 
-  const handleEmailClick = (emailId: string) => {
+  const handleEmailClick = (emailIdOrRef: string) => {
     try {
+      // Resolve short refs (ref_0, ref_1...) to real Graph API IDs
+      const emailId = resolveEmailRef(emailIdOrRef) ?? emailIdOrRef;
+
       // Office.js API to open an email in Outlook
       const mailbox = (window as any).Office?.context?.mailbox;
       if (mailbox?.displayMessageForm) {
@@ -329,7 +369,7 @@ export const AssistantView: React.FC = () => {
             ) : (
               <>
                 {msg.content && (
-                  <MarkdownContent content={msg.content} className={styles.assistantBubble} />
+                  <MarkdownContent content={msg.content} className={styles.assistantBubble} onEmailClick={handleEmailClick} />
                 )}
                 {msg.emailList && (
                   <div className={styles.emailList}>
@@ -392,7 +432,7 @@ export const AssistantView: React.FC = () => {
 
         {/* Streaming response */}
         {streamingContent && (
-          <MarkdownContent content={streamingContent} className={styles.assistantBubble} />
+          <MarkdownContent content={streamingContent} className={styles.assistantBubble} onEmailClick={handleEmailClick} />
         )}
 
         <div ref={messagesEndRef} />

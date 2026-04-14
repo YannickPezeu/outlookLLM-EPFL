@@ -93,7 +93,7 @@ export async function chatCompletion(
       model: model || cfg.model,
       messages,
       temperature: 0.3,
-      max_tokens: 2048,
+      max_tokens: 8192,
       stream: false,
     }),
   });
@@ -141,7 +141,7 @@ export async function chatCompletionStream(
       model: model || cfg.model,
       messages,
       temperature: 0.3,
-      max_tokens: 2048,
+      max_tokens: 8192,
       stream: true,
     }),
   });
@@ -210,7 +210,7 @@ export async function chatCompletionWithTools(
     model: model || cfg.model,
     messages,
     temperature: 0.3,
-    max_tokens: 2048,
+    max_tokens: 8192,
     stream: false,
   };
 

@@ -34,13 +34,15 @@ function buildSystemPrompt(): string {
 Tu aides à chercher des emails, résumer des échanges, préparer des réunions et organiser la messagerie.
 La date actuelle est : ${today}.
 
+RÈGLE PRIORITAIRE — SKILLS :
+Tu disposes de skills (workflows prédéfinis). Ton PREMIER réflexe pour chaque nouvelle demande est de vérifier si un skill correspond. Si oui, appelle load_skill AVANT tout autre outil. Lis les instructions retournées et suis-les exactement.
+
 Règles importantes :
 - Quand l'utilisateur mentionne un contact par nom (ex: "Dupont", "Martin"), utilise TOUJOURS l'outil search_contacts d'abord pour trouver l'adresse email exacte avant d'appeler d'autres outils.
 - Si search_contacts retourne un seul résultat, utilise-le directement sans demander confirmation.
 - Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Ne demande confirmation que si tu hésites vraiment entre deux contacts plausibles.
 - Si search_contacts ne retourne aucun résultat pertinent, utilise search_contacts_in_servicedesk pour chercher dans les tickets ServiceNow (certains échanges passent par le ServiceDesk et le vrai nom de la personne n'apparaît que dans le corps du mail).
 - Si aucun outil ne trouve le contact, dis-le à l'utilisateur et suggère de reformuler.
-- Quand l'utilisateur veut VOIR, MONTRER ou AFFICHER ses emails avec quelqu'un, utilise show_emails. Quand il veut un RÉSUMÉ, utilise get_email_interactions pour récupérer les emails puis rédige toi-même le résumé structuré.
 - Quand l'utilisateur mentionne une période temporelle, convertis-la en paramètres start_date et end_date au format ISO 8601. Fais très attention à l'année mentionnée — ne remplace JAMAIS une année explicite par l'année courante. Exemples :
   * "mai 2023" → start_date="2023-05-01T00:00:00Z", end_date="2023-06-01T00:00:00Z"
   * "les 3 derniers mois de 2023" → start_date="2023-10-01T00:00:00Z", end_date="2024-01-01T00:00:00Z" (octobre, novembre, décembre 2023)
@@ -51,10 +53,54 @@ Règles importantes :
 - Quand un outil retourne des résultats, évalue leur pertinence par rapport à la demande de l'utilisateur. Ne présente que les résultats réellement pertinents. Si aucun résultat n'est pertinent, dis-le clairement plutôt que d'afficher des résultats hors-sujet.
 - Réponds dans la langue utilisée par l'utilisateur.
 - Sois concis et structuré dans tes réponses.
-- Utilise le format Markdown pour structurer tes réponses. Quand show_emails retourne un lien, inclus-le en Markdown cliquable.`;
+- Utilise le format Markdown pour structurer tes réponses.
+- LIENS EMAILS CLIQUABLES : Quand tu listes des emails et que tu disposes de leur ID, utilise le format [Sujet — Date](email:ID) pour créer des liens cliquables. L'utilisateur pourra cliquer pour ouvrir l'email directement dans Outlook. Utilise ce format systématiquement pour chaque email que tu mentionnes.`;
 }
 
 const MAX_ITERATIONS = 8;
+
+// ─── Email ID reference mapping ────────────────────────────────────
+// Tool results contain very long Graph API email IDs (100+ chars).
+// We replace them with short refs (ref_0, ref_1...) so the LLM can
+// reliably include them in markdown links like [Subject](email:ref_0).
+// The UI resolves refs back to real IDs at click time.
+
+let emailRefCounter = 0;
+const emailRefMap = new Map<string, string>(); // ref → real ID
+
+function replaceEmailIdsWithRefs(jsonStr: string): string {
+  try {
+    const data = JSON.parse(jsonStr);
+    const items = data.results || data.emails || data.email_list;
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (item.id && typeof item.id === "string" && item.id.length > 20) {
+          const ref = `ref_${emailRefCounter++}`;
+          emailRefMap.set(ref, item.id);
+          item.id = ref;
+        }
+      }
+    }
+    // Also handle get_email_interactions format
+    if (Array.isArray(data.emails)) {
+      for (const item of data.emails) {
+        if (item.id && typeof item.id === "string" && item.id.length > 20) {
+          const ref = `ref_${emailRefCounter++}`;
+          emailRefMap.set(ref, item.id);
+          item.id = ref;
+        }
+      }
+    }
+    return JSON.stringify(data);
+  } catch {
+    return jsonStr;
+  }
+}
+
+/** Resolve a short ref (ref_0) to the real Graph API email ID. */
+export function resolveEmailRef(ref: string): string | undefined {
+  return emailRefMap.get(ref);
+}
 
 // ─── Agent Loop ─────────────────────────────────────────────────────
 
@@ -156,19 +202,12 @@ export async function runAgent(
         onToolProgress(toolName, "calling", JSON.stringify(args));
 
         try {
-          const result = await executeTool(toolName, args, onLog);
-          log(`Tool ${toolName} OK — résultat: ${result.slice(0, 500)}${result.length > 500 ? '...' : ''}`);
+          const rawResult = await executeTool(toolName, args, onLog);
+          log(`Tool ${toolName} OK — résultat: ${rawResult.slice(0, 500)}${rawResult.length > 500 ? '...' : ''}`);
           onToolProgress(toolName, "done");
 
-          // Intercept show_emails to push email list to UI
-          if (toolName === "show_emails" && onEmailList) {
-            try {
-              const parsed = JSON.parse(result);
-              if (parsed.type === "email_list" && parsed.emails) {
-                onEmailList(parsed.name, parsed.emails);
-              }
-            } catch { /* ignore parse errors */ }
-          }
+          // Replace long email IDs with short refs for the LLM
+          const result = toolName === "load_skill" ? rawResult : replaceEmailIdsWithRefs(rawResult);
 
           // Add tool result to conversation
           messages.push({

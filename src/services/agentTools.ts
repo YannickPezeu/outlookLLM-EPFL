@@ -9,6 +9,7 @@ import {
   DateRange,
 } from "./graphMailService";
 import { batchEmbed, rankBySimilarity } from "./embeddingService";
+import { getSkillCatalogForPrompt, getSkillIds, loadSkillContent } from "../skills/skillRegistry";
 
 // ─── Tool Definitions (OpenAI function-calling format) ──────────────
 
@@ -111,7 +112,7 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           },
           max_results: {
             type: "number",
-            description: "Nombre maximum de résultats (défaut: 20)",
+            description: "Nombre maximum de résultats (défaut: 100)",
           },
           start_date: {
             type: "string",
@@ -178,6 +179,28 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           },
         },
         required: ["name", "email"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "load_skill",
+      description:
+        "Charge les instructions détaillées d'un skill (workflow) pour savoir exactement comment répondre à la demande de l'utilisateur. " +
+        "TOUJOURS appeler cet outil EN PREMIER quand la demande correspond à un skill disponible.\n" +
+        "Skills disponibles :\n" +
+        getSkillCatalogForPrompt(),
+      parameters: {
+        type: "object",
+        properties: {
+          skill_id: {
+            type: "string",
+            description: "L'identifiant du skill à charger",
+            enum: getSkillIds(),
+          },
+        },
+        required: ["skill_id"],
       },
     },
   },
@@ -269,6 +292,7 @@ const executors: Record<string, ToolExecutor> = {
     }
 
     const emailSummaries = topEmails.slice(0, 30).map((e) => ({
+      id: e.id,
       subject: e.subject,
       date: e.displayDate,
       direction: e.direction,
@@ -311,7 +335,7 @@ const executors: Record<string, ToolExecutor> = {
 
   async search_emails(args, _log) {
     const query = args.query as string;
-    const maxResults = (args.max_results as number) || 20;
+    const maxResults = (args.max_results as number) || 100;
     const dateRange = extractDateRange(args);
     const emails = await searchEmails(query, maxResults, dateRange);
 
@@ -370,6 +394,13 @@ const executors: Record<string, ToolExecutor> = {
       emails: allEmails,
       count: allEmails.length,
     });
+  },
+
+  async load_skill(args, log) {
+    const skillId = args.skill_id as string;
+    const content = await loadSkillContent(skillId);
+    log(`Skill chargé: ${skillId}`);
+    return JSON.stringify({ skill_id: skillId, instructions: content });
   },
 
   async search_contacts_in_servicedesk(args, _log) {

@@ -9,10 +9,19 @@ import {
   MessageBar,
   MessageBarBody,
   Badge,
+  Combobox,
+  Option,
 } from "@fluentui/react-components";
 import { Settings24Regular, Checkmark24Regular } from "@fluentui/react-icons";
 import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
 import { isAuthenticated, isUsingNaa, getAccount, signOut } from "../services/authService";
+
+const AVAILABLE_MODELS = [
+  "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
+  "google/gemma-4-26B-A4B-it-bfloat16",
+  "google/gemma-4-31B-it-bfloat16",
+  "google/gemma-4-E4B-it",
+];
 
 const useStyles = makeStyles({
   container: { display: "flex", flexDirection: "column", gap: "16px" },
@@ -153,12 +162,21 @@ export const SettingsView: React.FC = () => {
           <Label htmlFor="rcp-model" size="small">
             Modèle
           </Label>
-          <Input
+          <Combobox
             id="rcp-model"
-            placeholder="default"
+            freeform
+            placeholder="Choisir ou saisir un modèle"
             value={rcpModel}
-            onChange={(_, data) => setRcpModel(data.value)}
-          />
+            selectedOptions={[rcpModel]}
+            onOptionSelect={(_, data) => setRcpModel(data.optionValue ?? data.optionText ?? "")}
+            onChange={(e) => setRcpModel((e.target as HTMLInputElement).value)}
+          >
+            {AVAILABLE_MODELS.map((model) => (
+              <Option key={model} value={model}>
+                {model}
+              </Option>
+            ))}
+          </Combobox>
         </div>
 
         <div className={styles.row}>
