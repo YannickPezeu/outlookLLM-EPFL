@@ -1,6 +1,6 @@
 import {
   AgentMessage,
-  chatCompletionWithTools,
+  chatCompletionWithToolsStream,
 } from "./rcpApiService";
 import { AGENT_TOOLS, executeTool } from "./agentTools";
 
@@ -12,7 +12,8 @@ export type ToolProgressCallback = (
   detail?: string
 ) => void;
 
-export type StreamCallback = (chunk: string) => void;
+/** Stream callback: string = append chunk, null = reset (clear streamed content) */
+export type StreamCallback = (chunk: string | null) => void;
 
 export type LogCallback = (message: string) => void;
 
@@ -133,16 +134,16 @@ export async function runAgent(
     iterations++;
     log(`Iteration ${iterations} — appel LLM avec ${AGENT_TOOLS.length} outils`);
 
-    // Call LLM with tools (non-streaming to parse tool_calls)
-    const response = await chatCompletionWithTools(messages, AGENT_TOOLS);
-    const choice = response.choices[0];
+    // Call LLM with streaming — content tokens are streamed in real-time,
+    // tool_calls are accumulated from SSE deltas
+    const streamResult = await chatCompletionWithToolsStream(
+      messages,
+      AGENT_TOOLS,
+      onStream // Stream content tokens directly to UI
+    );
 
-    if (!choice) {
-      throw new Error("Pas de réponse du LLM.");
-    }
-
-    const assistantMessage = choice.message;
-    const finishReason = choice.finish_reason;
+    const assistantMessage = streamResult.message;
+    const finishReason = streamResult.finish_reason;
 
     log(`finish_reason=${finishReason}, tool_calls=${assistantMessage.tool_calls?.length || 0}, content=${assistantMessage.content ? assistantMessage.content.slice(0, 80) + '...' : '(vide)'}`);
 
@@ -154,6 +155,8 @@ export async function runAgent(
       assistantMessage.content?.includes("[TOOL_CALLS]")
     ) {
       log("Detected text-format tool calls from Mistral, parsing...");
+      // Reset streamed content since it was tool call text, not a real response
+      onStream(null);
       const textContent = assistantMessage.content;
       const toolCallsText = textContent.slice(textContent.indexOf("[TOOL_CALLS]") + "[TOOL_CALLS]".length);
       const parsed: import("./rcpApiService").ToolCall[] = [];
@@ -232,31 +235,18 @@ export async function runAgent(
       continue;
     }
 
-    // No tool calls — this is the final text response
-    if (finishReason === "stop" || !assistantMessage.tool_calls) {
-      const finalContent = assistantMessage.content || "";
-      log(`Réponse finale (${finalContent.length} chars)`);
+    // No tool calls — this is the final text response (already streamed to UI)
+    const finalContent = assistantMessage.content || "";
+    log(`Réponse finale (${finalContent.length} chars)`);
 
-      // If we got content directly (non-streaming), stream it to UI chunk by chunk
-      if (finalContent) {
-        // Stream the already-received content in small chunks for UI effect
-        const chunkSize = 20;
-        for (let i = 0; i < finalContent.length; i += chunkSize) {
-          onStream(finalContent.slice(i, i + chunkSize));
-          // Small delay for visual streaming effect
-          await new Promise((r) => setTimeout(r, 10));
-        }
-      }
+    // Build the updated history (without system prompt)
+    const updatedHistory: AgentMessage[] = [
+      ...conversationHistory,
+      { role: "user", content: userMessage },
+      { role: "assistant", content: finalContent },
+    ];
 
-      // Build the updated history (without system prompt)
-      const updatedHistory: AgentMessage[] = [
-        ...conversationHistory,
-        { role: "user", content: userMessage },
-        { role: "assistant", content: finalContent },
-      ];
-
-      return { response: finalContent, updatedHistory };
-    }
+    return { response: finalContent, updatedHistory };
   }
 
   // Max iterations reached

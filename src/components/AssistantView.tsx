@@ -285,7 +285,11 @@ export const AssistantView: React.FC = () => {
     };
 
     const onStream: StreamCallback = (chunk) => {
-      setStreamingContent((prev) => prev + chunk);
+      if (chunk === null) {
+        setStreamingContent("");
+      } else {
+        setStreamingContent((prev) => prev + chunk);
+      }
     };
 
     const onEmailList: EmailListCallback = (name, emails) => {

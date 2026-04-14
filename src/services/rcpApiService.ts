@@ -250,6 +250,137 @@ export async function chatCompletionStreamAgent(
   return chatCompletionStream(messages as ChatMessage[], onChunk, model);
 }
 
+/**
+ * Streaming chat completion with tool support.
+ * Streams content tokens in real-time via onChunk, and accumulates tool_calls if present.
+ * Returns the final message (content + optional tool_calls).
+ */
+export async function chatCompletionWithToolsStream(
+  messages: AgentMessage[],
+  tools: ToolDefinition[],
+  onChunk: (text: string) => void,
+  model?: string
+): Promise<{
+  message: { role: string; content: string | null; tool_calls?: ToolCall[] };
+  finish_reason: string;
+}> {
+  const cfg = getRcpConfig();
+
+  if (!cfg.apiKey) {
+    throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
+  }
+
+  const body: Record<string, unknown> = {
+    model: model || cfg.model,
+    messages,
+    temperature: 0.3,
+    max_tokens: 8192,
+    stream: true,
+  };
+
+  if (tools.length > 0) {
+    body.tools = tools;
+    body.tool_choice = "auto";
+  }
+
+  console.log("[RCP] Streaming tool-calling request, tools:", tools.map((t) => t.function.name));
+
+  const response = await fetch(`${cfg.baseUrl}${config.rcp.completionsEndpoint}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${cfg.apiKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`RCP API error ${response.status}: ${errorText}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullContent = "";
+  let finishReason = "stop";
+
+  // Accumulate tool calls by index
+  const toolCallsMap = new Map<number, { id: string; type: "function"; function: { name: string; arguments: string } }>();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data: ")) continue;
+
+      const data = trimmed.slice(6);
+      if (data === "[DONE]") continue;
+
+      try {
+        const parsed = JSON.parse(data);
+        const choice = parsed.choices?.[0];
+        if (!choice) continue;
+
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
+        }
+
+        const delta = choice.delta;
+        if (!delta) continue;
+
+        // Stream content tokens
+        if (delta.content) {
+          fullContent += delta.content;
+          onChunk(delta.content);
+        }
+
+        // Accumulate tool calls
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCallsMap.has(idx)) {
+              toolCallsMap.set(idx, {
+                id: tc.id || "",
+                type: "function",
+                function: { name: tc.function?.name || "", arguments: "" },
+              });
+            }
+            const existing = toolCallsMap.get(idx)!;
+            if (tc.id) existing.id = tc.id;
+            if (tc.function?.name) existing.function.name = tc.function.name;
+            if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
+          }
+        }
+      } catch {
+        // Skip malformed SSE chunks
+      }
+    }
+  }
+
+  const toolCalls = toolCallsMap.size > 0
+    ? Array.from(toolCallsMap.values())
+    : undefined;
+
+  return {
+    message: {
+      role: "assistant",
+      content: fullContent || null,
+      tool_calls: toolCalls,
+    },
+    finish_reason: finishReason,
+  };
+}
+
 // ─── High-level functions ────────────────────────────────────────────
 
 /**
