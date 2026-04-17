@@ -14,7 +14,7 @@ import {
 } from "@fluentui/react-components";
 import { Settings24Regular, Checkmark24Regular } from "@fluentui/react-icons";
 import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
-import { isAuthenticated, isUsingNaa, getAccount, signOut } from "../services/authService";
+import { isAuthenticated, isUsingNaa, getAccount, signOut, getGraphToken } from "../services/authService";
 
 const AVAILABLE_MODELS = [
   "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
@@ -98,9 +98,33 @@ export const SettingsView: React.FC = () => {
           )}
         </div>
         {isAuthenticated() && (
+          <>
           <Button size="small" onClick={signOut}>
             Se déconnecter
           </Button>
+          <Button size="small" onClick={async () => {
+            try {
+              const token = await getGraphToken();
+              const pages = [];
+              let url: string | null = "https://graph.microsoft.com/v1.0/me/messages?$top=100&$select=id,subject,body,bodyPreview,receivedDateTime&$orderby=receivedDateTime desc";
+              while (url && pages.length < 500) {
+                const r = await fetch(url, { headers: { Authorization: "Bearer " + token } });
+                const j: { value?: unknown[]; "@odata.nextLink"?: string } = await r.json();
+                pages.push(...(j.value || []));
+                url = j["@odata.nextLink"] || null;
+              }
+              const blob = new Blob([JSON.stringify(pages, null, 2)], { type: "application/json" });
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(blob);
+              a.download = `emails-export-${pages.length}.json`;
+              a.click();
+              URL.revokeObjectURL(a.href);
+              console.log(`${pages.length} emails exportés !`);
+            } catch (e) { console.error("Export error:", e); }
+          }}>
+            Exporter emails (debug)
+          </Button>
+          </>
         )}
       </div>
 

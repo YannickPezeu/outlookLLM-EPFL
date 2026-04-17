@@ -5,6 +5,7 @@ import {
   Button,
   Spinner,
   Text,
+  Tooltip,
   ProgressBar,
   makeStyles,
   tokens,
@@ -20,6 +21,7 @@ import {
   People24Regular,
   Mail24Regular,
   ArrowDownload24Regular,
+  ArrowReset24Regular,
 } from "@fluentui/react-icons";
 import {
   prepareMeeting,
@@ -221,10 +223,21 @@ export const MeetingPrepView: React.FC = () => {
     }
   }, [dialogItem]);
 
+  const handleReset = useCallback(() => {
+    setBriefingText("");
+    setBriefingData(null);
+    setProgress(null);
+    setError(null);
+    setEventInfo(null);
+    abortRef.current = true;
+  }, []);
+
   const phaseLabel: Record<string, string> = {
     extracting_context: "Contexte",
     collecting_emails: "Collecte emails",
     embedding_ranking: "Analyse sémantique",
+    filtering_emails: "Filtrage intelligent",
+    searching_nonparticipants: "Recherche hors participants",
     reading_emails: "Lecture emails",
     summarizing_participants: "Résumés participants",
     generating_briefing: "Briefing final",
@@ -242,14 +255,27 @@ export const MeetingPrepView: React.FC = () => {
         vos échanges email avec les participants.
       </Text>
 
-      <Button
-        appearance="primary"
-        icon={<Sparkle24Regular />}
-        onClick={handlePrepare}
-        disabled={loading}
-      >
-        {loading ? "Préparation en cours..." : "Préparer cette réunion"}
-      </Button>
+      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+        <Button
+          appearance="primary"
+          icon={<Sparkle24Regular />}
+          onClick={handlePrepare}
+          disabled={loading}
+          style={{ flex: 1 }}
+        >
+          {loading ? "Préparation en cours..." : "Préparer cette réunion"}
+        </Button>
+        {briefingText && !loading && (
+          <Tooltip content="Réinitialiser" relationship="label">
+            <Button
+              appearance="subtle"
+              icon={<ArrowReset24Regular />}
+              size="medium"
+              onClick={handleReset}
+            />
+          </Tooltip>
+        )}
+      </div>
 
       {/* Event info */}
       {eventInfo && (

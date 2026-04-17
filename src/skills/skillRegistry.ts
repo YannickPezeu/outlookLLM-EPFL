@@ -31,6 +31,13 @@ export const SKILL_CATALOG: SkillMeta[] = [
       "Quand l'utilisateur veut voir ses événements/réunions à venir",
     file: "calendar-overview.md",
   },
+  {
+    id: "meeting_prep",
+    name: "Préparer une réunion",
+    description:
+      "Quand l'utilisateur veut PRÉPARER une réunion, obtenir un BRIEFING, ou se renseigner avant un rendez-vous",
+    file: "meeting-prep.md",
+  },
 ];
 
 export function getSkillCatalogForPrompt(): string {

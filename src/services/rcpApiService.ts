@@ -413,57 +413,85 @@ export async function summarizeEmail(
 
 /**
  * Summarize all interactions with a specific person.
+ *
+ * Deduplicates by conversationId (keeps only the most recent email per thread,
+ * which contains the full reply chain in its body). Uses cleanEmailBodyFull()
+ * to strip HTML while preserving reply chains for full context.
  */
 export async function summarizeInteractions(
   personName: string,
   personEmail: string,
-  receivedEmails: Array<{ subject: string; body: string; date: string }>,
-  sentEmails: Array<{ subject: string; body: string; date: string }>,
-  onChunk?: (text: string) => void
+  emails: Array<{
+    subject: string;
+    body: string;
+    date: string;
+    direction: "sent" | "received" | "servicedesk";
+    conversationId?: string;
+  }>,
+  onChunk?: (text: string) => void,
+  model?: string
 ): Promise<string> {
-  // Build a chronological conversation digest
-  const allEmails = [
-    ...receivedEmails.map((e) => ({
-      direction: `De ${personName}`,
-      ...e,
-    })),
-    ...sentEmails.map((e) => ({
-      direction: `À ${personName}`,
-      ...e,
-    })),
-  ].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  if (emails.length === 0) {
+    return `Aucun échange trouvé avec ${personName}.`;
+  }
 
-  // Truncate individual emails to avoid hitting token limits
-  const digest = allEmails
-    .map(
-      (e) =>
-        `[${e.date}] ${e.direction}\nSujet: ${e.subject}\n${e.body.slice(0, 500)}\n---`
-    )
-    .join("\n");
+  // Deduplicate by conversationId — keep only the most recent per thread
+  const sorted = [...emails].sort(
+    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+  );
+  const seenConversations = new Set<string>();
+  const deduplicated = sorted.filter((e) => {
+    if (!e.conversationId) return true; // keep emails without conversationId
+    if (seenConversations.has(e.conversationId)) return false;
+    seenConversations.add(e.conversationId);
+    return true;
+  });
+
+  // Clean bodies — cleanEmailBodyFull preserves reply chains
+  const { cleanEmailBodyFull } = await import("./cleanEmailBody");
+
+  const digest = deduplicated
+    .map((e) => {
+      const tag = e.direction === "sent" ? `À ${personName}` :
+                  e.direction === "servicedesk" ? `[ServiceNow]` :
+                  `De ${personName}`;
+      const cleanBody = cleanEmailBodyFull(e.body);
+      return `[${new Date(e.date).toLocaleDateString("fr-FR")}] ${tag}\nSujet: ${e.subject}\n${cleanBody}`;
+    })
+    .join("\n---\n");
+
+  const today = new Date().toLocaleDateString("fr-FR", {
+    weekday: "long", year: "numeric", month: "long", day: "numeric",
+  });
 
   const messages: ChatMessage[] = [
     {
       role: "system",
       content:
-        "Tu es un assistant qui analyse les échanges email entre deux personnes. " +
+        `Tu es un assistant qui analyse les échanges email entre deux personnes. ` +
+        `Nous sommes le ${today}. ` +
         "Fournis un résumé structuré en français qui inclut :\n" +
         "1. Un résumé global de la relation/collaboration\n" +
         "2. Les sujets principaux abordés\n" +
-        "3. Les actions en cours ou demandées\n" +
-        "4. Les décisions importantes prises\n" +
-        "5. Les points en suspens",
+        "3. Les décisions importantes prises\n" +
+        "4. Les points en suspens\n" +
+        "5. **To-dos** : liste concrète des actions à faire suite à ces échanges " +
+        "(qui doit faire quoi, avec quelle échéance si mentionnée)\n\n" +
+        "Sois concis mais complet.",
     },
     {
       role: "user",
-      content: `Voici les échanges email avec ${personName} (${personEmail}).\nRésume ces interactions :\n\n${digest}`,
+      content:
+        `Voici les ${deduplicated.length} échanges email (dédupliqués par conversation) ` +
+        `avec ${personName} (${personEmail}).\nRésume ces interactions :\n\n${digest}`,
     },
   ];
 
   if (onChunk) {
-    return chatCompletionStream(messages, onChunk);
+    return chatCompletionStream(messages, onChunk, model);
   }
 
-  const response = await chatCompletion(messages);
+  const response = await chatCompletion(messages, model);
   return extractContent(response);
 }
 
@@ -494,6 +522,121 @@ export async function suggestFolder(
 
   const response = await chatCompletion(messages);
   return extractContent(response).trim() || "Inbox";
+}
+
+// ─── Reranker (BAAI/bge-reranker-v2-m3) ─────────────────────────────
+
+interface RerankApiResponse {
+  id: string;
+  results: Array<{
+    index: number;
+    relevance_score: number;
+    document?: { text: string };
+  }>;
+}
+
+export interface RerankResult {
+  index: number;
+  score: number;
+}
+
+function isRerankLengthError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /maximum context length|context length is|exceeds.*tokens|too long/i.test(msg);
+}
+
+async function callRerankApi(query: string, documents: string[], model: string): Promise<RerankResult[]> {
+  const cfg = getRcpConfig();
+  if (!cfg.apiKey) {
+    throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
+  }
+
+  const response = await fetch(`${cfg.baseUrl}${config.rcp.rerankEndpoint}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${cfg.apiKey}`,
+    },
+    body: JSON.stringify({ model, query, documents }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`RCP rerank error ${response.status}: ${errorText}`);
+  }
+
+  const json: RerankApiResponse = await response.json();
+  return json.results.map((r) => ({ index: r.index, score: r.relevance_score }));
+}
+
+const RERANK_BATCH_SIZE = 50;
+
+/**
+ * Rerank a single batch, with token-level truncation on length error.
+ */
+async function rerankBatchWithRetry(
+  query: string,
+  documents: string[],
+  model: string
+): Promise<RerankResult[]> {
+  try {
+    return await callRerankApi(query, documents, model);
+  } catch (err) {
+    if (!isRerankLengthError(err)) throw err;
+
+    console.log(`[Rerank] Length error on batch of ${documents.length}, truncating with char limit fallback...`);
+
+    // Simple char-based truncation instead of tokenizer (which hangs on large docs)
+    const MAX_DOC_CHARS = 10000;
+    const MAX_QUERY_CHARS = 2000;
+
+    const truncQuery = query.length > MAX_QUERY_CHARS ? query.slice(0, MAX_QUERY_CHARS) : query;
+    let truncCount = 0;
+    const truncDocs = documents.map((d) => {
+      if (d.length > MAX_DOC_CHARS) {
+        truncCount++;
+        return d.slice(0, MAX_DOC_CHARS);
+      }
+      return d;
+    });
+    console.log(`[Rerank] Truncated ${truncCount}/${documents.length} docs to ${MAX_DOC_CHARS} chars (query: ${truncQuery.length} chars)`);
+
+    return await callRerankApi(truncQuery, truncDocs, model);
+  }
+}
+
+/**
+ * Rerank documents against a query using BAAI/bge-reranker-v2-m3.
+ *
+ * Splits documents into batches of 50 to avoid socket errors on large payloads.
+ * Each batch is scored independently, then results are merged and sorted globally.
+ *
+ * Returns results sorted by relevance_score descending.
+ */
+export async function rerank(
+  query: string,
+  documents: string[],
+  model: string = config.rcp.rerankerModel
+): Promise<RerankResult[]> {
+  if (documents.length === 0) return [];
+
+  if (documents.length <= RERANK_BATCH_SIZE) {
+    return await rerankBatchWithRetry(query, documents, model);
+  }
+
+  console.log(`[Rerank] Splitting ${documents.length} docs into batches of ${RERANK_BATCH_SIZE}`);
+  const allResults: RerankResult[] = [];
+
+  for (let i = 0; i < documents.length; i += RERANK_BATCH_SIZE) {
+    const batchDocs = documents.slice(i, i + RERANK_BATCH_SIZE);
+    const batchResults = await rerankBatchWithRetry(query, batchDocs, model);
+    for (const r of batchResults) {
+      allResults.push({ index: i + r.index, score: r.score });
+    }
+  }
+
+  allResults.sort((a, b) => b.score - a.score);
+  return allResults;
 }
 
 // ─── Settings persistence ────────────────────────────────────────────

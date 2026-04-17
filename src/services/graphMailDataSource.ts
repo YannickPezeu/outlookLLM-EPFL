@@ -11,6 +11,7 @@ import {
   LightEmail,
   getCalendarEvent,
   collectEmailsWithParticipant,
+  searchEmailsByKeyword,
   getEmailsBatch,
   getMessageAttachments,
 } from "./graphMailService";
@@ -22,6 +23,10 @@ export class GraphMailDataSource implements MailDataSource {
 
   collectEmailsWithParticipant(participantEmail: string): Promise<LightEmail[]> {
     return collectEmailsWithParticipant(participantEmail);
+  }
+
+  searchEmailsByKeyword(keyword: string, maxResults?: number): Promise<LightEmail[]> {
+    return searchEmailsByKeyword(keyword, maxResults);
   }
 
   getEmailsBatch(messageIds: string[]): Promise<EmailMessage[]> {

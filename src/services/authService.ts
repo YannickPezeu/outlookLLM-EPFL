@@ -57,16 +57,31 @@ export function getAccount(): AccountInfo | null {
  * Acquire a Graph API access token silently, with interactive fallback.
  * In dev mode, uses a manually pasted Graph Explorer token from localStorage.
  */
-export async function getGraphToken(): Promise<string> {
-  // Pop-out dialog: token relayed from taskpane takes priority
+export async function getGraphToken(forceRefresh = false): Promise<string> {
+  console.log(`[Auth] getGraphToken called (forceRefresh=${forceRefresh})`);
+
+  // Pop-out dialog: token relayed from taskpane, but only if not expired
   const popoutToken = localStorage.getItem("graph_popout_token");
-  if (popoutToken) {
-    return popoutToken;
+  if (popoutToken && !forceRefresh) {
+    try {
+      const payload = JSON.parse(atob(popoutToken.split(".")[1]));
+      const expiresAt = payload.exp * 1000;
+      if (expiresAt > Date.now() + 60_000) { // 1min margin
+        console.log("[Auth] Using popout token (valid)");
+        return popoutToken;
+      }
+      console.warn("[Auth] Popout token expired, removing");
+      localStorage.removeItem("graph_popout_token");
+    } catch {
+      console.warn("[Auth] Popout token invalid, removing");
+      localStorage.removeItem("graph_popout_token");
+    }
   }
 
   // Dev mode: use manually pasted token (from Graph Explorer)
   const devToken = localStorage.getItem("graph_dev_token");
   if (devToken) {
+    console.log("[Auth] Using dev token");
     return devToken;
   }
 
@@ -75,18 +90,20 @@ export async function getGraphToken(): Promise<string> {
   }
 
   const account = getAccount();
+  console.log(`[Auth] Account: ${account?.username || "NONE"}`);
   const tokenRequest = {
     scopes: config.graph.scopes,
     account: account || undefined,
+    forceRefresh,
   };
 
   try {
-    // Try silent token acquisition first
     const result: AuthenticationResult = await msalInstance!.acquireTokenSilent(tokenRequest);
+    // Decode exp from JWT to check if token is already expired
     return result.accessToken;
   } catch (error) {
+    console.error(`[Auth] acquireTokenSilent FAILED:`, error);
     if (error instanceof InteractionRequiredAuthError) {
-      // Silent failed, need interactive login
       return acquireTokenInteractive();
     }
     throw error;
@@ -94,22 +111,39 @@ export async function getGraphToken(): Promise<string> {
 }
 
 /**
- * Interactive login - uses popup (works in both NAA and standard MSAL).
+ * Interactive login with mutex — only one popup at a time.
+ * All concurrent callers await the same promise.
  */
-async function acquireTokenInteractive(): Promise<string> {
-  if (!msalInstance) throw new Error("MSAL not initialized");
+let interactivePromise: Promise<string> | null = null;
 
-  const tokenRequest = {
-    scopes: config.graph.scopes,
-  };
-
-  try {
-    const result = await msalInstance.acquireTokenPopup(tokenRequest);
-    return result.accessToken;
-  } catch (error) {
-    console.error("[Auth] Interactive login failed:", error);
-    throw error;
+export async function acquireTokenInteractive(): Promise<string> {
+  if (interactivePromise) {
+    console.log("[Auth] Interactive login already in progress, waiting...");
+    return interactivePromise;
   }
+
+  interactivePromise = (async () => {
+    if (!msalInstance) {
+      await initAuth();
+    }
+
+    const tokenRequest = {
+      scopes: config.graph.scopes,
+    };
+
+    try {
+      console.log("[Auth] Launching interactive login...");
+      const result = await msalInstance!.acquireTokenPopup(tokenRequest);
+      return result.accessToken;
+    } catch (error) {
+      console.error("[Auth] Interactive login failed:", error);
+      throw error;
+    } finally {
+      interactivePromise = null;
+    }
+  })();
+
+  return interactivePromise;
 }
 
 /**

@@ -6,11 +6,12 @@ import {
   Input,
   Spinner,
   Text,
+  Tooltip,
   makeStyles,
   tokens,
   Badge,
 } from "@fluentui/react-components";
-import { Send24Regular, Bot24Regular } from "@fluentui/react-icons";
+import { Send24Regular, Bot24Regular, ArrowReset24Regular } from "@fluentui/react-icons";
 import { runAgent, resolveEmailRef, type ToolProgressCallback, type StreamCallback, type EmailListCallback, type EmailListItem } from "../services/agentService";
 import { Mail24Regular } from "@fluentui/react-icons";
 import { type AgentMessage } from "../services/rcpApiService";
@@ -196,6 +197,7 @@ const TOOL_LABELS: Record<string, string> = {
   get_calendar_events: "Consultation du calendrier",
   search_emails: "Recherche dans les emails",
   show_emails: "Affichage des emails",
+  prepare_meeting: "Préparation de réunion",
 };
 
 // ─── Markdown renderer ──────────────────────────────────────────────
@@ -346,6 +348,15 @@ export const AssistantView: React.FC = () => {
 
   const isEmpty = messages.length === 0;
 
+  const handleReset = useCallback(() => {
+    setMessages([]);
+    setInput("");
+    setToolProgress([]);
+    setStreamingContent("");
+    conversationRef.current = [];
+    pendingEmailListRef.current = null;
+  }, []);
+
   return (
     <div className={styles.container}>
       <div className={styles.header}>
@@ -353,6 +364,19 @@ export const AssistantView: React.FC = () => {
         <Text size={300} weight="semibold">
           Assistant EPFL Mail
         </Text>
+        <div style={{ marginLeft: "auto" }}>
+          {!isEmpty && (
+            <Tooltip content="Nouvelle conversation" relationship="label">
+              <Button
+                appearance="subtle"
+                icon={<ArrowReset24Regular />}
+                size="small"
+                onClick={handleReset}
+                disabled={loading}
+              />
+            </Tooltip>
+          )}
+        </div>
       </div>
 
       <div className={styles.messagesArea}>
@@ -429,6 +453,7 @@ export const AssistantView: React.FC = () => {
               {tp.status === "done" && <Badge appearance="filled" color="success" size="tiny" />}
               {tp.status === "error" && <Badge appearance="filled" color="danger" size="tiny" />}
               <span>{TOOL_LABELS[tp.toolName] || tp.toolName}{argsDisplay}</span>
+              {tp.status === "calling" && tp.detail && !tp.detail.startsWith("{") && <span style={{ opacity: 0.7, marginLeft: 4 }}> — {tp.detail}</span>}
               {tp.status === "calling" && "..."}
             </div>
           );

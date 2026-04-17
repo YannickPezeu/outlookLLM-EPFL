@@ -16,6 +16,7 @@
     "@azure/msal-browser": "^3.6.0",
     "@fluentui/react-components": "^9.46.0",
     "@fluentui/react-icons": "^2.0.230",
+    "@huggingface/transformers": "^4.0.1",
     "@types/dompurify": "^3.0.5",
     "docx": "^9.6.1",
     "dompurify": "^3.3.3",

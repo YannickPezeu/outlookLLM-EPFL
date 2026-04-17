@@ -107,6 +107,25 @@ function filterByRecipient(items: EmailMessage[], recipientEmail: string): Email
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
+// Global token recovery: all parallel 401s wait on the same recovery promise
+let tokenRecoveryPromise: Promise<string> | null = null;
+
+async function recoverToken(): Promise<string> {
+  if (tokenRecoveryPromise) {
+    return tokenRecoveryPromise;
+  }
+  tokenRecoveryPromise = (async () => {
+    try {
+      console.warn(`[Graph] Token recovery — trying forceRefresh...`);
+      const freshToken = await getGraphToken(true);
+      return freshToken;
+    } finally {
+      tokenRecoveryPromise = null;
+    }
+  })();
+  return tokenRecoveryPromise;
+}
+
 async function graphFetch<T>(url: string, options?: RequestInit): Promise<T> {
   console.log(`[Graph] ${options?.method || "GET"} ${url}`);
   const token = await getGraphToken();
@@ -118,6 +137,24 @@ async function graphFetch<T>(url: string, options?: RequestInit): Promise<T> {
       ...options?.headers,
     },
   });
+
+  if (response.status === 401) {
+    const freshToken = await recoverToken();
+    const retry = await fetch(url, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${freshToken}`,
+        "Content-Type": "application/json",
+        ...options?.headers,
+      },
+    });
+    if (!retry.ok) {
+      const errorBody = await retry.text();
+      console.error(`[Graph] Error ${retry.status} after token recovery:`, errorBody);
+      throw new Error(`Graph API error ${retry.status}: ${errorBody}`);
+    }
+    return retry.json();
+  }
 
   if (!response.ok) {
     const errorBody = await response.text();
@@ -360,6 +397,38 @@ export async function getEmailsBatch(
   }
 
   return results;
+}
+
+// ─── Keyword Search (for non-participant emails) ────────────────────
+
+/**
+ * Search emails by keyword using Graph $search.
+ * Used to find emails related to the meeting subject from non-participants.
+ * Returns light emails for embedding.
+ */
+export async function searchEmailsByKeyword(
+  keyword: string,
+  maxResults = 50
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+  const encodedQuery = encodeURIComponent(keyword);
+  const url = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=${select}&$top=50`;
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+/**
+ * Get all recent emails (received) within a date range.
+ * Used by explore_topic to get all emails for embedding.
+ */
+export async function getRecentEmails(
+  months = 6,
+  maxResults = 2000
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+  const startDate = new Date(Date.now() - months * 30 * 24 * 60 * 60 * 1000);
+  const dateFilter = `receivedDateTime ge ${startDate.toISOString().slice(0, 10)}T00:00:00Z`;
+  const url = `${GRAPH}/me/messages?$filter=${encodeURI(dateFilter)}&$orderby=receivedDateTime desc&$select=${select}&$top=50`;
+  return fetchAllPages<LightEmail>(url, maxResults);
 }
 
 // ─── Contact Cache + Fuzzy Search (for agent) ──────────────────────

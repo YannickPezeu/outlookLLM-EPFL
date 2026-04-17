@@ -2,7 +2,7 @@ import {
   AgentMessage,
   chatCompletionWithToolsStream,
 } from "./rcpApiService";
-import { AGENT_TOOLS, executeTool } from "./agentTools";
+import { AGENT_TOOLS, executeTool, ToolProgressFn } from "./agentTools";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -39,6 +39,7 @@ RÈGLE PRIORITAIRE — SKILLS :
 Tu disposes de skills (workflows prédéfinis). Ton PREMIER réflexe pour chaque nouvelle demande est de vérifier si un skill correspond. Si oui, appelle load_skill AVANT tout autre outil. Lis les instructions retournées et suis-les exactement.
 
 Règles importantes :
+- Quand l'utilisateur pose une question sur un SUJET ou THÈME (ex: "qui travaille sur l'IA ?", "quels sont les acteurs sur le projet X ?", "quel est le positionnement de chacun sur Y ?"), utilise l'outil explore_topic. Ne demande PAS de précisions — lance directement l'exploration. IMPORTANT : le paramètre topic sert à la recherche ET au classement sémantique (embeddings). Un mot seul comme "IA" est trop vague. Développe le sujet en une description riche avec synonymes et termes associés (ex: "intelligence artificielle, IA, machine learning, LLM, modèles de langage, deep learning, ChatGPT, Copilot" au lieu de juste "IA").
 - Quand l'utilisateur mentionne un contact par nom (ex: "Dupont", "Martin"), utilise TOUJOURS l'outil search_contacts d'abord pour trouver l'adresse email exacte avant d'appeler d'autres outils.
 - Si search_contacts retourne un seul résultat, utilise-le directement sans demander confirmation.
 - Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Ne demande confirmation que si tu hésites vraiment entre deux contacts plausibles.
@@ -205,7 +206,8 @@ export async function runAgent(
         onToolProgress(toolName, "calling", JSON.stringify(args));
 
         try {
-          const rawResult = await executeTool(toolName, args, onLog);
+          const progressFn: ToolProgressFn = (detail) => onToolProgress(toolName, "calling", detail);
+          const rawResult = await executeTool(toolName, args, onLog, progressFn);
           log(`Tool ${toolName} OK — résultat: ${rawResult.slice(0, 500)}${rawResult.length > 500 ? '...' : ''}`);
           onToolProgress(toolName, "done");
 

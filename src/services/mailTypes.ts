@@ -64,6 +64,7 @@ export interface GraphAttachment {
 export interface MailDataSource {
   getCalendarEvent(eventId: string): Promise<CalendarEvent>;
   collectEmailsWithParticipant(participantEmail: string): Promise<LightEmail[]>;
+  searchEmailsByKeyword(keyword: string, maxResults?: number): Promise<LightEmail[]>;
   getEmailsBatch(messageIds: string[]): Promise<EmailMessage[]>;
   getMessageAttachments(messageId: string): Promise<GraphAttachment[]>;
 }

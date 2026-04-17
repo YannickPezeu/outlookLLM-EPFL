@@ -26,8 +26,12 @@ export const config = {
     apiKey: "", // User sets this in the UI settings, or stored in localStorage
     defaultModel: "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
     embeddingModel: "Qwen/Qwen3-Embedding-8B",
+    rerankerModel: "BAAI/bge-reranker-v2-m3",
+    filterModel: "google/gemma-4-E2B-it-bfloat16",
+    synthesisModel: "google/gemma-4-26B-A4B-it-bfloat16",
     completionsEndpoint: "/chat/completions",
     embeddingsEndpoint: "/embeddings",
+    rerankEndpoint: "/rerank",
   },
 
   // Feature defaults
@@ -35,7 +39,10 @@ export const config = {
     maxEmailsToFetch: 50,
     maxEmailsForSummary: 30,
     maxEmailsPerParticipant: 200,
-    embeddingTopK: 50,
-    rerankTopK: 20,
+    embeddingTopK: 200,
+    filterThreshold: 6,
+    filterBatchSize: 30,
+    recentMonths: 6,
+    nonParticipantTopK: 20,
   },
 };

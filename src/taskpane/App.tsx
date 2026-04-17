@@ -223,6 +223,10 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
       console.warn("[Dialog] Could not read data from URL hash:", err);
     }
 
+    // Clean up popout token when dialog closes
+    const cleanup = () => localStorage.removeItem("graph_popout_token");
+    window.addEventListener("beforeunload", cleanup);
+
     // Listen for live item updates from taskpane via messageChild
     try {
       Office.context.ui.addHandlerAsync(
@@ -241,6 +245,7 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
     } catch (err) {
       console.warn("[Dialog] Could not register parent message handler:", err);
     }
+    return () => window.removeEventListener("beforeunload", cleanup);
   }, [inDialog, setItem]);
 
   if (loading) {
@@ -291,8 +296,12 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
           </MessageBar>
         )}
 
-        {activeTab === "assistant" && <AssistantView />}
-        {activeTab === "meeting" && <MeetingPrepView />}
+        <div style={{ display: activeTab === "assistant" ? "contents" : "none" }}>
+          <AssistantView />
+        </div>
+        <div style={{ display: activeTab === "meeting" ? "contents" : "none" }}>
+          <MeetingPrepView />
+        </div>
         {activeTab === "settings" && <SettingsView />}
       </div>
     </div>

@@ -125,6 +125,36 @@ export class SqliteMailDataSource implements MailDataSource {
     return deduplicated;
   }
 
+  // ── searchEmailsByKeyword ─────────────────────────────────────────
+  async searchEmailsByKeyword(keyword: string, maxResults = 50): Promise<LightEmail[]> {
+    // Simple LIKE search on subject for the mock DB (no FTS)
+    const rows = this.db
+      .prepare(
+        `SELECT id, subject, body_preview, from_name, from_address,
+                to_recipients_json, received_date_time, conversation_id
+         FROM messages
+         WHERE subject LIKE ?
+         ORDER BY received_date_time DESC
+         LIMIT ?`
+      )
+      .all(`%${keyword}%`, maxResults) as SqlRow[];
+
+    return rows.map((row) => ({
+      id: row.id as string,
+      subject: row.subject as string,
+      bodyPreview: (row.body_preview as string) || "",
+      from: {
+        emailAddress: {
+          name: row.from_name as string,
+          address: row.from_address as string,
+        },
+      },
+      toRecipients: JSON.parse(row.to_recipients_json as string),
+      receivedDateTime: row.received_date_time as string,
+      conversationId: (row.conversation_id as string) || "",
+    }));
+  }
+
   // ── getEmailsBatch ────────────────────────────────────────────────
   async getEmailsBatch(messageIds: string[]): Promise<EmailMessage[]> {
     if (messageIds.length === 0) return [];
