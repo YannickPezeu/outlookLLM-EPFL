@@ -8,6 +8,7 @@ import {
   searchEmails,
   searchEmailsByKeyword,
   getRecentEmails,
+  getRecentSentEmails,
   getCalendarView,
   getEmailsBatch,
   DateRange,
@@ -19,6 +20,16 @@ import { prepareMeeting } from "./meetingPrepService";
 import { GraphMailDataSource } from "./graphMailDataSource";
 
 // ─── Tool Definitions (OpenAI function-calling format) ──────────────
+
+// Tools whose call+result stays in the conversation history for subsequent turns.
+// Enable for small, structured results that users typically ask follow-ups about
+// (calendar events, contacts). Do NOT enable for large results (email searches,
+// identify_topic_participants, summarize_topic_status, summaries) — the assistant's
+// text already summarizes those and keeping the raw payload would bloat context.
+export const PRESERVED_TOOLS = new Set<string>([
+  "get_calendar_events",
+  "search_contacts",
+]);
 
 export const AGENT_TOOLS: ToolDefinition[] = [
   {
@@ -85,7 +96,9 @@ export const AGENT_TOOLS: ToolDefinition[] = [
       name: "get_calendar_events",
       description:
         "Récupère les événements du calendrier dans une période donnée. " +
-        "Par défaut, retourne les événements des 7 prochains jours.",
+        "Par défaut, retourne les événements des 7 prochains jours. " +
+        "OBLIGATOIRE pour toute question sur les réunions, rendez-vous, agenda ou disponibilités — " +
+        "ne jamais répondre sans appeler cet outil, même pour un simple 'ma prochaine réunion' ou 'la suivante'.",
       parameters: {
         type: "object",
         properties: {
@@ -253,13 +266,14 @@ export const AGENT_TOOLS: ToolDefinition[] = [
   {
     type: "function",
     function: {
-      name: "explore_topic",
+      name: "identify_topic_participants",
       description:
-        "Explore un sujet/thème dans les emails de l'utilisateur. " +
-        "Identifie les personnes impliquées, leur rôle et leur positionnement sur ce sujet. " +
-        "Cherche les emails pertinents, les classe par correspondant, et résume le rôle de chacun. " +
+        "CARTOGRAPHIE LES PERSONNES impliquées sur un sujet/thème dans les emails. " +
+        "Identifie qui travaille sur le sujet, leur rôle, leur positionnement et leurs contributions. " +
         "Utiliser quand l'utilisateur pose une question comme 'qui travaille sur X ?', " +
-        "'quels sont les acteurs sur le thème Y ?', 'qui est impliqué dans Z ?'.",
+        "'quels sont les acteurs sur le thème Y ?', 'qui est impliqué dans Z ?'. " +
+        "NE PAS utiliser pour un point d'avancement chronologique (« où on en est de X ? ») — " +
+        "utiliser summarize_topic_status à la place.",
       parameters: {
         type: "object",
         properties: {
@@ -272,6 +286,39 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           max_people: {
             type: "number",
             description: "Nombre maximum de personnes à analyser (défaut: 10)",
+          },
+        },
+        required: ["topic"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "summarize_topic_status",
+      description:
+        "POINT D'AVANCEMENT CHRONOLOGIQUE sur un sujet/projet en cours : où on en est, " +
+        "dernières évolutions datées, prochaines étapes, points bloquants. " +
+        "Couvre à la fois les emails reçus et envoyés par l'utilisateur. " +
+        "Utiliser quand l'utilisateur demande 'où on en est de X ?', 'état d'avancement de Y ?', " +
+        "'fais-moi un point sur le projet Z', 'résume l'avancée du dossier W'. " +
+        "NE PAS confondre avec identify_topic_participants qui cartographie les PERSONNES impliquées.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            description: "Description RICHE et détaillée du sujet/projet pour le classement sémantique (embeddings). " +
+              "Inclure synonymes et termes associés. Ex: 'recrutement binôme, candidat assistant, offre d'emploi, " +
+              "CV, entretien, embauche, RH' plutôt que juste 'recrutement'.",
+          },
+          months: {
+            type: "number",
+            description: "Nombre de mois à remonter (défaut: 6)",
+          },
+          max_emails: {
+            type: "number",
+            description: "Nombre maximum d'emails à analyser après ranking sémantique (défaut: 30)",
           },
         },
         required: ["topic"],
@@ -312,6 +359,20 @@ function extractDateRange(args: Record<string, unknown>): DateRange | undefined 
   const startDate = args.start_date as string | undefined;
   const endDate = args.end_date as string | undefined;
   return (startDate || endDate) ? { startDate, endDate } : undefined;
+}
+
+function formatLocalDateTime(dateTime: string, timeZone: string): string {
+  // Graph renvoie des heures "murales" dans le TZ demandé via le header Prefer,
+  // sans suffixe Z/offset. On parse en forçant UTC puis on formate en UTC pour
+  // afficher les composants tels quels (sans reconversion), en précisant le TZ.
+  const iso = /[zZ]|[+-]\d{2}:?\d{2}$/.test(dateTime) ? dateTime : `${dateTime}Z`;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return `${dateTime} (${timeZone})`;
+  return d.toLocaleString("fr-CH", {
+    timeZone: "UTC",
+    dateStyle: "full",
+    timeStyle: "short",
+  }) + ` (${timeZone})`;
 }
 
 const executors: Record<string, ToolExecutor> = {
@@ -420,6 +481,8 @@ const executors: Record<string, ToolExecutor> = {
       subject: e.subject,
       start: e.start.dateTime,
       end: e.end.dateTime,
+      startLocal: formatLocalDateTime(e.start.dateTime, e.start.timeZone),
+      endLocal: formatLocalDateTime(e.end.dateTime, e.end.timeZone),
       location: e.location?.displayName,
       attendees: e.attendees.map((a) => ({
         name: a.emailAddress.name,
@@ -605,18 +668,23 @@ const executors: Record<string, ToolExecutor> = {
     });
   },
 
-  async explore_topic(args, log) {
+  async identify_topic_participants(args, log) {
     const topic = args.topic as string;
     const maxPeople = (args.max_people as number) || 10;
+    const LOOKBACK_MONTHS = 6;
+    const MAX_FETCH = 2000;
+    const TOP_N = 200;
+    const MAX_EMAILS_PER_PERSON = 5;
 
-    // Step 1: Get ALL emails from last 6 months
-    log(`Récupération des emails des 6 derniers mois...`);
-    const allRecentEmails = await getRecentEmails(6, 2000);
+    // Step 1: Get ALL emails from last N months (inbox only)
+    log(`Récupération des emails reçus sur les ${LOOKBACK_MONTHS} derniers mois (cap: ${MAX_FETCH})...`);
+    const allRecentEmails = await getRecentEmails(LOOKBACK_MONTHS, MAX_FETCH);
 
     if (allRecentEmails.length === 0) {
-      return JSON.stringify({ message: "Aucun email trouvé sur les 6 derniers mois.", people: [] });
+      return JSON.stringify({ message: `Aucun email trouvé sur les ${LOOKBACK_MONTHS} derniers mois.`, people: [] });
     }
-    log(`${allRecentEmails.length} emails récupérés`);
+    const cappedNote = allRecentEmails.length >= MAX_FETCH ? ` (cap atteint — période peut être incomplète)` : "";
+    log(`${allRecentEmails.length} emails récupérés${cappedNote}`);
 
     // Step 2: Identify all correspondents
     const byPerson = new Map<string, { name: string; email: string; allEmails: typeof allRecentEmails }>();
@@ -629,57 +697,56 @@ const executors: Record<string, ToolExecutor> = {
       }
       byPerson.get(addr)!.allEmails.push(e);
     }
-    log(`${byPerson.size} correspondants identifiés`);
+    log(`${byPerson.size} correspondants distincts identifiés`);
 
-    // Step 3: Embed ALL emails → top 200 by similarity to topic
-    log(`Embedding de ${allRecentEmails.length} emails...`);
+    // Step 3: Embed ALL emails → top N by similarity to topic
+    log(`Classement sémantique (embeddings) de ${allRecentEmails.length} emails sur le sujet...`);
     const emailTexts = allRecentEmails.map((e) => `${e.subject} ${e.bodyPreview}`);
     const allTexts = [topic, ...emailTexts];
     const embeddings = await batchEmbed(allTexts);
     const queryEmbedding = embeddings[0];
     const emailEmbeddings = embeddings.slice(1);
     const ranked = rankBySimilarity(queryEmbedding, emailEmbeddings);
-    const top200 = ranked.slice(0, 200);
-    log(`Top ${top200.length} emails par pertinence sémantique`);
+    const topRanked = ranked.slice(0, TOP_N);
+    log(`Top ${topRanked.length} emails sélectionnés (score max: ${topRanked[0]?.score.toFixed(3)}, min: ${topRanked[topRanked.length - 1]?.score.toFixed(3)})`);
 
-    // Step 4: Which correspondents survived in top 200?
-    const survivorEmailIds = new Map<string, Set<string>>();
-    for (const r of top200) {
+    // Step 4: Group top-N emails by sender, keeping ranking order (score-desc)
+    const topByPerson = new Map<string, Array<{ email: typeof allRecentEmails[number]; score: number }>>();
+    for (const r of topRanked) {
       const e = allRecentEmails[r.index];
       const addr = e.from?.emailAddress?.address?.toLowerCase();
       if (!addr) continue;
-      if (!survivorEmailIds.has(addr)) survivorEmailIds.set(addr, new Set());
-      survivorEmailIds.get(addr)!.add(e.id);
+      if (!topByPerson.has(addr)) topByPerson.set(addr, []);
+      topByPerson.get(addr)!.push({ email: e, score: r.score });
     }
 
-    // For each survivor, take the 5 most recent emails (from their full list, not just top200)
-    const survivors = [...survivorEmailIds.entries()]
-      .map(([addr, topIds]) => {
+    // For each survivor, take their TOP-scored emails from the top-N (not the most recent)
+    const survivors = [...topByPerson.entries()]
+      .map(([addr, items]) => {
         const person = byPerson.get(addr)!;
-        const recent5 = person.allEmails
-          .sort((a, b) => new Date(b.receivedDateTime).getTime() - new Date(a.receivedDateTime).getTime())
-          .slice(0, 5);
-        return { ...person, topCount: topIds.size, recentEmails: recent5 };
+        const topEmails = items.slice(0, MAX_EMAILS_PER_PERSON).map((i) => i.email);
+        return { ...person, topCount: items.length, topEmails };
       })
       .sort((a, b) => b.topCount - a.topCount)
       .slice(0, maxPeople);
 
-    log(`${survivorEmailIds.size} correspondants dans le top 200, analyse des ${survivors.length} principaux...`);
+    log(`${topByPerson.size} correspondants dans le top ${TOP_N}, analyse des ${survivors.length} principaux`);
 
-    // Step 5: Read full body for survivors' recent emails
-    const allEmailIds = survivors.flatMap((p) => p.recentEmails.map((e: any) => e.id));
+    // Step 5: Read full body for survivors' top-scored emails
+    const allEmailIds = survivors.flatMap((p) => p.topEmails.map((e) => e.id));
+    log(`Lecture du contenu complet de ${allEmailIds.length} emails...`);
     const fullEmails = await getEmailsBatch(allEmailIds);
     const fullById = new Map(fullEmails.map((f) => [f.id, f]));
 
     // Step 6: Build digest per person, send to LLM
     const personDigests = survivors.map((person) => {
-      const emailDigest = person.recentEmails.map((e: any) => {
+      const emailDigest = person.topEmails.map((e) => {
         const full = fullById.get(e.id);
         const body = full?.body?.content ? cleanEmailBodyFull(full.body.content).slice(0, 1500) : e.bodyPreview;
         const date = new Date(e.receivedDateTime).toLocaleDateString("fr-FR");
         return `[${date}] Sujet: ${e.subject}\n${body}`;
       }).join("\n---\n");
-      return `### ${person.name} (${person.email}) — ${person.topCount} emails pertinents dans le top 200, ${person.allEmails.length} emails total\n${emailDigest}`;
+      return `### ${person.name} (${person.email}) — ${person.topCount} emails pertinents dans le top ${TOP_N}, ${person.allEmails.length} emails total\n${emailDigest}`;
     }).join("\n\n");
 
     const today = new Date().toLocaleDateString("fr-FR", {
@@ -713,11 +780,139 @@ const executors: Record<string, ToolExecutor> = {
 
     return JSON.stringify({
       topic,
-      people_found: survivorEmailIds.size,
+      people_found: topByPerson.size,
       people_analyzed: survivors.length,
       emails_total: allRecentEmails.length,
-      emails_ranked: top200.length,
-      people: survivors.map((p) => ({ name: p.name, email: p.email, emails_in_top200: p.topCount })),
+      emails_ranked: topRanked.length,
+      people: survivors.map((p) => ({ name: p.name, email: p.email, emails_in_top_ranked: p.topCount })),
+      analysis,
+    });
+  },
+
+  async summarize_topic_status(args, log) {
+    const topic = args.topic as string;
+    const months = (args.months as number) || 6;
+    const maxEmails = (args.max_emails as number) || 30;
+    const MAX_FETCH_PER_DIRECTION = 2000;
+
+    // Step 1: fetch received + sent in parallel
+    log(`Récupération des emails des ${months} derniers mois (reçus + envoyés, cap: ${MAX_FETCH_PER_DIRECTION} par direction)...`);
+    const [received, sent] = await Promise.all([
+      getRecentEmails(months, MAX_FETCH_PER_DIRECTION),
+      getRecentSentEmails(months, MAX_FETCH_PER_DIRECTION),
+    ]);
+    const capNote = (received.length >= MAX_FETCH_PER_DIRECTION || sent.length >= MAX_FETCH_PER_DIRECTION)
+      ? " (cap atteint — période peut être incomplète)" : "";
+    log(`${received.length} reçus, ${sent.length} envoyés${capNote}`);
+
+    // Step 2: merge + dedupe by id, normalize direction
+    const byId = new Map<string, {
+      id: string;
+      subject: string;
+      bodyPreview: string;
+      date: string;
+      direction: "received" | "sent";
+      from: string;
+    }>();
+    for (const e of received) {
+      byId.set(e.id, {
+        id: e.id,
+        subject: e.subject,
+        bodyPreview: e.bodyPreview,
+        date: e.receivedDateTime,
+        direction: "received",
+        from: e.from?.emailAddress?.name || e.from?.emailAddress?.address || "?",
+      });
+    }
+    for (const e of sent) {
+      if (byId.has(e.id)) continue;
+      byId.set(e.id, {
+        id: e.id,
+        subject: e.subject,
+        bodyPreview: e.bodyPreview,
+        date: e.receivedDateTime,
+        direction: "sent",
+        from: "Moi",
+      });
+    }
+    const allEmails = [...byId.values()];
+    if (allEmails.length === 0) {
+      return JSON.stringify({ message: "Aucun email trouvé sur la période.", topic, timeline: [] });
+    }
+
+    // Step 3: semantic ranking against topic
+    log(`Classement sémantique (embeddings) de ${allEmails.length} emails sur le sujet...`);
+    const texts = allEmails.map((e) => `${e.subject} ${e.bodyPreview}`);
+    const embeddings = await batchEmbed([topic, ...texts]);
+    const ranked = rankBySimilarity(embeddings[0], embeddings.slice(1));
+    const topN = Math.min(maxEmails, allEmails.length);
+    const survivors = ranked.slice(0, topN).map((r) => allEmails[r.index]);
+    log(`Top ${topN} emails sélectionnés (score max: ${ranked[0]?.score.toFixed(3)}, min: ${ranked[topN - 1]?.score.toFixed(3)})`);
+
+    // Step 4: read full body for survivors
+    log(`Lecture du contenu complet des ${survivors.length} emails...`);
+    const fullEmails = await getEmailsBatch(survivors.map((e) => e.id));
+    const fullById = new Map(fullEmails.map((f) => [f.id, f]));
+
+    // Step 5: sort chronologically ascending (oldest first) for timeline narrative
+    survivors.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    // Step 6: build digest + synthesize
+    const digest = survivors.map((e) => {
+      const full = fullById.get(e.id);
+      const body = full?.body?.content
+        ? cleanEmailBodyFull(full.body.content).slice(0, 1500)
+        : e.bodyPreview;
+      const date = new Date(e.date).toLocaleDateString("fr-FR");
+      const tag = e.direction === "sent" ? "ENVOYÉ par moi" : `REÇU de ${e.from}`;
+      return `[${date}] [${tag}] Sujet: ${e.subject}\n${body}`;
+    }).join("\n---\n");
+
+    const today = new Date().toLocaleDateString("fr-FR", {
+      weekday: "long", year: "numeric", month: "long", day: "numeric",
+    });
+
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content:
+          `Tu es un assistant expert en suivi de dossiers et projets. Nous sommes le ${today}. ` +
+          `On te donne les emails (reçus ET envoyés par l'utilisateur) échangés autour du sujet "${topic}", ` +
+          "triés du plus ancien au plus récent. Certains emails peuvent ne PAS être réellement liés au sujet " +
+          "(faux positifs du moteur de recherche). Ignore-les silencieusement.\n\n" +
+          "Produis un POINT D'AVANCEMENT structuré en français avec ces sections :\n" +
+          "## Point actuel\n" +
+          "Une à deux phrases qui résument où on en est aujourd'hui.\n\n" +
+          "## Dernières évolutions\n" +
+          "Bullets datés (format JJ/MM) en ordre chronologique, max 8 points, en se concentrant sur " +
+          "les événements clés (décisions, envois, réponses reçues, changements d'état).\n\n" +
+          "## Prochaines étapes\n" +
+          "Ce qui est attendu ensuite, idéalement avec qui doit faire quoi.\n\n" +
+          "## En attente / blocages\n" +
+          "Tout point qui coince, question sans réponse, relance nécessaire. Mettre \"Rien d'identifié\" si absent.\n\n" +
+          "Sois concis et factuel. Ne reproduis pas le texte brut des emails — synthétise.",
+      },
+      {
+        role: "user",
+        content: `Sujet : "${topic}"\n\nEmails (ordre chronologique) :\n\n${digest}\n\nFais le point d'avancement.`,
+      },
+    ];
+
+    log(`Génération du point d'avancement par le LLM...`);
+    const response = await chatCompletion(messages, config.rcp.synthesisModel);
+    const analysis = response.choices?.[0]?.message?.content || "Analyse non disponible.";
+
+    return JSON.stringify({
+      topic,
+      period_months: months,
+      emails_total: allEmails.length,
+      emails_analyzed: survivors.length,
+      timeline: survivors.map((e) => ({
+        date: e.date,
+        direction: e.direction,
+        from: e.from,
+        subject: e.subject,
+      })),
       analysis,
     });
   },

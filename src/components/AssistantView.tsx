@@ -12,7 +12,7 @@ import {
   Badge,
 } from "@fluentui/react-components";
 import { Send24Regular, Bot24Regular, ArrowReset24Regular } from "@fluentui/react-icons";
-import { runAgent, resolveEmailRef, type ToolProgressCallback, type StreamCallback, type EmailListCallback, type EmailListItem } from "../services/agentService";
+import { runAgent, resolveEmailRef, type ToolProgressCallback, type StreamCallback, type EmailListCallback, type EmailListItem, type LogCallback } from "../services/agentService";
 import { Mail24Regular } from "@fluentui/react-icons";
 import { type AgentMessage } from "../services/rcpApiService";
 
@@ -30,16 +30,19 @@ marked.setOptions({ breaks: true, gfm: true, renderer });
 
 // ─── Types ──────────────────────────────────────────────────────────
 
+interface ToolTrace {
+  toolName: string;
+  args?: string;
+  steps: string[];
+  status: "calling" | "done" | "error";
+  errorMsg?: string;
+}
+
 interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   emailList?: { name: string; emails: EmailListItem[] };
-}
-
-interface ToolProgress {
-  toolName: string;
-  status: "calling" | "done" | "error";
-  detail?: string;
+  traces?: ToolTrace[];
 }
 
 // ─── Styles ─────────────────────────────────────────────────────────
@@ -112,14 +115,59 @@ const useStyles = makeStyles({
       },
     },
   },
-  toolIndicator: {
+  tracePanel: {
     alignSelf: "flex-start",
+    width: "100%",
+    backgroundColor: tokens.colorNeutralBackground2,
+    borderRadius: tokens.borderRadiusMedium,
+    padding: "6px 10px",
+    fontSize: tokens.fontSizeBase100,
+    color: tokens.colorNeutralForeground3,
+    "& > summary": {
+      cursor: "pointer",
+      userSelect: "none",
+      display: "flex",
+      alignItems: "center",
+      gap: "6px",
+      fontWeight: tokens.fontWeightSemibold,
+    },
+  },
+  traceTool: {
+    marginTop: "6px",
+    paddingLeft: "4px",
+    borderLeft: `2px solid ${tokens.colorNeutralStroke2}`,
+    paddingBlock: "2px",
+  },
+  traceToolHeader: {
     display: "flex",
     alignItems: "center",
     gap: "6px",
-    padding: "4px 8px",
+    fontSize: tokens.fontSizeBase100,
+    color: tokens.colorNeutralForeground2,
+    marginLeft: "4px",
+  },
+  traceToolArgs: {
+    fontFamily: tokens.fontFamilyMonospace,
     fontSize: tokens.fontSizeBase100,
     color: tokens.colorNeutralForeground3,
+    opacity: 0.8,
+    maxWidth: "60%",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  traceSteps: {
+    margin: "2px 0 4px 20px",
+    padding: 0,
+    listStyle: "disc",
+    "& li": {
+      margin: "2px 0",
+    },
+  },
+  traceError: {
+    marginLeft: "20px",
+    color: tokens.colorPaletteRedForeground1,
+    fontSize: tokens.fontSizeBase100,
   },
   inputArea: {
     display: "flex",
@@ -198,6 +246,8 @@ const TOOL_LABELS: Record<string, string> = {
   search_emails: "Recherche dans les emails",
   show_emails: "Affichage des emails",
   prepare_meeting: "Préparation de réunion",
+  identify_topic_participants: "Identification des acteurs",
+  summarize_topic_status: "Point d'avancement",
 };
 
 // ─── Markdown renderer ──────────────────────────────────────────────
@@ -238,6 +288,71 @@ const MarkdownContent: React.FC<{
   );
 };
 
+// ─── Trace panel (tool execution steps, persistent in chat) ────────
+
+const formatToolArgs = (raw?: string): string => {
+  if (!raw) return "";
+  try {
+    const args = JSON.parse(raw);
+    const parts: string[] = [];
+    if (args.topic) parts.push(`topic: "${String(args.topic).slice(0, 60)}${String(args.topic).length > 60 ? "…" : ""}"`);
+    if (args.name) parts.push(`name: "${args.name}"`);
+    if (args.query) parts.push(`query: "${args.query}"`);
+    if (args.months) parts.push(`${args.months} mois`);
+    if (args.max_emails) parts.push(`max_emails: ${args.max_emails}`);
+    if (args.max_people) parts.push(`max_people: ${args.max_people}`);
+    if (args.start_date || args.end_date) {
+      parts.push(`${args.start_date?.slice(0, 10) || "…"} → ${args.end_date?.slice(0, 10) || "…"}`);
+    }
+    return parts.join(", ");
+  } catch {
+    return "";
+  }
+};
+
+const TracePanelView: React.FC<{
+  traces: ToolTrace[];
+  isLive?: boolean;
+  styles: ReturnType<typeof useStyles>;
+}> = ({ traces, isLive, styles }) => {
+  if (traces.length === 0) return null;
+  const totalSteps = traces.reduce((s, t) => s + t.steps.length, 0);
+  const anyRunning = traces.some((t) => t.status === "calling");
+  const title = isLive && anyRunning
+    ? `Actions en cours — ${traces.length} outil${traces.length > 1 ? "s" : ""}, ${totalSteps} étape${totalSteps > 1 ? "s" : ""}`
+    : `Actions de l'agent — ${traces.length} outil${traces.length > 1 ? "s" : ""}, ${totalSteps} étape${totalSteps > 1 ? "s" : ""}`;
+  return (
+    <details className={styles.tracePanel} open={isLive}>
+      <summary>
+        {anyRunning ? <Spinner size="tiny" /> : <Badge appearance="filled" color="success" size="tiny" />}
+        <span>{title}</span>
+      </summary>
+      {traces.map((t, i) => {
+        const argsText = formatToolArgs(t.args);
+        return (
+          <div key={i} className={styles.traceTool}>
+            <div className={styles.traceToolHeader}>
+              {t.status === "calling" && <Spinner size="tiny" />}
+              {t.status === "done" && <Badge appearance="filled" color="success" size="tiny" />}
+              {t.status === "error" && <Badge appearance="filled" color="danger" size="tiny" />}
+              <span style={{ fontWeight: 600 }}>{TOOL_LABELS[t.toolName] || t.toolName}</span>
+              {argsText && <span className={styles.traceToolArgs}>— {argsText}</span>}
+            </div>
+            {t.steps.length > 0 && (
+              <ul className={styles.traceSteps}>
+                {t.steps.map((s, j) => <li key={j}>{s}</li>)}
+              </ul>
+            )}
+            {t.status === "error" && t.errorMsg && (
+              <div className={styles.traceError}>Erreur : {t.errorMsg}</div>
+            )}
+          </div>
+        );
+      })}
+    </details>
+  );
+};
+
 // ─── Suggestions ────────────────────────────────────────────────────
 
 const SUGGESTIONS = [
@@ -248,21 +363,30 @@ const SUGGESTIONS = [
 
 // ─── Component ──────────────────────────────────────────────────────
 
-export const AssistantView: React.FC = () => {
+export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = true }) => {
   const styles = useStyles();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [toolProgress, setToolProgress] = useState<ToolProgress[]>([]);
+  const [liveTraces, setLiveTraces] = useState<ToolTrace[]>([]);
   const [streamingContent, setStreamingContent] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const conversationRef = useRef<AgentMessage[]>([]);
   const pendingEmailListRef = useRef<{ name: string; emails: EmailListItem[] } | null>(null);
+  const tracesRef = useRef<ToolTrace[]>([]);
 
   // Auto-scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, toolProgress, streamingContent]);
+  }, [messages, liveTraces, streamingContent]);
+
+  // Auto-focus input when tab becomes active
+  useEffect(() => {
+    if (isActive && !loading) {
+      inputRef.current?.focus();
+    }
+  }, [isActive, loading]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
@@ -271,18 +395,53 @@ export const AssistantView: React.FC = () => {
     setInput("");
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setLoading(true);
-    setToolProgress([]);
+    tracesRef.current = [];
+    setLiveTraces([]);
     setStreamingContent("");
 
+    const findLastTraceIdx = (toolName: string): number => {
+      for (let i = tracesRef.current.length - 1; i >= 0; i--) {
+        if (tracesRef.current[i].toolName === toolName) return i;
+      }
+      return -1;
+    };
+
+    const updateTraces = (updater: (prev: ToolTrace[]) => ToolTrace[]) => {
+      tracesRef.current = updater(tracesRef.current);
+      setLiveTraces(tracesRef.current);
+    };
+
     const onToolProgress: ToolProgressCallback = (toolName, status, detail) => {
-      setToolProgress((prev) => {
-        const existing = prev.findIndex((t) => t.toolName === toolName);
-        if (existing >= 0) {
-          const updated = [...prev];
-          updated[existing] = { toolName, status, detail };
-          return updated;
-        }
-        return [...prev, { toolName, status, detail }];
+      const isInitialCall = status === "calling" && !!detail && detail.trim().startsWith("{");
+      if (isInitialCall) {
+        updateTraces((prev) => [...prev, { toolName, args: detail, steps: [], status: "calling" }]);
+        return;
+      }
+      const idx = findLastTraceIdx(toolName);
+      if (idx < 0) return;
+      updateTraces((prev) => {
+        const next = [...prev];
+        next[idx] = {
+          ...next[idx],
+          status: status === "done" || status === "error" ? status : next[idx].status,
+          errorMsg: status === "error" ? detail : next[idx].errorMsg,
+        };
+        return next;
+      });
+    };
+
+    const onLog: LogCallback = (msg) => {
+      const match = msg.match(/^\[([^\]]+)\] ([\s\S]+)$/);
+      if (!match) return;
+      const prefix = match[1];
+      const rest = match[2];
+      if (prefix === "Agent") return;
+      const idx = findLastTraceIdx(prefix);
+      if (idx < 0) return;
+      updateTraces((prev) => {
+        const next = [...prev];
+        next[idx] = { ...next[idx], steps: [...next[idx].steps, rest] };
+        return next;
       });
     };
 
@@ -304,22 +463,39 @@ export const AssistantView: React.FC = () => {
         conversationRef.current,
         onToolProgress,
         onStream,
-        undefined,
+        onLog,
         onEmailList
       );
 
       conversationRef.current = updatedHistory;
       const emailList = pendingEmailListRef.current;
       pendingEmailListRef.current = null;
-      setMessages((prev) => [...prev, { role: "assistant", content: response, emailList: emailList || undefined }]);
-      setStreamingContent("");
-      setToolProgress([]);
-    } catch (err: any) {
-      const errorMsg = err.message || "Erreur inattendue";
+      const finalTraces = tracesRef.current;
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: `**Erreur :** ${errorMsg}` },
+        {
+          role: "assistant",
+          content: response,
+          emailList: emailList || undefined,
+          traces: finalTraces.length > 0 ? finalTraces : undefined,
+        },
       ]);
+      setStreamingContent("");
+      tracesRef.current = [];
+      setLiveTraces([]);
+    } catch (err: any) {
+      const errorMsg = err.message || "Erreur inattendue";
+      const finalTraces = tracesRef.current;
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: `**Erreur :** ${errorMsg}`,
+          traces: finalTraces.length > 0 ? finalTraces : undefined,
+        },
+      ]);
+      tracesRef.current = [];
+      setLiveTraces([]);
     } finally {
       setLoading(false);
     }
@@ -351,7 +527,8 @@ export const AssistantView: React.FC = () => {
   const handleReset = useCallback(() => {
     setMessages([]);
     setInput("");
-    setToolProgress([]);
+    tracesRef.current = [];
+    setLiveTraces([]);
     setStreamingContent("");
     conversationRef.current = [];
     pendingEmailListRef.current = null;
@@ -396,6 +573,9 @@ export const AssistantView: React.FC = () => {
               <div className={styles.userBubble}>{msg.content}</div>
             ) : (
               <>
+                {msg.traces && msg.traces.length > 0 && (
+                  <TracePanelView traces={msg.traces} styles={styles} />
+                )}
                 {msg.content && (
                   <MarkdownContent content={msg.content} className={styles.assistantBubble} onEmailClick={handleEmailClick} />
                 )}
@@ -429,35 +609,10 @@ export const AssistantView: React.FC = () => {
           </div>
         ))}
 
-        {/* Tool progress indicators */}
-        {toolProgress.map((tp, i) => {
-          // Format tool args for display
-          let argsDisplay = "";
-          if (tp.detail) {
-            try {
-              const args = JSON.parse(tp.detail);
-              const parts: string[] = [];
-              if (args.name) parts.push(args.name);
-              if (args.query) parts.push(`"${args.query}"`);
-              if (args.start_date || args.end_date) {
-                const from = args.start_date?.slice(0, 10) || "...";
-                const to = args.end_date?.slice(0, 10) || "...";
-                parts.push(`${from} → ${to}`);
-              }
-              if (parts.length > 0) argsDisplay = ` (${parts.join(", ")})`;
-            } catch { /* ignore */ }
-          }
-          return (
-            <div key={`tool-${i}`} className={styles.toolIndicator}>
-              {tp.status === "calling" && <Spinner size="tiny" />}
-              {tp.status === "done" && <Badge appearance="filled" color="success" size="tiny" />}
-              {tp.status === "error" && <Badge appearance="filled" color="danger" size="tiny" />}
-              <span>{TOOL_LABELS[tp.toolName] || tp.toolName}{argsDisplay}</span>
-              {tp.status === "calling" && tp.detail && !tp.detail.startsWith("{") && <span style={{ opacity: 0.7, marginLeft: 4 }}> — {tp.detail}</span>}
-              {tp.status === "calling" && "..."}
-            </div>
-          );
-        })}
+        {/* Live tool trace (during current turn) */}
+        {liveTraces.length > 0 && (
+          <TracePanelView traces={liveTraces} isLive styles={styles} />
+        )}
 
         {/* Streaming response */}
         {streamingContent && (
@@ -486,6 +641,7 @@ export const AssistantView: React.FC = () => {
       <div className={styles.inputArea}>
         <Input
           className={styles.inputField}
+          input={{ ref: inputRef }}
           placeholder="Posez votre question..."
           value={input}
           onChange={(_, data) => setInput(data.value)}

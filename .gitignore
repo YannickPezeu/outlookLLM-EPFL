@@ -9,3 +9,5 @@ Thumbs.db
 .venv/
 data/
 ADMIN_REQUEST.pdf
+results/
+manifest.zip

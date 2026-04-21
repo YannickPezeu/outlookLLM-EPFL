@@ -4,6 +4,8 @@ import { distance as levenshtein } from "fastest-levenshtein";
 
 const GRAPH = config.graph.baseUrl;
 
+const USER_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
 // ─── Types ───────────────────────────────────────────────────────────
 
 export interface EmailMessage {
@@ -168,12 +170,12 @@ async function graphFetch<T>(url: string, options?: RequestInit): Promise<T> {
 /**
  * Fetch all pages up to maxItems, following @odata.nextLink.
  */
-async function fetchAllPages<T>(url: string, maxItems: number): Promise<T[]> {
+async function fetchAllPages<T>(url: string, maxItems: number, options?: RequestInit): Promise<T[]> {
   const items: T[] = [];
   let nextUrl: string | undefined = url;
 
   while (nextUrl && items.length < maxItems) {
-    const page: GraphPagedResponse<T> = await graphFetch<GraphPagedResponse<T>>(nextUrl);
+    const page: GraphPagedResponse<T> = await graphFetch<GraphPagedResponse<T>>(nextUrl, options);
     items.push(...page.value);
     nextUrl = page["@odata.nextLink"];
   }
@@ -310,7 +312,9 @@ export async function getMessageAttachments(messageId: string): Promise<GraphAtt
  */
 export async function getCalendarEvent(eventId: string): Promise<CalendarEvent> {
   const url = `${GRAPH}/me/events/${eventId}?$select=id,subject,body,bodyPreview,start,end,location,attendees,isOrganizer,organizer,seriesMasterId`;
-  return graphFetch<CalendarEvent>(url);
+  return graphFetch<CalendarEvent>(url, {
+    headers: { Prefer: `outlook.timezone="${USER_TIMEZONE}"` },
+  });
 }
 
 /**
@@ -322,7 +326,9 @@ export async function getCalendarView(
   maxResults = 50
 ): Promise<CalendarEvent[]> {
   const url = `${GRAPH}/me/calendarView?startDateTime=${startDateTime}&endDateTime=${endDateTime}&$select=id,subject,bodyPreview,start,end,attendees,isOrganizer,organizer,seriesMasterId&$orderby=start/dateTime desc&$top=50`;
-  return fetchAllPages<CalendarEvent>(url, maxResults);
+  return fetchAllPages<CalendarEvent>(url, maxResults, {
+    headers: { Prefer: `outlook.timezone="${USER_TIMEZONE}"` },
+  });
 }
 
 // ─── Light Email Search (for embedding pipeline) ────────────────────
@@ -417,8 +423,9 @@ export async function searchEmailsByKeyword(
 }
 
 /**
- * Get all recent emails (received) within a date range.
- * Used by explore_topic to get all emails for embedding.
+ * Get all recent received emails (inbox) within a date range.
+ * Used by topic-wide tools (identify_topic_participants, summarize_topic_status)
+ * to feed semantic reranking without a person filter.
  */
 export async function getRecentEmails(
   months = 6,
@@ -428,6 +435,21 @@ export async function getRecentEmails(
   const startDate = new Date(Date.now() - months * 30 * 24 * 60 * 60 * 1000);
   const dateFilter = `receivedDateTime ge ${startDate.toISOString().slice(0, 10)}T00:00:00Z`;
   const url = `${GRAPH}/me/messages?$filter=${encodeURI(dateFilter)}&$orderby=receivedDateTime desc&$select=${select}&$top=50`;
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+/**
+ * Get all recent sent emails (sentitems folder) within a date range.
+ * Counterpart to getRecentEmails for the user's outgoing mail.
+ */
+export async function getRecentSentEmails(
+  months = 6,
+  maxResults = 2000
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+  const startDate = new Date(Date.now() - months * 30 * 24 * 60 * 60 * 1000);
+  const dateFilter = `sentDateTime ge ${startDate.toISOString().slice(0, 10)}T00:00:00Z`;
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$filter=${encodeURI(dateFilter)}&$orderby=sentDateTime desc&$select=${select}&$top=50`;
   return fetchAllPages<LightEmail>(url, maxResults);
 }
 

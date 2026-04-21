@@ -12,6 +12,7 @@ import {
   getCalendarEvent,
   collectEmailsWithParticipant,
   searchEmailsByKeyword,
+  getServiceDeskEmailsForPerson,
   getEmailsBatch,
   getMessageAttachments,
 } from "./graphMailService";
@@ -27,6 +28,20 @@ export class GraphMailDataSource implements MailDataSource {
 
   searchEmailsByKeyword(keyword: string, maxResults?: number): Promise<LightEmail[]> {
     return searchEmailsByKeyword(keyword, maxResults);
+  }
+
+  async searchServiceDeskEmailsForPerson(personName: string, maxResults = 50): Promise<LightEmail[]> {
+    const emails = await getServiceDeskEmailsForPerson(personName, maxResults);
+    // Convert EmailMessage → LightEmail
+    return emails.map((e) => ({
+      id: e.id,
+      subject: e.subject,
+      bodyPreview: e.bodyPreview,
+      from: e.from,
+      toRecipients: e.toRecipients,
+      receivedDateTime: e.receivedDateTime,
+      conversationId: (e as any).conversationId || "",
+    }));
   }
 
   getEmailsBatch(messageIds: string[]): Promise<EmailMessage[]> {

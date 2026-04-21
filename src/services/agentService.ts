@@ -2,7 +2,7 @@ import {
   AgentMessage,
   chatCompletionWithToolsStream,
 } from "./rcpApiService";
-import { AGENT_TOOLS, executeTool, ToolProgressFn } from "./agentTools";
+import { AGENT_TOOLS, executeTool, PRESERVED_TOOLS, ToolProgressFn } from "./agentTools";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -29,17 +29,34 @@ export type EmailListCallback = (name: string, emails: EmailListItem[]) => void;
 
 // ─── System Prompt ──────────────────────────────────────────────────
 
-function buildSystemPrompt(): string {
-  const today = new Date().toISOString().slice(0, 10);
+export function buildSystemPrompt(): string {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const nowLocal = new Date().toLocaleString("fr-CH", {
+    timeZone: tz,
+    dateStyle: "full",
+    timeStyle: "short",
+  });
   return `Tu es un assistant intelligent intégré dans Outlook pour les collaborateurs EPFL.
 Tu aides à chercher des emails, résumer des échanges, préparer des réunions et organiser la messagerie.
-La date actuelle est : ${today}.
+La date et l'heure actuelles sont : ${nowLocal} (fuseau ${tz}).
+
+RÈGLE ANTI-HALLUCINATION — LA PLUS IMPORTANTE :
+Tu n'as AUCUNE connaissance du calendrier, des emails, des contacts ou des réunions de l'utilisateur en dehors des résultats retournés par tes outils. Tu ne DOIS JAMAIS inventer :
+- un sujet de réunion, un titre d'email, un nom de contact, une date, une heure, un participant, un lieu
+- ni aucune donnée factuelle qui n'apparaît pas littéralement dans un résultat d'outil de la conversation en cours
+Si tu n'as pas appelé l'outil correspondant dans cette conversation, tu dois l'appeler MAINTENANT avant de répondre. Ne devine pas. Ne fais pas "comme si". Si l'outil ne retourne rien, dis "Je n'ai trouvé aucun résultat" — ne comble jamais le vide avec une réponse plausible.
+
+RÈGLE CALENDRIER :
+Pour TOUTE question concernant des réunions, rendez-vous, disponibilités, agenda ou calendrier (incluant "ma prochaine réunion", "la suivante", "qu'ai-je demain", "suis-je libre à X"), tu DOIS appeler get_calendar_events AVANT de répondre, à CHAQUE question, même si l'utilisateur vient de poser une question similaire. N'utilise jamais le résultat d'un appel précédent pour répondre à une nouvelle question calendrier — rappelle l'outil.
 
 RÈGLE PRIORITAIRE — SKILLS :
 Tu disposes de skills (workflows prédéfinis). Ton PREMIER réflexe pour chaque nouvelle demande est de vérifier si un skill correspond. Si oui, appelle load_skill AVANT tout autre outil. Lis les instructions retournées et suis-les exactement.
 
 Règles importantes :
-- Quand l'utilisateur pose une question sur un SUJET ou THÈME (ex: "qui travaille sur l'IA ?", "quels sont les acteurs sur le projet X ?", "quel est le positionnement de chacun sur Y ?"), utilise l'outil explore_topic. Ne demande PAS de précisions — lance directement l'exploration. IMPORTANT : le paramètre topic sert à la recherche ET au classement sémantique (embeddings). Un mot seul comme "IA" est trop vague. Développe le sujet en une description riche avec synonymes et termes associés (ex: "intelligence artificielle, IA, machine learning, LLM, modèles de langage, deep learning, ChatGPT, Copilot" au lieu de juste "IA").
+- Deux outils thématiques à bien distinguer :
+  * identify_topic_participants — cartographie les PERSONNES impliquées sur un sujet. Utiliser pour "qui travaille sur X ?", "quels sont les acteurs sur Y ?", "qui est impliqué dans Z ?", "quel est le positionnement de chacun sur W ?".
+  * summarize_topic_status — POINT D'AVANCEMENT chronologique d'un projet/dossier en cours. Utiliser pour "où on en est de X ?", "état d'avancement de Y ?", "fais-moi un point sur Z", "résume l'avancée du dossier W".
+  Ne demande PAS de précisions — lance directement l'outil adapté. IMPORTANT : le paramètre topic sert au classement sémantique (embeddings). Un mot seul est trop vague. Développe en description riche avec synonymes et termes associés (ex: "intelligence artificielle, IA, machine learning, LLM, modèles de langage, deep learning, ChatGPT, Copilot" au lieu de juste "IA").
 - Quand l'utilisateur mentionne un contact par nom (ex: "Dupont", "Martin"), utilise TOUJOURS l'outil search_contacts d'abord pour trouver l'adresse email exacte avant d'appeler d'autres outils.
 - Si search_contacts retourne un seul résultat, utilise-le directement sans demander confirmation.
 - Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Ne demande confirmation que si tu hésites vraiment entre deux contacts plausibles.
@@ -241,10 +258,15 @@ export async function runAgent(
     const finalContent = assistantMessage.content || "";
     log(`Réponse finale (${finalContent.length} chars)`);
 
-    // Build the updated history (without system prompt)
+    // Build the updated history (without system prompt), preserving tool_calls
+    // and tool results for tools in PRESERVED_TOOLS so follow-up questions
+    // ("la suivante ?", "rien entre les 2 ?") have access to the fresh data.
+    const turnMessages = messages.slice(conversationHistory.length + 2);
+    const preserved = filterPreservedToolMessages(turnMessages);
     const updatedHistory: AgentMessage[] = [
       ...conversationHistory,
       { role: "user", content: userMessage },
+      ...preserved,
       { role: "assistant", content: finalContent },
     ];
 
@@ -255,11 +277,41 @@ export async function runAgent(
   const fallback = "J'ai atteint la limite de recherches. Veuillez reformuler votre demande de manière plus simple.";
   onStream(fallback);
 
+  const turnMessages = messages.slice(conversationHistory.length + 2);
+  const preserved = filterPreservedToolMessages(turnMessages);
   const updatedHistory: AgentMessage[] = [
     ...conversationHistory,
     { role: "user", content: userMessage },
+    ...preserved,
     { role: "assistant", content: fallback },
   ];
 
   return { response: fallback, updatedHistory };
+}
+
+// Filter turn messages to keep only assistant→tool_calls + tool_results pairs
+// for tools flagged in PRESERVED_TOOLS. Drops non-preserved tool cycles entirely
+// (their summaries are already in the final assistant text).
+function filterPreservedToolMessages(turnMessages: AgentMessage[]): AgentMessage[] {
+  const result: AgentMessage[] = [];
+  for (let i = 0; i < turnMessages.length; i++) {
+    const msg = turnMessages[i];
+    if (msg.role !== "assistant" || !msg.tool_calls || msg.tool_calls.length === 0) continue;
+
+    const preservedCalls = msg.tool_calls.filter((tc) => PRESERVED_TOOLS.has(tc.function.name));
+    if (preservedCalls.length === 0) continue;
+
+    result.push({
+      role: "assistant",
+      content: msg.content ?? null,
+      tool_calls: preservedCalls,
+    });
+
+    const preservedIds = new Set(preservedCalls.map((c) => c.id));
+    for (let j = i + 1; j < turnMessages.length && turnMessages[j].role === "tool"; j++) {
+      const tr = turnMessages[j];
+      if (tr.tool_call_id && preservedIds.has(tr.tool_call_id)) result.push(tr);
+    }
+  }
+  return result;
 }

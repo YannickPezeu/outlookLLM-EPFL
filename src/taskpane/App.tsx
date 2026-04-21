@@ -297,7 +297,7 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
         )}
 
         <div style={{ display: activeTab === "assistant" ? "contents" : "none" }}>
-          <AssistantView />
+          <AssistantView isActive={activeTab === "assistant"} />
         </div>
         <div style={{ display: activeTab === "meeting" ? "contents" : "none" }}>
           <MeetingPrepView />

@@ -103,6 +103,7 @@ async function collectEmails(
 
   // Sequential collection to avoid Graph API throttling (429)
   let totalEmails = 0;
+  let totalServiceDesk = 0;
   for (let i = 0; i < participants.length; i++) {
     const p = participants[i];
     onProgress({
@@ -110,14 +111,35 @@ async function collectEmails(
       message: `Collecte des emails : ${p.name} (${i + 1}/${participants.length})...`,
       percent: 15 + (i / participants.length) * 10,
     });
-    const emails = await ds.collectEmailsWithParticipant(p.email);
-    emailsByParticipant.set(p.email, emails);
-    totalEmails += emails.length;
+    // Direct emails (from/to/cc)
+    const direct = await ds.collectEmailsWithParticipant(p.email);
+    // ServiceDesk emails mentioning the person by name
+    let serviceDesk: LightEmail[] = [];
+    try {
+      serviceDesk = await ds.searchServiceDeskEmailsForPerson(p.name, 50);
+    } catch (err) {
+      console.warn(`[MeetingPrep] ServiceDesk search failed for ${p.name}:`, err);
+    }
+
+    // Merge + dedup by id (ServiceDesk emails may already be in direct via from address)
+    const seenIds = new Set(direct.map((e) => e.id));
+    const merged = [...direct];
+    for (const e of serviceDesk) {
+      if (!seenIds.has(e.id)) {
+        merged.push(e);
+        seenIds.add(e.id);
+      }
+    }
+
+    emailsByParticipant.set(p.email, merged);
+    totalEmails += merged.length;
+    totalServiceDesk += serviceDesk.length;
+    console.log(`[MeetingPrep] Phase 2 — ${p.name}: ${direct.length} direct + ${serviceDesk.length} ServiceDesk = ${merged.length} emails`);
   }
 
   onProgress({
     phase: "collecting_emails",
-    message: `${totalEmails} emails collectés (dédupliqués par conversation)`,
+    message: `${totalEmails} emails collectés${totalServiceDesk > 0 ? ` (dont ${totalServiceDesk} ServiceDesk)` : ""}`,
     percent: 25,
   });
 

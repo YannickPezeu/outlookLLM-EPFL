@@ -79,6 +79,7 @@ module.exports = async (env, argv) => {
       new webpack.DefinePlugin({
         "process.env.ENTRA_CLIENT_ID": JSON.stringify(process.env.ENTRA_CLIENT_ID || ""),
         "process.env.ENTRA_TENANT_ID": JSON.stringify(process.env.ENTRA_TENANT_ID || ""),
+        "process.env.DEPLOY_TARGET": JSON.stringify(isK8s ? "k8s" : isGhPages ? "ghpages" : "dev"),
       }),
     ],
     devServer: {

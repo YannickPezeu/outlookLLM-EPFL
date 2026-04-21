@@ -65,6 +65,8 @@ export interface MailDataSource {
   getCalendarEvent(eventId: string): Promise<CalendarEvent>;
   collectEmailsWithParticipant(participantEmail: string): Promise<LightEmail[]>;
   searchEmailsByKeyword(keyword: string, maxResults?: number): Promise<LightEmail[]>;
+  /** Search ServiceDesk emails (from 1234@epfl.ch) mentioning a person by name. */
+  searchServiceDeskEmailsForPerson(personName: string, maxResults?: number): Promise<LightEmail[]>;
   getEmailsBatch(messageIds: string[]): Promise<EmailMessage[]>;
   getMessageAttachments(messageId: string): Promise<GraphAttachment[]>;
 }

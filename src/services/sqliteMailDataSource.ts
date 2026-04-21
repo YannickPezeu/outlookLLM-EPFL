@@ -125,6 +125,12 @@ export class SqliteMailDataSource implements MailDataSource {
     return deduplicated;
   }
 
+  // ── searchServiceDeskEmailsForPerson ──────────────────────────────
+  async searchServiceDeskEmailsForPerson(_personName: string, _maxResults = 50): Promise<LightEmail[]> {
+    // Mock DB has no ServiceDesk emails
+    return [];
+  }
+
   // ── searchEmailsByKeyword ─────────────────────────────────────────
   async searchEmailsByKeyword(keyword: string, maxResults = 50): Promise<LightEmail[]> {
     // Simple LIKE search on subject for the mock DB (no FTS)

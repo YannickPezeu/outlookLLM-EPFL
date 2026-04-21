@@ -18,13 +18,13 @@ export const config = {
   },
 
   // EPFL RCP API (OpenAI-compatible)
-  // Auto-detect: use CORS proxy on k8s (expert-finder.epfl.ch), direct URL otherwise
+  // Build-time detection: k8s uses CORS proxy, dev/ghpages use direct URL
   rcp: {
-    baseUrl: window.location.hostname === "expert-finder.epfl.ch"
-      ? "/outlook/api/rcp"
+    baseUrl: process.env.DEPLOY_TARGET === "k8s"
+      ? "https://expert-finder.epfl.ch/outlook/api/rcp"
       : "https://inference.rcp.epfl.ch/v1",
     apiKey: "", // User sets this in the UI settings, or stored in localStorage
-    defaultModel: "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
+    defaultModel: "google/gemma-4-26B-A4B-it-bfloat16",
     embeddingModel: "Qwen/Qwen3-Embedding-8B",
     rerankerModel: "BAAI/bge-reranker-v2-m3",
     filterModel: "google/gemma-4-E2B-it-bfloat16",
