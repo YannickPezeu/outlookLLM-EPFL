@@ -88,6 +88,11 @@ module.exports = async (env, argv) => {
         "Access-Control-Allow-Origin": "*",
       },
       server: serverOptions,
+      client: {
+        overlay: {
+          runtimeErrors: (error) => !/ResizeObserver loop/.test(error?.message || ""),
+        },
+      },
     },
   };
 

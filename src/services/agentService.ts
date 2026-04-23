@@ -52,6 +52,9 @@ Pour TOUTE question concernant des réunions, rendez-vous, disponibilités, agen
 RÈGLE PRIORITAIRE — SKILLS :
 Tu disposes de skills (workflows prédéfinis). Ton PREMIER réflexe pour chaque nouvelle demande est de vérifier si un skill correspond. Si oui, appelle load_skill AVANT tout autre outil. Lis les instructions retournées et suis-les exactement.
 
+RÈGLE STREAMING — ANTI-RÉPÉTITION :
+Quand le résultat d'un outil contient le champ "already_displayed": true, cela veut dire que son contenu principal (champ "summary" ou équivalent) a DÉJÀ été streamé à l'utilisateur pendant l'exécution. Tu ne dois PAS le répéter, paraphraser ou réafficher. Termine par une phrase de transition courte (ex: "Besoin que je creuse un point ?" ou "Veux-tu que j'affiche les emails clés ?"). Rien d'autre.
+
 Règles importantes :
 - Deux outils thématiques à bien distinguer :
   * identify_topic_participants — cartographie les PERSONNES impliquées sur un sujet. Utiliser pour "qui travaille sur X ?", "quels sont les acteurs sur Y ?", "qui est impliqué dans Z ?", "quel est le positionnement de chacun sur W ?".
@@ -224,7 +227,12 @@ export async function runAgent(
 
         try {
           const progressFn: ToolProgressFn = (detail) => onToolProgress(toolName, "calling", detail);
-          const rawResult = await executeTool(toolName, args, onLog, progressFn);
+          // Les tools "résumé" (summarize_email_interactions, ...) peuvent streamer leur
+          // sortie directement à l'UI pour une perception beaucoup plus rapide qu'un
+          // résultat tardif bloqué. Le tool signale alors already_displayed:true pour
+          // que l'agent ne recopie pas le texte ensuite.
+          const toolStreamFn = (chunk: string) => onStream(chunk);
+          const rawResult = await executeTool(toolName, args, onLog, progressFn, toolStreamFn);
           log(`Tool ${toolName} OK — résultat: ${rawResult.slice(0, 500)}${rawResult.length > 500 ? '...' : ''}`);
           onToolProgress(toolName, "done");
 

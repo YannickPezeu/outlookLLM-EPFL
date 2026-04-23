@@ -375,11 +375,16 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
   const conversationRef = useRef<AgentMessage[]>([]);
   const pendingEmailListRef = useRef<{ name: string; emails: EmailListItem[] } | null>(null);
   const tracesRef = useRef<ToolTrace[]>([]);
+  // Accumulates every streamed chunk of the turn (tool outputs + final agent reply)
+  // so the final persisted message contains the full text, not just runAgent.response.
+  const streamBufferRef = useRef("");
 
-  // Auto-scroll to bottom
+  // Auto-scroll only on discrete events (new user message, final assistant message).
+  // Do NOT scroll during streaming or trace updates — let the user scroll freely
+  // to read at their own pace while the response is being generated.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, liveTraces, streamingContent]);
+  }, [messages]);
 
   // Auto-focus input when tab becomes active
   useEffect(() => {
@@ -398,6 +403,7 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     tracesRef.current = [];
     setLiveTraces([]);
     setStreamingContent("");
+    streamBufferRef.current = "";
 
     const findLastTraceIdx = (toolName: string): number => {
       for (let i = tracesRef.current.length - 1; i >= 0; i--) {
@@ -448,8 +454,10 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     const onStream: StreamCallback = (chunk) => {
       if (chunk === null) {
         setStreamingContent("");
+        streamBufferRef.current = "";
       } else {
-        setStreamingContent((prev) => prev + chunk);
+        streamBufferRef.current += chunk;
+        setStreamingContent(streamBufferRef.current);
       }
     };
 
@@ -471,16 +479,20 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
       const emailList = pendingEmailListRef.current;
       pendingEmailListRef.current = null;
       const finalTraces = tracesRef.current;
+      // Use the full streamed buffer (tool output + final agent reply) as the
+      // persisted content, falling back to runAgent's response if nothing was streamed.
+      const persistedContent = streamBufferRef.current || response;
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: response,
+          content: persistedContent,
           emailList: emailList || undefined,
           traces: finalTraces.length > 0 ? finalTraces : undefined,
         },
       ]);
       setStreamingContent("");
+      streamBufferRef.current = "";
       tracesRef.current = [];
       setLiveTraces([]);
     } catch (err: any) {

@@ -11,8 +11,10 @@ import {
   getRecentSentEmails,
   getCalendarView,
   getEmailsBatch,
+  getSchedule,
   DateRange,
 } from "./graphMailService";
+import { getAccount } from "./authService";
 import { batchEmbed, rankBySimilarity } from "./embeddingService";
 import { cleanEmailBodyFull } from "./cleanEmailBody";
 import { getSkillCatalogForPrompt, getSkillIds, loadSkillContent } from "../skills/skillRegistry";
@@ -266,6 +268,61 @@ export const AGENT_TOOLS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "find_common_slots",
+      description:
+        "Trouve les créneaux horaires où tous les participants sont simultanément disponibles, " +
+        "en consultant leur free/busy via l'API Graph getSchedule. " +
+        "Ne voit PAS le détail des événements des collègues, seulement libre/occupé/tentatif/absent. " +
+        "Par défaut inclut l'utilisateur courant, cherche sur 7 jours, créneaux de 30 min en heures ouvrées (9h–18h, lun–ven). " +
+        "Usage typique : 'trouve un créneau pour une réunion avec X et Y' — fournir les adresses email des participants.",
+      parameters: {
+        type: "object",
+        properties: {
+          participants: {
+            type: "array",
+            items: { type: "string" },
+            description: "Liste des adresses email des participants (max 20).",
+          },
+          duration_minutes: {
+            type: "number",
+            description: "Durée souhaitée de la réunion en minutes (défaut: 30, multiples de 30 recommandés).",
+          },
+          start_date: {
+            type: "string",
+            description: "Début de la fenêtre de recherche (ISO 8601). Défaut: maintenant.",
+          },
+          end_date: {
+            type: "string",
+            description: "Fin de la fenêtre de recherche (ISO 8601). Défaut: 7 jours après start_date.",
+          },
+          working_hours_start: {
+            type: "number",
+            description: "Heure de début de journée de travail, 0-23 (défaut: 9).",
+          },
+          working_hours_end: {
+            type: "number",
+            description: "Heure de fin de journée de travail, 0-23 (défaut: 18).",
+          },
+          include_weekends: {
+            type: "boolean",
+            description: "Inclure samedi et dimanche (défaut: false).",
+          },
+          include_self: {
+            type: "boolean",
+            description: "Inclure l'utilisateur courant dans les participants (défaut: true).",
+          },
+          max_results: {
+            type: "number",
+            description: "Nombre maximum de créneaux candidats à retourner (défaut: 10).",
+          },
+        },
+        required: ["participants"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "identify_topic_participants",
       description:
         "CARTOGRAPHIE LES PERSONNES impliquées sur un sujet/thème dans les emails. " +
@@ -353,7 +410,13 @@ export const AGENT_TOOLS: ToolDefinition[] = [
 
 type LogFn = (msg: string) => void;
 export type ToolProgressFn = (detail: string) => void;
-type ToolExecutor = (args: Record<string, unknown>, log: LogFn, onProgress?: ToolProgressFn) => Promise<string>;
+export type ToolStreamFn = (chunk: string) => void;
+type ToolExecutor = (
+  args: Record<string, unknown>,
+  log: LogFn,
+  onProgress?: ToolProgressFn,
+  onStream?: ToolStreamFn
+) => Promise<string>;
 
 function extractDateRange(args: Record<string, unknown>): DateRange | undefined {
   const startDate = args.start_date as string | undefined;
@@ -511,23 +574,55 @@ const executors: Record<string, ToolExecutor> = {
     return JSON.stringify({ results, count: emails.length });
   },
 
-  async summarize_email_interactions(args, log) {
+  async summarize_email_interactions(args, log, _onProgress, onStream) {
     const name = args.name as string;
     const email = args.email as string;
     const dateRange = extractDateRange(args);
     const query = args.query as string | undefined;
 
-    // Default to last 6 months if no date range specified
-    const effectiveDateRange = dateRange || {
-      startDate: new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString(),
-      endDate: new Date().toISOString(),
+    // Only use a date range when the user asked for one, OR when we need a broad
+    // pool for semantic ranking (query case). Otherwise the fast $search path
+    // returns ~30 most-recent emails in one request per flow, no client-side
+    // filtering of a 1000-email pull needed.
+    const effectiveDateRange = dateRange || (query
+      ? {
+          startDate: new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString(),
+          endDate: new Date().toISOString(),
+        }
+      : undefined);
+
+    const fastPath = !effectiveDateRange;
+    log(`Collecte des emails avec ${name}${fastPath ? " (rapide, ~30 par flux)" : " (large, peut prendre 10-30s)"}...`);
+    if (email) log(`  → Recherche des emails reçus/envoyés avec ${email}...`);
+    log(`  → Recherche des tickets ServiceDesk mentionnant ${name}...`);
+
+    // Log page-level progress so the UI doesn't sit silent during the 20+
+    // paginated Graph fetches. Each callback fires as a new page of 50 arrives.
+    const directOnPage = (direction: "received" | "sent", n: number) => {
+      if (n % 200 === 0) log(`  · Emails ${direction === "received" ? "reçus" : "envoyés"} en cours : ${n} chargés...`);
+    };
+    const serviceDeskOnPage = (n: number) => {
+      if (n % 200 === 0) log(`  · ServiceDesk en cours : ${n} emails chargés (avant filtrage par nom)...`);
     };
 
-    log(`Collecte des emails avec ${name}...`);
+    // Wrap each Graph fetch so we log individual completions as they come in.
+    const directPromise = email
+      ? getAllInteractions(email, undefined, effectiveDateRange, directOnPage).then((r) => {
+          log(`  ✓ Emails directs récupérés : ${r.received.length} reçus + ${r.sent.length} envoyés`);
+          return r;
+        })
+      : Promise.resolve({ received: [] as Awaited<ReturnType<typeof getAllInteractions>>["received"], sent: [] as Awaited<ReturnType<typeof getAllInteractions>>["sent"] });
+
+    const serviceDeskPromise = getServiceDeskEmailsForPerson(name, undefined, effectiveDateRange, serviceDeskOnPage).then(
+      (sd) => {
+        log(`  ✓ Tickets ServiceDesk récupérés : ${sd.length}`);
+        return sd;
+      }
+    );
 
     const [{ received, sent }, serviceDeskEmails] = await Promise.all([
-      email ? getAllInteractions(email, undefined, effectiveDateRange) : Promise.resolve({ received: [], sent: [] }),
-      getServiceDeskEmailsForPerson(name, undefined, effectiveDateRange),
+      directPromise,
+      serviceDeskPromise,
     ]);
 
     // Merge all emails
@@ -551,17 +646,64 @@ const executors: Record<string, ToolExecutor> = {
 
     log(`${allEmails.length} emails collectés (${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk)`);
 
-    let emailsToSummarize = allEmails;
+    // Dédup par conversation : on garde le plus récent de chaque thread
+    // (avant embeddings / relecture body / prompt LLM pour réduire le volume)
+    const sortedAll = [...allEmails].sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    );
+    const seenConv = new Set<string>();
+    const deduped = sortedAll.filter((e) => {
+      if (!e.conversationId) return true;
+      if (seenConv.has(e.conversationId)) return false;
+      seenConv.add(e.conversationId);
+      return true;
+    });
+    if (deduped.length < allEmails.length) {
+      log(`Dédup par conversation : ${allEmails.length} → ${deduped.length} emails (un par thread)`);
+    }
 
-    // Semantic filtering if query is provided
+    let emailsToSummarize = deduped;
+    // Selection depends on intent:
+    //   - query → semantic ranking, cap 25
+    //   - explicit date range (no query) → temporal sampling across the period,
+    //     cap 50 so each month gets a fair share
+    //   - nothing → most recent, cap 25
+    const CAP_RECENT = 25;
+    const CAP_PERIOD = 50;
+
     if (query && emailsToSummarize.length > 0) {
       log(`Filtrage sémantique: "${query}"...`);
       const texts = emailsToSummarize.map((e) => `${e.subject} ${e.body.replace(/<[^>]+>/g, " ").slice(0, 2000)}`);
       const [queryEmb, ...itemEmbs] = await batchEmbed([query, ...texts]);
       const ranked = rankBySimilarity(queryEmb, itemEmbs);
-      const topN = Math.min(50, emailsToSummarize.length);
+      const topN = Math.min(CAP_RECENT, emailsToSummarize.length);
       emailsToSummarize = ranked.slice(0, topN).map((r) => emailsToSummarize[r.index]);
       log(`Top ${topN} emails par pertinence sélectionnés`);
+    } else if (dateRange && emailsToSummarize.length > CAP_PERIOD) {
+      // Temporal sampling: bin by month over the user's date range, keep top
+      // (CAP_PERIOD / bins) most recent per bin → balanced coverage of the period.
+      const start = new Date(dateRange.startDate || deduped[deduped.length - 1].date).getTime();
+      const end = new Date(dateRange.endDate || deduped[0].date).getTime();
+      const months = Math.max(1, Math.min(12, Math.round((end - start) / (30 * 24 * 60 * 60 * 1000))));
+      const binSize = (end - start) / months;
+      const perBin = Math.ceil(CAP_PERIOD / months);
+      const bins: typeof deduped[] = Array.from({ length: months }, () => []);
+      for (const e of deduped) {
+        const t = new Date(e.date).getTime();
+        const idx = Math.min(months - 1, Math.max(0, Math.floor((t - start) / binSize)));
+        bins[idx].push(e);
+      }
+      const sampled: typeof deduped = [];
+      for (const bin of bins) {
+        bin.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        sampled.push(...bin.slice(0, perBin));
+      }
+      sampled.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+      emailsToSummarize = sampled.slice(0, CAP_PERIOD);
+      log(`Échantillonnage temporel : ${deduped.length} → ${emailsToSummarize.length} emails (${months} tranches, ~${perBin}/tranche)`);
+    } else if (emailsToSummarize.length > CAP_RECENT) {
+      emailsToSummarize = emailsToSummarize.slice(0, CAP_RECENT);
+      log(`Cap appliqué : ${deduped.length} emails → ${CAP_RECENT} plus récents`);
     }
 
     // Read full body for emails that only have bodyPreview
@@ -576,10 +718,10 @@ const executors: Record<string, ToolExecutor> = {
       }
     }
 
-    log(`Génération du résumé (${emailsToSummarize.length} emails)...`);
+    log(`Génération du résumé (${emailsToSummarize.length} emails, streaming=${!!onStream})...`);
 
     const summary = await summarizeInteractions(
-      name, email, emailsToSummarize, undefined, config.rcp.synthesisModel
+      name, email, emailsToSummarize, onStream, config.rcp.synthesisModel
     );
 
     return JSON.stringify({
@@ -588,6 +730,7 @@ const executors: Record<string, ToolExecutor> = {
       emails_analyzed: emailsToSummarize.length,
       emails_total: allEmails.length,
       query: query || null,
+      already_displayed: !!onStream,
       summary,
     });
   },
@@ -665,6 +808,135 @@ const executors: Record<string, ToolExecutor> = {
       participantCount: result.participants.length,
       emailsAnalyzed: result.participantBriefings.reduce((sum, b) => sum + b.emailCount, 0),
       briefing: result.finalBriefing,
+    });
+  },
+
+  async find_common_slots(args, log) {
+    const participantsArg = (args.participants as string[]) || [];
+    const durationMin = (args.duration_minutes as number) || 30;
+    const whStart = (args.working_hours_start as number) ?? 9;
+    const whEnd = (args.working_hours_end as number) ?? 18;
+    const includeWeekends = (args.include_weekends as boolean) ?? false;
+    const includeSelf = (args.include_self as boolean) ?? true;
+    const maxResults = (args.max_results as number) || 10;
+    const INTERVAL_MIN = 30;
+
+    // Build final participants list (optionally add the signed-in user)
+    const emails = [...participantsArg.map((e) => e.trim()).filter(Boolean)];
+    const selfEmail = getAccount()?.username;
+    if (includeSelf && selfEmail && !emails.some((e) => e.toLowerCase() === selfEmail.toLowerCase())) {
+      emails.unshift(selfEmail);
+    }
+    if (emails.length === 0) {
+      return JSON.stringify({ error: "Aucun participant fourni." });
+    }
+    if (emails.length > 20) {
+      return JSON.stringify({ error: `Trop de participants (${emails.length}), max 20 supportés par getSchedule.` });
+    }
+
+    // Window: default now → now+7d, aligned to 30-min boundary
+    const now = new Date();
+    const rawStart = args.start_date ? new Date(args.start_date as string) : now;
+    const startDate = rawStart.getTime() < now.getTime() ? now : rawStart;
+    const endDate = args.end_date
+      ? new Date(args.end_date as string)
+      : new Date(startDate.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    const alignedStart = new Date(startDate);
+    alignedStart.setSeconds(0, 0);
+    const mins = alignedStart.getMinutes();
+    alignedStart.setMinutes(Math.ceil(mins / INTERVAL_MIN) * INTERVAL_MIN);
+
+    if (endDate.getTime() <= alignedStart.getTime()) {
+      return JSON.stringify({ error: "Fenêtre temporelle invalide (end_date <= start_date)." });
+    }
+
+    log(`Consultation free/busy de ${emails.length} personne(s) sur ${Math.round((endDate.getTime() - alignedStart.getTime()) / 3600000)}h...`);
+
+    const schedules = await getSchedule(emails, alignedStart, endDate, INTERVAL_MIN);
+
+    const missing: string[] = [];
+    const schedById = new Map<string, string>();
+    for (const s of schedules) {
+      if (s.error || !s.availabilityView) {
+        missing.push(s.scheduleId);
+        log(`  ⚠ ${s.scheduleId}: ${s.error?.message || "pas de données free/busy"}`);
+      } else {
+        schedById.set(s.scheduleId.toLowerCase(), s.availabilityView);
+      }
+    }
+
+    const totalSlots = Math.floor((endDate.getTime() - alignedStart.getTime()) / 60000 / INTERVAL_MIN);
+    // Merge: '0' at index i only if ALL known participants are free at i.
+    // Missing participants are treated as busy to avoid false positives.
+    const merged: string[] = new Array(totalSlots).fill("0");
+    for (const email of emails) {
+      const view = schedById.get(email.toLowerCase());
+      if (!view) {
+        for (let i = 0; i < totalSlots; i++) merged[i] = "2";
+        continue;
+      }
+      for (let i = 0; i < totalSlots; i++) {
+        const c = view[i] ?? "2";
+        if (c !== "0") merged[i] = c;
+      }
+    }
+
+    const slotsNeeded = Math.max(1, Math.ceil(durationMin / INTERVAL_MIN));
+    const candidates: Array<{ start: Date; end: Date }> = [];
+    // Track one candidate per day first, then fill up to maxResults
+    const firstPerDay: Array<{ start: Date; end: Date }> = [];
+    const seenDays = new Set<string>();
+
+    let i = 0;
+    while (i < totalSlots) {
+      if (merged[i] !== "0") { i++; continue; }
+      let j = i;
+      while (j < totalSlots && merged[j] === "0") j++;
+      // Emit candidate start positions within the free run
+      for (let k = i; k + slotsNeeded <= j; k++) {
+        const slotStart = new Date(alignedStart.getTime() + k * INTERVAL_MIN * 60000);
+        const slotEnd = new Date(slotStart.getTime() + durationMin * 60000);
+        const day = slotStart.getDay();
+        if (!includeWeekends && (day === 0 || day === 6)) continue;
+        if (slotStart.getHours() < whStart) continue;
+        const endHr = slotEnd.getHours();
+        const endMin = slotEnd.getMinutes();
+        if (endHr > whEnd || (endHr === whEnd && endMin > 0)) continue;
+        // also skip slots that spill past the configured end-of-day on a different calendar day
+        if (slotEnd.getDate() !== slotStart.getDate()) continue;
+
+        const dayKey = slotStart.toISOString().slice(0, 10);
+        if (!seenDays.has(dayKey)) {
+          seenDays.add(dayKey);
+          firstPerDay.push({ start: slotStart, end: slotEnd });
+        } else {
+          candidates.push({ start: slotStart, end: slotEnd });
+        }
+      }
+      i = j;
+    }
+
+    // Combine: one-per-day first (chronological), then fill with remaining
+    const combined = [...firstPerDay, ...candidates].slice(0, maxResults);
+
+    log(`${combined.length} créneau(x) trouvé(s) (${firstPerDay.length} jours distincts)`);
+
+    return JSON.stringify({
+      participants: emails,
+      duration_minutes: durationMin,
+      window_start: alignedStart.toISOString(),
+      window_end: endDate.toISOString(),
+      working_hours: `${whStart}h–${whEnd}h`,
+      weekends_included: includeWeekends,
+      slots_found: combined.length,
+      missing_data: missing,
+      slots: combined.map((c) => ({
+        start: c.start.toISOString(),
+        end: c.end.toISOString(),
+        startLocal: c.start.toLocaleString("fr-CH", { dateStyle: "full", timeStyle: "short" }),
+        endLocal: c.end.toLocaleString("fr-CH", { timeStyle: "short" }),
+      })),
     });
   },
 
@@ -945,7 +1217,8 @@ export async function executeTool(
   toolName: string,
   args: Record<string, unknown>,
   log?: LogFn,
-  onProgress?: ToolProgressFn
+  onProgress?: ToolProgressFn,
+  onStream?: ToolStreamFn
 ): Promise<string> {
   const executor = executors[toolName];
   if (!executor) {
@@ -958,7 +1231,7 @@ export async function executeTool(
   };
 
   try {
-    return await executor(args, toolLog, onProgress);
+    return await executor(args, toolLog, onProgress, onStream);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[Agent] Tool ${toolName} error:`, message);
