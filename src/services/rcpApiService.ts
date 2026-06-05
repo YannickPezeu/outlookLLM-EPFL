@@ -65,6 +65,32 @@ function getRcpConfig() {
   };
 }
 
+// Max context window (tokens) per model family — probed on RCP (2026-06):
+// Kimi-K2.6 = 262144, gpt-oss-120b = 131072, Mistral-Small-3.2 = 131072.
+const MODEL_CONTEXT_TOKENS: Array<[RegExp, number]> = [
+  [/kimi-k2/i, 262144],
+  [/gpt-oss/i, 131072],
+  [/mistral-small|ministral|magistral|devstral/i, 131072],
+  [/gemma-4|gemma-3-27|gemma-3-1b/i, 131072],
+];
+const DEFAULT_CONTEXT_TOKENS = 131072; // conservative floor for the models we use
+
+/** Max context window (tokens) of the active (or given) model. */
+export function getModelMaxContextTokens(model?: string): number {
+  const m = model || getRcpConfig().model || "";
+  for (const [re, tok] of MODEL_CONTEXT_TOKENS) if (re.test(m)) return tok;
+  return DEFAULT_CONTEXT_TOKENS;
+}
+
+/**
+ * Character budget for stuffing content (emails, attachments) into a single
+ * prompt for the ACTIVE model, leaving room for the prompt structure + streamed
+ * output. ~2.3 chars/token keeps ≈40% headroom over the real ~4 chars/token.
+ */
+export function getContextBudgetChars(model?: string): number {
+  return Math.floor(getModelMaxContextTokens(model) * 2.3);
+}
+
 // Reasoning models served by RCP (self-hosted vLLM) emit a chain-of-thought
 // before the answer/tool call. We don't need it for tool orchestration or
 // summaries and it adds large latency (minutes on long context → timeouts), and
@@ -479,6 +505,11 @@ export async function summarizeInteractions(
     weekday: "long", year: "numeric", month: "long", day: "numeric",
   });
 
+  const customPrompt = getUserCustomPrompt();
+  const customContext = customPrompt
+    ? `\n\nContexte fourni par l'utilisateur (adapte le ton et le focus du résumé en conséquence) :\n${customPrompt}`
+    : "";
+
   const messages: ChatMessage[] = [
     {
       role: "system",
@@ -492,7 +523,8 @@ export async function summarizeInteractions(
         "4. Les points en suspens\n" +
         "5. **To-dos** : liste concrète des actions à faire suite à ces échanges " +
         "(qui doit faire quoi, avec quelle échéance si mentionnée)\n\n" +
-        "Sois concis mais complet.",
+        "Sois concis mais complet." +
+        customContext,
     },
     {
       role: "user",
@@ -631,7 +663,8 @@ export function saveRcpSettings(
   baseUrl: string,
   apiKey: string,
   model: string,
-  relevanceFilterEnabled?: boolean
+  relevanceFilterEnabled?: boolean,
+  customPrompt?: string
 ): void {
   localStorage.setItem("rcp_base_url", baseUrl);
   localStorage.setItem("rcp_api_key", apiKey);
@@ -641,6 +674,11 @@ export function saveRcpSettings(
     // rename it or existing users' disabled setting silently resets to enabled.
     localStorage.setItem("rcp_gemma_filter_enabled", relevanceFilterEnabled ? "1" : "0");
   }
+  if (typeof customPrompt === "string") {
+    const trimmed = customPrompt.trim();
+    if (trimmed) localStorage.setItem("user_custom_prompt", trimmed);
+    else localStorage.removeItem("user_custom_prompt");
+  }
 }
 
 export function loadRcpSettings(): {
@@ -648,8 +686,22 @@ export function loadRcpSettings(): {
   apiKey: string;
   model: string;
   relevanceFilterEnabled: boolean;
+  customPrompt: string;
 } {
-  return { ...getRcpConfig(), relevanceFilterEnabled: isRelevanceFilterEnabled() };
+  return {
+    ...getRcpConfig(),
+    relevanceFilterEnabled: isRelevanceFilterEnabled(),
+    customPrompt: getUserCustomPrompt(),
+  };
+}
+
+/**
+ * Free-form context the user provides in Settings (name, role, activity, recurring
+ * needs) so the assistant and the email summaries can adapt their tone and focus.
+ * Empty string when unset.
+ */
+export function getUserCustomPrompt(): string {
+  return localStorage.getItem("user_custom_prompt") || "";
 }
 
 /**

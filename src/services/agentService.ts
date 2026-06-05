@@ -5,6 +5,7 @@ import {
 import { AGENT_TOOLS, executeTool, PRESERVED_TOOLS, CORE_TOOL_NAMES, ToolProgressFn } from "./agentTools";
 import { replaceEmailIdsWithRefs, resolveEmailRef as _resolveEmailRef } from "./emailRefs";
 import { getSkillTools } from "../skills/skillRegistry";
+import { getUserCustomPrompt } from "./rcpApiService";
 
 // Re-export so existing AssistantView import path keeps working.
 export const resolveEmailRef = _resolveEmailRef;
@@ -41,6 +42,10 @@ export function buildSystemPrompt(): string {
     dateStyle: "full",
     timeStyle: "short",
   });
+  const customPrompt = getUserCustomPrompt();
+  const customSection = customPrompt
+    ? `\n\nCONTEXTE UTILISATEUR (fourni dans les réglages — qui il est, son activité, ses besoins récurrents). Tiens-en compte pour adapter le ton, le niveau de détail et le focus de tes réponses, notamment lors des résumés. Ce contexte ne remplace JAMAIS la règle anti-hallucination : il ne constitue pas une source de faits sur les emails/contacts/calendrier.\n${customPrompt}`
+    : "";
   return `Tu es un assistant intelligent intégré dans Outlook pour les collaborateurs EPFL.
 Tu aides à chercher des emails, résumer des échanges, préparer des réunions et organiser la messagerie.
 La date et l'heure actuelles sont : ${nowLocal} (fuseau ${tz}).
@@ -94,7 +99,7 @@ Règles importantes :
   * OUI, il y a un critère → get_email_interactions(name, email, query="<sujet enrichi avec synonymes>"), PUIS :
       1. Lis les sujets+previews retournés. Choisis TOI-MÊME les refs réellement pertinents (le ranking par embeddings n'est qu'un pré-tri, certains hors-sujet remontent quand même — c'est ton boulot de les écarter).
       2. display_emails(email_ids=[refs sélectionnés], context_label="<sujet>")
-  Dans les DEUX cas : après l'appel final, écris UNIQUEMENT une phrase d'introduction courte (ex: "Voici les 8 emails sur le recrutement échangés avec Martin Rajman."). Ne JAMAIS recopier la liste à la main avec [Sujet](email:ref_X) — l'UI s'en charge.`;
+  Dans les DEUX cas : après l'appel final, écris UNIQUEMENT une phrase d'introduction courte (ex: "Voici les 8 emails sur le recrutement échangés avec Martin Rajman."). Ne JAMAIS recopier la liste à la main avec [Sujet](email:ref_X) — l'UI s'en charge.${customSection}`;
 }
 
 const MAX_ITERATIONS = 20;

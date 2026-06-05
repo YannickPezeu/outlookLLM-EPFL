@@ -1,7 +1,7 @@
 import { config } from "../config";
 import type { CalendarEvent, LightEmail, EmailMessage, MailDataSource } from "./mailTypes";
 import { batchEmbed, rankBySimilarity } from "./embeddingService";
-import { chatCompletionStream, chatCompletion, ChatMessage, isRelevanceFilterEnabled } from "./rcpApiService";
+import { chatCompletionStream, chatCompletion, ChatMessage, isRelevanceFilterEnabled, getContextBudgetChars } from "./rcpApiService";
 import { cleanEmailBody } from "./cleanEmailBody";
 import { cleanEmailBodyFull } from "./cleanEmailBody";
 import { getAccount } from "./authService";
@@ -726,12 +726,10 @@ async function searchNonParticipantEmails(
 
 // ─── Phase 6: Per-Participant Summaries ─────────────────────────────
 
-// Char budget for emails loaded directly into the synthesis prompt. Meeting prep
-// now ALWAYS loads directly (no Mistral relevance filter, no per-participant
-// summaries) and truncates by embedding rank to fit this budget. Kimi K2.6 has a
-// 262144-token context; ~600k chars ≈ 150k tokens leaves ample room for the prompt
-// structure + streamed output.
-const DIRECT_LOAD_MAX_CHARS = 600_000;
+// Meeting prep ALWAYS loads emails directly into the synthesis prompt (no Mistral
+// relevance filter, no per-participant summaries) and truncates by embedding rank
+// to fit the ACTIVE model's context budget (getContextBudgetChars — per-model,
+// e.g. ~600k chars for Kimi 256k, ~300k for 128k models).
 
 /**
  * Format one email as a text block for synthesis prompts: header line + full
@@ -1210,9 +1208,10 @@ export async function prepareMeeting(
   // filter was slow. We skip them entirely: keep the top emails by EMBEDDING rank
   // (already relevance-ordered, instant) that fit the budget, and load them raw
   // into the final-briefing prompt.
+  const directLoadMaxChars = getContextBudgetChars(); // per active model
   const totalRanked = rankedEmails.length;
   const nonPartChars = nonParticipantEmails.reduce((s, r) => s + formatEmailBlock(r).length, 0);
-  const emailBudget = Math.max(0, DIRECT_LOAD_MAX_CHARS - nonPartChars);
+  const emailBudget = Math.max(0, directLoadMaxChars - nonPartChars);
   let accChars = 0;
   const fitted: RankedEmail[] = [];
   for (const r of rankedEmails) {
@@ -1225,7 +1224,7 @@ export async function prepareMeeting(
   const truncated = fitted.length < totalRanked;
   console.log(
     `[MeetingPrep] Chargement direct: ${fitted.length}/${totalRanked} emails (${accChars.toLocaleString()} chars) ` +
-    `+ ${nonParticipantEmails.length} hors-participants — budget ${DIRECT_LOAD_MAX_CHARS.toLocaleString()} chars`
+    `+ ${nonParticipantEmails.length} hors-participants — budget ${directLoadMaxChars.toLocaleString()} chars`
   );
 
   onProgress({

@@ -1,4 +1,4 @@
-import { ToolDefinition, summarizeInteractions, chatCompletion, ChatMessage } from "./rcpApiService";
+import { ToolDefinition, summarizeInteractions, chatCompletion, ChatMessage, getContextBudgetChars } from "./rcpApiService";
 import { config } from "../config";
 import {
   searchContactsByName,
@@ -1019,8 +1019,8 @@ const executors: Record<string, ToolExecutor> = {
     if (email.hasAttachments) {
       log("Lecture des pièces jointes...");
       const raw = await getMessageAttachments(restId);
-      // Generous per-attachment budget: a single open email fits Kimi's 256k ctx.
-      attachments = await extractTextFromAttachments(raw as any, 500000);
+      // Per-attachment budget scaled to the ACTIVE model's context window.
+      attachments = await extractTextFromAttachments(raw as any, getContextBudgetChars());
       log(`  ✓ ${attachments.length} pièce(s) jointe(s) exploitable(s)`);
     }
 

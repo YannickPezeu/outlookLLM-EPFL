@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Button,
   Input,
@@ -6,12 +6,10 @@ import {
   Label,
   makeStyles,
   tokens,
-  MessageBar,
-  MessageBarBody,
   Badge,
-  Combobox,
-  Option,
   Switch,
+  Textarea,
+  InfoLabel,
 } from "@fluentui/react-components";
 import { Settings24Regular, Checkmark24Regular } from "@fluentui/react-icons";
 import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
@@ -36,7 +34,28 @@ const useStyles = makeStyles({
   field: { display: "flex", flexDirection: "column", gap: "4px" },
   row: { display: "flex", gap: "8px", alignItems: "center" },
   statusRow: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" },
+  savedIcon: {
+    color: tokens.colorPaletteGreenForeground1,
+    verticalAlign: "middle",
+    fontSize: "16px",
+  },
+  // Native <select>: the Fluent Combobox renders its listbox in a portal that gets
+  // mispositioned/clipped inside the narrow Office taskpane iframe (the dropdown never
+  // appears). A native select is rendered by the host and always works there.
+  select: {
+    width: "100%",
+    height: "32px",
+    padding: "0 8px",
+    borderRadius: tokens.borderRadiusMedium,
+    border: `1px solid ${tokens.colorNeutralStroke1}`,
+    backgroundColor: tokens.colorNeutralBackground1,
+    color: tokens.colorNeutralForeground1,
+    fontFamily: tokens.fontFamilyBase,
+    fontSize: tokens.fontSizeBase300,
+  },
 });
+
+const CUSTOM_MODEL_VALUE = "__custom__";
 
 export const SettingsView: React.FC = () => {
   const styles = useStyles();
@@ -44,8 +63,15 @@ export const SettingsView: React.FC = () => {
   const [rcpKey, setRcpKey] = useState("");
   const [rcpModel, setRcpModel] = useState("");
   const [relevanceFilterEnabled, setRelevanceFilterEnabled] = useState(true);
+  const [customPrompt, setCustomPrompt] = useState("");
+  // True when the user picked "Autre…" to type a model not in the preset list.
+  const [customModelMode, setCustomModelMode] = useState(false);
   const [graphToken, setGraphToken] = useState("");
   const [saved, setSaved] = useState(false);
+  // Don't persist during the initial load (when state is populated from storage),
+  // otherwise the auto-save effect would fire and re-write the same values.
+  const loadedRef = useRef(false);
+  const savedTimer = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => {
     const settings = loadRcpSettings();
@@ -53,19 +79,24 @@ export const SettingsView: React.FC = () => {
     setRcpKey(settings.apiKey);
     setRcpModel(settings.model);
     setRelevanceFilterEnabled(settings.relevanceFilterEnabled);
+    setCustomPrompt(settings.customPrompt);
     setGraphToken(localStorage.getItem("graph_dev_token") || "");
+    loadedRef.current = true;
   }, []);
 
-  const handleSave = () => {
-    saveRcpSettings(rcpUrl, rcpKey, rcpModel, relevanceFilterEnabled);
+  // Auto-save on every change once the initial values are loaded.
+  useEffect(() => {
+    if (!loadedRef.current) return;
+    saveRcpSettings(rcpUrl, rcpKey, rcpModel, relevanceFilterEnabled, customPrompt);
     if (graphToken.trim()) {
       localStorage.setItem("graph_dev_token", graphToken.trim());
     } else {
       localStorage.removeItem("graph_dev_token");
     }
     setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
-  };
+    clearTimeout(savedTimer.current);
+    savedTimer.current = setTimeout(() => setSaved(false), 1500);
+  }, [rcpUrl, rcpKey, rcpModel, relevanceFilterEnabled, customPrompt, graphToken]);
 
   const account = getAccount();
 
@@ -153,6 +184,41 @@ export const SettingsView: React.FC = () => {
         </div>
       </div>
 
+      {/* Personnalisation — prompt utilisateur */}
+      <div className={styles.section}>
+        <Text weight="semibold" size={200}>
+          Personnalisation
+        </Text>
+        <div className={styles.field}>
+          <InfoLabel
+            htmlFor="custom-prompt"
+            size="small"
+            info={
+              <>
+                Indiquez votre nom, votre fonction et vos besoins récurrents, notamment
+                pour le résumé d'emails. Devez-vous expliquer des projets complexes à un
+                membre du personnel administratif ? à un chercheur ? Précisez-le pour que
+                l'IA adapte le ton et le niveau de détail de ses réponses à vos besoins.
+              </>
+            }
+          >
+            Contexte personnel (optionnel)
+          </InfoLabel>
+          <Textarea
+            id="custom-prompt"
+            resize="vertical"
+            placeholder="Ex : Je suis Jean Dupont, adjoint de direction. Je résume souvent les échanges pour les transmettre à des chercheurs ; privilégie un ton clair et synthétique, et mets en avant les actions à entreprendre."
+            value={customPrompt}
+            onChange={(_, data) => setCustomPrompt(data.value)}
+            rows={4}
+          />
+          <Text size={100}>
+            Ce contexte est ajouté aux instructions de l'assistant et des résumés.
+            Il reste stocké localement sur votre poste.
+          </Text>
+        </div>
+      </div>
+
       {/* RCP API settings */}
       <div className={styles.section}>
         <Text weight="semibold" size={200}>
@@ -188,20 +254,35 @@ export const SettingsView: React.FC = () => {
           <Label htmlFor="rcp-model" size="small">
             Modèle
           </Label>
-          <Combobox
+          <select
             id="rcp-model"
-            freeform
-            placeholder="Choisir ou saisir un modèle"
-            value={rcpModel}
-            onOptionSelect={(_, data) => setRcpModel(data.optionValue ?? data.optionText ?? "")}
-            onChange={(e) => setRcpModel((e.target as HTMLInputElement).value)}
+            className={styles.select}
+            value={customModelMode || (rcpModel && !AVAILABLE_MODELS.includes(rcpModel)) ? CUSTOM_MODEL_VALUE : rcpModel}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v === CUSTOM_MODEL_VALUE) {
+                setCustomModelMode(true);
+              } else {
+                setCustomModelMode(false);
+                setRcpModel(v);
+              }
+            }}
           >
             {AVAILABLE_MODELS.map((model) => (
-              <Option key={model} value={model}>
+              <option key={model} value={model}>
                 {model}
-              </Option>
+              </option>
             ))}
-          </Combobox>
+            <option value={CUSTOM_MODEL_VALUE}>Autre (personnalisé)…</option>
+          </select>
+          {(customModelMode || (rcpModel && !AVAILABLE_MODELS.includes(rcpModel))) && (
+            <Input
+              aria-label="Modèle personnalisé"
+              placeholder="Saisir un identifiant de modèle"
+              value={rcpModel}
+              onChange={(_, data) => setRcpModel(data.value)}
+            />
+          )}
         </div>
 
         <div className={styles.field}>
@@ -217,19 +298,15 @@ export const SettingsView: React.FC = () => {
         </div>
 
         <div className={styles.row}>
-          <Button
-            appearance="primary"
-            icon={<Checkmark24Regular />}
-            onClick={handleSave}
-            size="small"
-          >
-            Sauvegarder
-          </Button>
-          {saved && (
-            <MessageBar intent="success">
-              <MessageBarBody>Configuration sauvegardée !</MessageBarBody>
-            </MessageBar>
-          )}
+          <Text size={100} aria-live="polite">
+            {saved ? (
+              <>
+                <Checkmark24Regular className={styles.savedIcon} /> Enregistré automatiquement
+              </>
+            ) : (
+              "Les modifications sont enregistrées automatiquement."
+            )}
+          </Text>
         </div>
       </div>
     </div>
