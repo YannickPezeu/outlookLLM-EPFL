@@ -65,6 +65,12 @@ const useStyles = makeStyles({
 
 type TabType = "assistant" | "meeting" | "settings";
 
+// Ctrl + wheel zoom configuration
+const ZOOM_STORAGE_KEY = "epfl-mail-ai-zoom";
+const ZOOM_MIN = 0.6;
+const ZOOM_MAX = 2.5;
+const ZOOM_STEP = 0.0015; // zoom change per wheel-delta unit
+
 const isInDialog = (): boolean => {
   try {
     return new URLSearchParams(window.location.search).has("popout");
@@ -114,8 +120,44 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [zoom, setZoom] = useState<number>(() => {
+    const saved = parseFloat(localStorage.getItem(ZOOM_STORAGE_KEY) || "");
+    return Number.isFinite(saved) && saved >= ZOOM_MIN && saved <= ZOOM_MAX ? saved : 1;
+  });
   const dialogRef = useRef<Office.Dialog | null>(null);
   const { setItem } = useOutlookItem();
+
+  // Ctrl + mouse wheel zoom — the Office webview doesn't zoom on its own.
+  // Applies a browser-like zoom to the whole task pane; Ctrl+0 resets.
+  useEffect(() => {
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      setZoom((z) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z - e.deltaY * ZOOM_STEP)));
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === "0") {
+        e.preventDefault();
+        setZoom(1);
+      }
+    };
+    window.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
+
+  // Apply the zoom to the page and persist it across remounts.
+  useEffect(() => {
+    (document.body.style as unknown as { zoom: string }).zoom = String(zoom);
+    try {
+      localStorage.setItem(ZOOM_STORAGE_KEY, String(zoom));
+    } catch {
+      // localStorage unavailable — zoom stays in memory only
+    }
+  }, [zoom]);
 
   // Open pop-out dialog
   const openPopout = async () => {

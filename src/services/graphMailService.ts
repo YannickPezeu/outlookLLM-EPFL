@@ -1,6 +1,7 @@
 import { getGraphToken } from "./authService";
 import { config } from "../config";
 import { distance as levenshtein } from "fastest-levenshtein";
+import type { ParticipantCollectStats } from "./mailTypes";
 
 const GRAPH = config.graph.baseUrl;
 
@@ -33,15 +34,6 @@ export interface GraphAttachment {
   "@odata.type"?: string;
 }
 
-export interface MailFolder {
-  id: string;
-  displayName: string;
-  parentFolderId?: string;
-  childFolderCount: number;
-  totalItemCount: number;
-  unreadItemCount: number;
-}
-
 export interface LightEmail {
   id: string;
   subject: string;
@@ -50,6 +42,7 @@ export interface LightEmail {
   toRecipients?: Array<{ emailAddress: { name: string; address: string } }>;
   receivedDateTime: string;
   conversationId: string;
+  hasAttachments?: boolean;
 }
 
 export interface CalendarEvent {
@@ -93,8 +86,22 @@ function buildDateFilter(dateRange?: DateRange, field = "receivedDateTime"): str
 }
 
 /**
- * Client-side date-range filter. Used when the Graph query filters on something
- * else (e.g. $search by sender) and we narrow by date ourselves.
+ * KQL date-range clause appended to a $search query so the search is bounded by
+ * date SERVER-SIDE (e.g. " AND received:2025-01-01..2025-12-31"). Without it,
+ * $search returns the ~1000 most-recent matches across all time, so older date
+ * ranges get truncated. Graph's mail $search supports the `received`/`sent`
+ * searchable properties with the `..` range operator.
+ */
+function kqlDateClause(dateRange: DateRange | undefined, prop: "received" | "sent"): string {
+  if (dateRange?.startDate && dateRange?.endDate) {
+    return ` AND ${prop}:${dateRange.startDate.slice(0, 10)}..${dateRange.endDate.slice(0, 10)}`;
+  }
+  return "";
+}
+
+/**
+ * Client-side date-range filter. Used when the Graph query narrows by something
+ * else (e.g. $search by sender) and we restrict the date ourselves.
  */
 function filterByDate<T>(items: T[], dateField: keyof T, dateRange: DateRange): T[] {
   const start = dateRange.startDate ? new Date(dateRange.startDate).getTime() : -Infinity;
@@ -128,7 +135,11 @@ async function recoverToken(): Promise<string> {
   return tokenRecoveryPromise;
 }
 
-async function graphFetch<T>(url: string, options?: RequestInit): Promise<T> {
+async function graphFetch<T>(
+  url: string,
+  options?: RequestInit,
+  throttleRetriesLeft = 3
+): Promise<T> {
   console.log(`[Graph] ${options?.method || "GET"} ${url}`);
   const token = await getGraphToken();
   const response = await fetch(url, {
@@ -139,6 +150,21 @@ async function graphFetch<T>(url: string, options?: RequestInit): Promise<T> {
       ...options?.headers,
     },
   });
+
+  // 429 Too Many Requests — honor Retry-After header (in seconds), else exp backoff.
+  // Microsoft Graph throttles per-mailbox concurrency (default ~4 per app per user).
+  if (response.status === 429 && throttleRetriesLeft > 0) {
+    const retryAfter = response.headers.get("Retry-After");
+    const parsed = retryAfter ? parseInt(retryAfter, 10) : NaN;
+    const delayMs = !Number.isNaN(parsed) && parsed > 0
+      ? Math.min(parsed * 1000, 10000)
+      : Math.min(500 * Math.pow(2, 3 - throttleRetriesLeft), 8000);
+    console.warn(
+      `[Graph] 429 throttled on ${url.split("?")[0]}, retry in ${delayMs}ms (${throttleRetriesLeft} left)`
+    );
+    await new Promise((r) => setTimeout(r, delayMs));
+    return graphFetch<T>(url, options, throttleRetriesLeft - 1);
+  }
 
   if (response.status === 401) {
     const freshToken = await recoverToken();
@@ -201,21 +227,22 @@ export async function searchEmailsFromSender(
   dateRange?: DateRange,
   onPage?: (itemsSoFar: number) => void
 ): Promise<EmailMessage[]> {
-  const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead";
+  const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead,hasAttachments";
 
-  // Use $search to filter by sender server-side (always bounded to this
-  // correspondent's emails, case-insensitive), then post-filter by date
-  // client-side if requested. Far lighter than fetching all date-ranged emails
-  // and client-filtering sender.
-  const url = `${GRAPH}/me/messages?$search="from:${senderEmail}"&$select=${select}&$top=50`;
-  // Over-fetch a bit so the date post-filter still leaves room to reach maxResults.
-  const fetchCap = dateRange ? Math.max(maxResults * 3, 100) : maxResults;
+  // Narrow to this sender with $search (reliable for from/to via the search
+  // index — unlike $filter on from/emailAddress/address, which under-returns).
+  // The date range is pushed into the KQL query (received:start..end) so the
+  // search is bounded server-side; otherwise $search returns only the ~1000
+  // most-recent matches and older ranges get truncated. The client filterByDate
+  // below is a safety net.
+  const search = `from:${senderEmail}${kqlDateClause(dateRange, "received")}`;
+  const url = `${GRAPH}/me/messages?$search="${encodeURIComponent(search)}"&$select=${select}&$top=50`;
+  const fetchCap = dateRange ? Math.max(maxResults * 20, 600) : maxResults;
   const results = await fetchAllPages<EmailMessage>(url, fetchCap, undefined, onPage);
 
-  if (dateRange) {
-    return filterByDate(results, "receivedDateTime", dateRange).slice(0, maxResults);
-  }
-  return results.slice(0, maxResults);
+  const dated = dateRange ? filterByDate(results, "receivedDateTime", dateRange) : results;
+  dated.sort((a, b) => new Date(b.receivedDateTime).getTime() - new Date(a.receivedDateTime).getTime());
+  return dated.slice(0, maxResults);
 }
 
 /**
@@ -227,18 +254,19 @@ export async function searchEmailsSentTo(
   dateRange?: DateRange,
   onPage?: (itemsSoFar: number) => void
 ): Promise<EmailMessage[]> {
-  const select = "id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId";
+  const select = "id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId,hasAttachments";
 
-  // Same pattern as searchEmailsFromSender: $search narrows to this recipient
-  // server-side, date is post-filtered client-side.
-  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${recipientEmail}"&$select=${select}&$top=50`;
-  const fetchCap = dateRange ? Math.max(maxResults * 3, 100) : maxResults;
+  // Same reliable approach as searchEmailsFromSender: $search narrows to this
+  // recipient (search index), date pushed into the KQL query (sent:start..end)
+  // so the search is bounded server-side.
+  const search = `to:${recipientEmail}${kqlDateClause(dateRange, "sent")}`;
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$search="${encodeURIComponent(search)}"&$select=${select}&$top=50`;
+  const fetchCap = dateRange ? Math.max(maxResults * 20, 600) : maxResults;
   const results = await fetchAllPages<EmailMessage>(url, fetchCap, undefined, onPage);
 
-  if (dateRange) {
-    return filterByDate(results, "sentDateTime", dateRange).slice(0, maxResults);
-  }
-  return results.slice(0, maxResults);
+  const dated = dateRange ? filterByDate(results, "sentDateTime", dateRange) : results;
+  dated.sort((a, b) => new Date(b.sentDateTime || b.receivedDateTime).getTime() - new Date(a.sentDateTime || a.receivedDateTime).getTime());
+  return dated.slice(0, maxResults);
 }
 
 /**
@@ -256,49 +284,6 @@ export async function getAllInteractions(
   ]);
 
   return { received, sent };
-}
-
-// ─── Folder Management ───────────────────────────────────────────────
-
-/**
- * List all top-level mail folders.
- */
-export async function listFolders(): Promise<MailFolder[]> {
-  const url = `${GRAPH}/me/mailFolders?$top=100`;
-  return fetchAllPages<MailFolder>(url, 100);
-}
-
-/**
- * List child folders of a given folder.
- */
-export async function listChildFolders(parentFolderId: string): Promise<MailFolder[]> {
-  const url = `${GRAPH}/me/mailFolders/${parentFolderId}/childFolders?$top=100`;
-  return fetchAllPages<MailFolder>(url, 100);
-}
-
-/**
- * Create a new mail folder.
- */
-export async function createFolder(displayName: string, parentFolderId?: string): Promise<MailFolder> {
-  const url = parentFolderId
-    ? `${GRAPH}/me/mailFolders/${parentFolderId}/childFolders`
-    : `${GRAPH}/me/mailFolders`;
-
-  return graphFetch<MailFolder>(url, {
-    method: "POST",
-    body: JSON.stringify({ displayName }),
-  });
-}
-
-/**
- * Move a message to a different folder.
- */
-export async function moveMessage(messageId: string, destinationFolderId: string): Promise<EmailMessage> {
-  const url = `${GRAPH}/me/messages/${messageId}/move`;
-  return graphFetch<EmailMessage>(url, {
-    method: "POST",
-    body: JSON.stringify({ destinationId: destinationFolderId }),
-  });
 }
 
 /**
@@ -412,10 +397,16 @@ export async function searchEmailsSentToLight(
 /**
  * Collect all light emails exchanged with a participant, deduplicated by conversationId.
  * Keeps only the most recent email per conversation thread.
+ *
+ * Optional onStats callback exposes the raw-vs-deduped numbers — useful so
+ * callers can surface "we fetched 350 emails across all your threads with this
+ * person and collapsed them into 80 thread-leaders" instead of just showing
+ * the deduped count.
  */
 export async function collectEmailsWithParticipant(
   email: string,
-  maxPerDirection = config.defaults.maxEmailsPerParticipant
+  maxPerDirection = config.defaults.maxEmailsPerParticipant,
+  onStats?: (stats: ParticipantCollectStats) => void
 ): Promise<LightEmail[]> {
   const received = await searchEmailsFromSenderLight(email, maxPerDirection);
   const sent = await searchEmailsSentToLight(email, maxPerDirection);
@@ -432,26 +423,66 @@ export async function collectEmailsWithParticipant(
     }
   }
 
+  const deduped = byConversation.size;
+  console.log(
+    `[Graph] collectEmails ${email}: ${received.length} reçus + ${sent.length} envoyés ` +
+      `= ${received.length + sent.length} bruts → ${deduped} après dedup conversation`
+  );
+  onStats?.({ rawReceived: received.length, rawSent: sent.length, deduped });
   return Array.from(byConversation.values());
 }
 
 /**
  * Get multiple emails by ID with full body (for the final reading phase).
- * Parallelized with concurrency limit.
+ *
+ * Uses a per-id worker pool with concurrency capped at the Microsoft Graph
+ * MailboxConcurrency limit (~4 per app per user). $batch was tried but
+ * triggered massive 429s because sub-requests within a batch hit the mailbox
+ * in parallel internally — a 20-sub-request batch alone busts the limit.
+ *
+ * Each individual GET goes through graphFetch which handles 429 with
+ * Retry-After backoff, so transient throttling is recovered automatically.
+ * Truly failed emails are logged and dropped (not present in the result).
  */
 export async function getEmailsBatch(
   messageIds: string[],
-  concurrency = 2
+  concurrency = 4
 ): Promise<EmailMessage[]> {
-  const results: EmailMessage[] = [];
+  if (messageIds.length === 0) return [];
 
-  for (let i = 0; i < messageIds.length; i += concurrency) {
-    const batch = messageIds.slice(i, i + concurrency);
-    const batchResults = await Promise.all(batch.map((id) => getEmail(id)));
-    results.push(...batchResults);
+  const results: Array<EmailMessage | undefined> = new Array(messageIds.length);
+  let nextIdx = 0;
+  let failed = 0;
+  const failureSamples: string[] = [];
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const myIdx = nextIdx++;
+      if (myIdx >= messageIds.length) return;
+      try {
+        results[myIdx] = await getEmail(messageIds[myIdx]);
+      } catch (err) {
+        failed++;
+        if (failureSamples.length < 3) {
+          const msg = err instanceof Error ? err.message : String(err);
+          failureSamples.push(`#${myIdx} → ${msg.slice(0, 120)}`);
+        }
+      }
+    }
   }
 
-  return results;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, messageIds.length) }, () => worker())
+  );
+
+  if (failed > 0) {
+    console.warn(
+      `[getEmailsBatch] ${failed}/${messageIds.length} emails échoués après retries. ` +
+        `Échantillon : ${failureSamples.join(" | ")}`
+    );
+  }
+
+  return results.filter((e): e is EmailMessage => e !== undefined);
 }
 
 // ─── Keyword Search (for non-participant emails) ────────────────────
@@ -683,21 +714,146 @@ async function getContactCache(): Promise<CachedContact[]> {
   return contactCache;
 }
 
+// ─── Directory (Microsoft Graph /users) ─────────────────────────────
+
+interface GraphUser {
+  displayName?: string;
+  givenName?: string;
+  surname?: string;
+  mail?: string;
+  userPrincipalName?: string;
+  jobTitle?: string;
+  department?: string;
+}
+
+// Set to true after the first failure attributable to missing
+// User.ReadBasic.All admin consent. We then skip /users for the rest of
+// the session — preserves the legacy behavior until Pascal grants consent.
+let directorySearchUnavailable = false;
+
+function looksLikeConsentError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /consent_required|AADSTS65001|insufficient privileges|forbidden|403/i.test(msg);
+}
+
 /**
- * Search for contacts by name.
- * Strategy 1: Graph $search on from/to fields (fast, exact/close matches).
- * Strategy 2: Local cache + Levenshtein fuzzy matching (handles typos, missing accents).
- * Strategy 3: ServiceDesk emails (for contacts who only appear in ServiceNow tickets).
- * All strategies run, results are merged and tagged with their source.
+ * Search the EPFL directory via Microsoft Graph /users.
+ * Requires the User.ReadBasic.All scope (admin-consented).
+ * Returns [] if the scope isn't granted yet (degrades to legacy mail-history search).
  */
-export async function searchContactsByName(
+export async function searchUsersInDirectory(
   query: string
-): Promise<Array<{ name: string; email: string; source?: string }>> {
-  console.log(`[searchContacts] Searching for "${query}"`);
+): Promise<Array<{ name: string; email: string; source: "directory"; jobTitle?: string; department?: string; score: number }>> {
+  if (directorySearchUnavailable) return [];
+  const trimmed = query.trim();
+  if (!trimmed) return [];
 
-  const results: Array<{ name: string; email: string; source: string; score: number }> = [];
+  // $search wants a quoted value per field. We OR over displayName/givenName/surname/mail.
+  // The whole quoted string is URL-encoded so spaces and accents pass through.
+  const q = trimmed.replace(/"/g, ""); // drop quotes to avoid breaking the $search syntax
+  const clauses = [
+    `"displayName:${q}"`,
+    `"givenName:${q}"`,
+    `"surname:${q}"`,
+    `"mail:${q}"`,
+  ].join(" OR ");
+  const select = "displayName,givenName,surname,mail,userPrincipalName,jobTitle,department";
+  const url =
+    `${GRAPH}/users` +
+    `?$search=${encodeURIComponent(clauses)}` +
+    `&$select=${select}` +
+    `&$top=25&$count=true`;
 
-  // --- Strategy 1: Graph $search on from/to ---
+  try {
+    const resp = await graphFetch<GraphPagedResponse<GraphUser>>(url, {
+      headers: { ConsistencyLevel: "eventual" },
+    });
+
+    const out: Array<{ name: string; email: string; source: "directory"; jobTitle?: string; department?: string; score: number }> = [];
+    for (const u of resp.value) {
+      const email = u.mail || u.userPrincipalName;
+      if (!email) continue; // skip shared mailboxes / accounts with no addressable identity
+      const name = u.displayName || [u.givenName, u.surname].filter(Boolean).join(" ") || email;
+
+      // Filter false positives with the same fuzzy score we apply to mail-history hits.
+      // Graph's $search ranking is opaque, so on common names it can return unrelated entries.
+      const fScore = fuzzyScore(trimmed, { name, email, count: 1 });
+      if (fScore <= 0) {
+        console.log(`[searchUsersInDirectory] Filtered (low fuzzy): ${name} <${email}>`);
+        continue;
+      }
+
+      out.push({
+        name,
+        email,
+        source: "directory",
+        jobTitle: u.jobTitle,
+        department: u.department,
+        score: fScore + 8, // small tie-breaker (a verified directory person beats
+                           // mail-history noise at equal name match) — kept well
+                           // below the correspondence bonus (+25..+35), so people
+                           // you actually email still rank first.
+      });
+    }
+
+    console.log(`[searchUsersInDirectory] "${trimmed}" → ${out.length} directory hits`);
+    return out;
+  } catch (err) {
+    if (looksLikeConsentError(err)) {
+      console.warn(`[searchUsersInDirectory] Scope not granted (User.ReadBasic.All), disabling directory search for this session`);
+      directorySearchUnavailable = true;
+      return [];
+    }
+    console.warn(`[searchUsersInDirectory] failed:`, (err as Error).message);
+    return [];
+  }
+}
+
+export interface UserProfile {
+  displayName?: string;
+  jobTitle?: string;
+  department?: string;
+  officeLocation?: string;
+  mail?: string;
+}
+
+/**
+ * Fetch a single user's directory profile by email (or UPN).
+ * Used to enrich meeting participants with title/department/location.
+ *
+ * Returns null on any failure: consent missing (sets the session-wide
+ * `directorySearchUnavailable` flag like searchUsersInDirectory), 404 for
+ * external addresses not in the tenant, or transient errors. Callers should
+ * treat null as "no extra info available, skip the enrichment".
+ */
+export async function getUserByEmail(email: string): Promise<UserProfile | null> {
+  if (directorySearchUnavailable) return null;
+  const select = "displayName,jobTitle,department,officeLocation,mail";
+  const url = `${GRAPH}/users/${encodeURIComponent(email)}?$select=${select}`;
+  try {
+    return await graphFetch<UserProfile>(url);
+  } catch (err) {
+    if (looksLikeConsentError(err)) {
+      console.warn(`[getUserByEmail] Scope not granted (User.ReadBasic.All), disabling directory lookups for this session`);
+      directorySearchUnavailable = true;
+      return null;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    // 404 for external (non-EPFL) addresses is normal — log at debug level only
+    if (/404|Resource.*not found|Request_ResourceNotFound/i.test(msg)) {
+      return null;
+    }
+    console.warn(`[getUserByEmail] ${email} failed:`, msg);
+    return null;
+  }
+}
+
+// ─── Mail-history strategies (legacy fallback path) ────────────────────
+
+interface ScoredContact { name: string; email: string; source: string; score: number; jobTitle?: string; department?: string; count?: number }
+
+/** Strategy: Graph $search on /me/messages from + sentitems to. */
+async function searchContactsViaMailHistory(query: string): Promise<ScoredContact[]> {
   const encodedQuery = encodeURIComponent(query);
   const receivedUrl = `${GRAPH}/me/messages?$search="from:${encodedQuery}"&$select=from&$top=30`;
   const sentUrl = `${GRAPH}/me/mailFolders/sentitems/messages?$search="to:${encodedQuery}"&$select=toRecipients&$top=30`;
@@ -713,72 +869,114 @@ export async function searchContactsByName(
     }),
   ]);
 
-  const graphSeen = new Map<string, { name: string; email: string; count: number }>();
-
+  const seen = new Map<string, { name: string; email: string; count: number }>();
   for (const msg of received.value) {
     if (msg.from?.emailAddress?.address) {
       const addr = msg.from.emailAddress.address.toLowerCase();
-      const existing = graphSeen.get(addr);
-      if (existing) existing.count++;
-      else graphSeen.set(addr, { name: msg.from.emailAddress.name, email: msg.from.emailAddress.address, count: 1 });
+      const e = seen.get(addr);
+      if (e) e.count++;
+      else seen.set(addr, { name: msg.from.emailAddress.name, email: msg.from.emailAddress.address, count: 1 });
     }
   }
   for (const msg of sent.value) {
     for (const r of msg.toRecipients || []) {
       if (r.emailAddress?.address) {
         const addr = r.emailAddress.address.toLowerCase();
-        const existing = graphSeen.get(addr);
-        if (existing) existing.count++;
-        else graphSeen.set(addr, { name: r.emailAddress.name, email: r.emailAddress.address, count: 1 });
+        const e = seen.get(addr);
+        if (e) e.count++;
+        else seen.set(addr, { name: r.emailAddress.name, email: r.emailAddress.address, count: 1 });
       }
     }
   }
 
-  for (const contact of graphSeen.values()) {
-    // Score Graph results with fuzzy to filter out false positives
-    const fScore = fuzzyScore(query, { name: contact.name, email: contact.email, count: contact.count });
-    if (fScore > 0) {
-      results.push({ name: contact.name, email: contact.email, source: "email", score: fScore });
+  const out: ScoredContact[] = [];
+  for (const c of seen.values()) {
+    const fScore = fuzzyScore(query, { name: c.name, email: c.email, count: c.count });
+    if (fScore > 0) out.push({ name: c.name, email: c.email, source: "email", score: fScore, count: c.count });
+  }
+  return out;
+}
+
+/**
+ * Search for contacts by name.
+ * Primary: EPFL directory via Graph /users (requires User.ReadBasic.All).
+ * Fallbacks (always run, dedup-merged with directory hits):
+ *   - Graph $search on /me/messages from/to fields (catches external contacts in mail history)
+ *   - ServiceDesk extraction (contacts who only appear in ServiceNow ticket bodies)
+ * If the directory returns 0 hits AND mail-history returns 0 hits, also runs a
+ * local Levenshtein search over the cached recent-contacts list (slow, last resort).
+ */
+export async function searchContactsByName(
+  query: string
+): Promise<Array<{ name: string; email: string; source?: string; jobTitle?: string; department?: string }>> {
+  console.log(`[searchContacts] Searching for "${query}"`);
+
+  // Run directory + mail-history in parallel — both are network calls, mail-history
+  // is cheap to keep running even on a directory hit (covers external contacts).
+  const [directoryHits, mailHits] = await Promise.all([
+    searchUsersInDirectory(query),
+    searchContactsViaMailHistory(query),
+  ]);
+
+  console.log(`[searchContacts] directory=${directoryHits.length} mail-history=${mailHits.length}`);
+
+  // Merge directory + mail-history by email. Having actually corresponded with
+  // someone is a strong relevance signal for "my contacts" intents, so a
+  // mail-history hit adds a bonus (scaled by interaction count) — otherwise a
+  // person you email daily gets buried under directory namesakes (the +20
+  // directory boost). A contact present in BOTH sources is the strongest match:
+  // keep the directory metadata (job/department) AND add the correspondence bonus.
+  const byEmail = new Map<string, ScoredContact>();
+  for (const c of directoryHits) byEmail.set(c.email.toLowerCase(), { ...c });
+  for (const c of mailHits) {
+    const k = c.email.toLowerCase();
+    const historyBonus = 25 + Math.min(c.count ?? 1, 10);
+    const existing = byEmail.get(k);
+    if (existing) {
+      existing.score = Math.max(existing.score, c.score) + historyBonus;
+      existing.source = "directory+email";
     } else {
-      console.log(`[searchContacts] Graph result filtered out (low fuzzy score): ${contact.name} <${contact.email}>`);
+      byEmail.set(k, { ...c, score: c.score + historyBonus });
     }
   }
 
-  console.log(`[searchContacts] Strategy 1 (Graph $search): ${results.length} contacts after fuzzy filter`);
-
-  // --- Strategy 2: Fuzzy search on local contact cache ---
-  const cache = await getContactCache();
-  const scored = cache
-    .map((contact) => ({ contact, score: fuzzyScore(query, contact) }))
-    .filter((x) => x.score > 30) // Higher threshold to avoid noise
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 5);
-
-  for (const { contact, score } of scored) {
-    // Don't add if already found via Graph
-    if (!results.some((r) => r.email.toLowerCase() === contact.email.toLowerCase())) {
-      results.push({ name: contact.name, email: contact.email, source: "email", score });
-    }
-  }
-
-  console.log(`[searchContacts] Strategy 2 (fuzzy cache): ${scored.length} additional matches`);
-
-  // --- Strategy 3: ServiceDesk emails ---
+  // ServiceDesk: name-only entries (no email), so they don't dedup with the others
   try {
     const sdContacts = await searchContactsInServiceDesk(query);
     for (const sd of sdContacts) {
-      // ServiceDesk contacts don't have an email, tag them as servicedesk
-      results.push({ name: sd.name, email: "", source: "servicedesk", score: 70 + sd.ticketCount });
+      // Use a synthetic key so multiple no-email entries don't collide
+      byEmail.set(`__sd__${sd.name.toLowerCase()}`, {
+        name: sd.name,
+        email: "",
+        source: "servicedesk",
+        score: 70 + sd.ticketCount,
+      });
     }
-    console.log(`[searchContacts] Strategy 3 (ServiceDesk): ${sdContacts.length} contacts`);
+    console.log(`[searchContacts] ServiceDesk: ${sdContacts.length} contacts`);
   } catch (err) {
     console.warn(`[searchContacts] ServiceDesk search failed:`, (err as Error).message);
   }
 
-  // Sort by score desc, deduplicate, return top 10
-  results.sort((a, b) => b.score - a.score);
-  const final = results.slice(0, 10).map(({ name, email, source }) => ({ name, email, source }));
+  // If still nothing, fall back to the slow local-cache Levenshtein scan.
+  if (byEmail.size === 0) {
+    console.log(`[searchContacts] No directory/mail-history/ServiceDesk hits — trying local cache fuzzy`);
+    const cache = await getContactCache();
+    const scored = cache
+      .map((c) => ({ contact: c, score: fuzzyScore(query, c) }))
+      .filter((x) => x.score > 30)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+    for (const { contact, score } of scored) {
+      byEmail.set(contact.email.toLowerCase(), { name: contact.name, email: contact.email, source: "email", score });
+    }
+  }
 
+  const merged = Array.from(byEmail.values()).sort((a, b) => b.score - a.score).slice(0, 25);
+  const final = merged.map(({ name, email, source, jobTitle, department }) => ({
+    name, email, source,
+    ...(jobTitle ? { jobTitle } : {}),
+    ...(department ? { department } : {}),
+  }));
   console.log(`[searchContacts] Final results:`, final);
   return final;
 }
@@ -791,7 +989,7 @@ export async function searchEmails(
   maxResults = 20,
   dateRange?: DateRange
 ): Promise<LightEmail[]> {
-  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId,hasAttachments";
 
   if (dateRange) {
     // Can't combine $search + $filter on messages, so $filter date + post-filter text client-side
@@ -942,20 +1140,23 @@ export async function getServiceDeskEmailsForPerson(
   dateRange?: DateRange,
   onPage?: (itemsSoFar: number) => void
 ): Promise<EmailMessage[]> {
-  // Split name into words and search each independently (no quotes)
+  // Split name into words and match each independently (no quotes)
   // so "Pablo Tanner" matches "Pablo Sidney Tanner" or "Tanner, Pablo"
   const nameWords = personName.trim().split(/\s+/);
-  const searchTerms = nameWords.map((w) => encodeURIComponent(w)).join(" ");
-  let url: string;
+  const select = "id,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isRead";
 
-  // Always use $search — narrows to ServiceDesk sender + name mentions server-side.
-  // Post-filter by date client-side if requested.
-  url = `${GRAPH}/me/messages?$search="from:${SERVICEDESK_EMAIL} ${searchTerms}"&$select=id,subject,body,bodyPreview,from,receivedDateTime,parentFolderId,isRead&$top=50`;
+  // $search narrows to the ServiceDesk sender + name mentions server-side. The date
+  // range is pushed into the KQL query (received:start..end) so the search is bounded
+  // server-side — without it, $search returns only the ~1000 most-recent matches and
+  // older years get truncated. The whole KQL string is encoded once.
+  const search = `from:${SERVICEDESK_EMAIL} ${nameWords.join(" ")}${kqlDateClause(dateRange, "received")}`;
+  const url = `${GRAPH}/me/messages?$search="${encodeURIComponent(search)}"&$select=${select}&$top=50`;
 
   console.log(`[serviceDeskEmails] Fetching ServiceDesk emails mentioning "${personName}" (words: ${nameWords.join(", ")})`);
 
   try {
-    const fetchCap = dateRange ? Math.max(maxResults * 3, 100) : maxResults;
+    // Deep fetch for date ranges so the client date filter reaches old tickets.
+    const fetchCap = dateRange ? Math.max(maxResults * 20, 600) : maxResults;
     let allMessages = await fetchAllPages<EmailMessage>(url, fetchCap, undefined, onPage);
 
     if (dateRange) {
@@ -963,12 +1164,11 @@ export async function getServiceDeskEmailsForPerson(
     }
 
     // Post-filter: verify the person's name actually appears in the body
-    // (Graph $search without quotes can return loose matches)
+    // ($search without quotes can return loose matches).
     const filtered = allMessages.filter((msg) => {
       const bodyText = msg.body?.content
         ? stripHtml(msg.body.content).toLowerCase()
         : (msg.bodyPreview || "").toLowerCase();
-      // Check that all name words appear somewhere in the body
       return nameWords.every((w) => bodyText.includes(w.toLowerCase()));
     });
 

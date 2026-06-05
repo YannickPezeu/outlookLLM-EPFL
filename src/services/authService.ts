@@ -160,9 +160,21 @@ export async function signOut(): Promise<void> {
 
 /**
  * Check if the user is currently authenticated.
+ * Returns true for MSAL accounts, dev tokens, or relayed popout tokens.
  */
 export function isAuthenticated(): boolean {
-  return getAccount() !== null;
+  if (getAccount() !== null) return true;
+  if (localStorage.getItem("graph_dev_token")) return true;
+  const popoutToken = localStorage.getItem("graph_popout_token");
+  if (popoutToken) {
+    try {
+      const payload = JSON.parse(atob(popoutToken.split(".")[1]));
+      if (payload.exp * 1000 > Date.now() + 60_000) return true;
+    } catch {
+      // ignore malformed token
+    }
+  }
+  return false;
 }
 
 /**

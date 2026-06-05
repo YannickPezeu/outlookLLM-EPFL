@@ -48,6 +48,7 @@
 
   <Rule xsi:type="RuleCollection" Mode="Or">
     <Rule xsi:type="ItemIs" ItemType="Message" FormType="Read" />
+    <Rule xsi:type="ItemIs" ItemType="Message" FormType="Edit" />
     <Rule xsi:type="ItemIs" ItemType="Appointment" FormType="Read" />
   </Rule>
 
@@ -81,7 +82,30 @@
                   </Icon>
                   <Action xsi:type="ShowTaskpane">
                     <SourceLocation resid="TaskPane.Url" />
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
 
+          <!-- Extension point: button in the compose/reply pane -->
+          <ExtensionPoint xsi:type="MessageComposeCommandSurface">
+            <OfficeTab id="TabDefault">
+              <Group id="epflMailAiComposeGroup">
+                <Label resid="GroupLabel" />
+                <Control xsi:type="Button" id="openTaskPaneComposeBtn">
+                  <Label resid="TaskPaneBtn.Label" />
+                  <Supertip>
+                    <Title resid="TaskPaneBtn.Label" />
+                    <Description resid="TaskPaneBtn.Tooltip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon.16x16" />
+                    <bt:Image size="32" resid="Icon.32x32" />
+                    <bt:Image size="80" resid="Icon.80x80" />
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <SourceLocation resid="TaskPane.Url" />
                   </Action>
                 </Control>
               </Group>
@@ -158,5 +182,128 @@
         <bt:String id="TaskPaneBtn.Tooltip" DefaultValue="Ouvrir l'assistant IA pour préparer vos réunions et résumer vos emails" />
       </bt:LongStrings>
     </Resources>
+
+    <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides/1.1" xsi:type="VersionOverridesV1_1">
+      <Requirements>
+        <bt:Sets DefaultMinVersion="1.5">
+          <bt:Set Name="Mailbox" />
+        </bt:Sets>
+      </Requirements>
+      <Hosts>
+        <Host xsi:type="MailHost">
+          <DesktopFormFactor>
+            <ExtensionPoint xsi:type="MessageReadCommandSurface">
+              <OfficeTab id="TabDefault">
+                <Group id="epflMailAiGroupV11">
+                  <Label resid="GroupLabel" />
+                  <Control xsi:type="Button" id="openTaskPaneBtnV11">
+                    <Label resid="TaskPaneBtn.Label" />
+                    <Supertip>
+                      <Title resid="TaskPaneBtn.Label" />
+                      <Description resid="TaskPaneBtn.Tooltip" />
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="Icon.16x16" />
+                      <bt:Image size="32" resid="Icon.32x32" />
+                      <bt:Image size="80" resid="Icon.80x80" />
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <SourceLocation resid="TaskPane.Url" />
+                      <SupportsPinning>true</SupportsPinning>
+                    </Action>
+                  </Control>
+                </Group>
+              </OfficeTab>
+            </ExtensionPoint>
+            <ExtensionPoint xsi:type="MessageComposeCommandSurface">
+              <OfficeTab id="TabDefault">
+                <Group id="epflMailAiComposeGroupV11">
+                  <Label resid="GroupLabel" />
+                  <Control xsi:type="Button" id="openTaskPaneComposeBtnV11">
+                    <Label resid="TaskPaneBtn.Label" />
+                    <Supertip>
+                      <Title resid="TaskPaneBtn.Label" />
+                      <Description resid="TaskPaneBtn.Tooltip" />
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="Icon.16x16" />
+                      <bt:Image size="32" resid="Icon.32x32" />
+                      <bt:Image size="80" resid="Icon.80x80" />
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <SourceLocation resid="TaskPane.Url" />
+                      <SupportsPinning>true</SupportsPinning>
+                    </Action>
+                  </Control>
+                </Group>
+              </OfficeTab>
+            </ExtensionPoint>
+            <ExtensionPoint xsi:type="AppointmentAttendeeCommandSurface">
+              <OfficeTab id="TabDefault">
+                <Group id="epflMailAiAttendeeGroupV11">
+                  <Label resid="GroupLabel" />
+                  <Control xsi:type="Button" id="openTaskPaneAttendeeBtnV11">
+                    <Label resid="TaskPaneBtn.Label" />
+                    <Supertip>
+                      <Title resid="TaskPaneBtn.Label" />
+                      <Description resid="TaskPaneBtn.Tooltip" />
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="Icon.16x16" />
+                      <bt:Image size="32" resid="Icon.32x32" />
+                      <bt:Image size="80" resid="Icon.80x80" />
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <SourceLocation resid="TaskPane.Url" />
+                      <SupportsPinning>true</SupportsPinning>
+                    </Action>
+                  </Control>
+                </Group>
+              </OfficeTab>
+            </ExtensionPoint>
+            <ExtensionPoint xsi:type="AppointmentOrganizerCommandSurface">
+              <OfficeTab id="TabDefault">
+                <Group id="epflMailAiOrganizerGroupV11">
+                  <Label resid="GroupLabel" />
+                  <Control xsi:type="Button" id="openTaskPaneOrganizerBtnV11">
+                    <Label resid="TaskPaneBtn.Label" />
+                    <Supertip>
+                      <Title resid="TaskPaneBtn.Label" />
+                      <Description resid="TaskPaneBtn.Tooltip" />
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="Icon.16x16" />
+                      <bt:Image size="32" resid="Icon.32x32" />
+                      <bt:Image size="80" resid="Icon.80x80" />
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <SourceLocation resid="TaskPane.Url" />
+                      <SupportsPinning>true</SupportsPinning>
+                    </Action>
+                  </Control>
+                </Group>
+              </OfficeTab>
+            </ExtensionPoint>
+          </DesktopFormFactor>
+        </Host>
+      </Hosts>
+      <Resources>
+        <bt:Images>
+          <bt:Image id="Icon.16x16" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-16.png" />
+          <bt:Image id="Icon.32x32" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-32.png" />
+          <bt:Image id="Icon.80x80" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-80.png" />
+        </bt:Images>
+        <bt:Urls>
+          <bt:Url id="TaskPane.Url" DefaultValue="https://expert-finder.epfl.ch/outlook/taskpane.html" />
+        </bt:Urls>
+        <bt:ShortStrings>
+          <bt:String id="GroupLabel" DefaultValue="EPFL Mail AI" />
+          <bt:String id="TaskPaneBtn.Label" DefaultValue="EPFL Mail AI" />
+        </bt:ShortStrings>
+        <bt:LongStrings>
+          <bt:String id="TaskPaneBtn.Tooltip" DefaultValue="Ouvrir l'assistant IA pour préparer vos réunions et résumer vos emails" />
+        </bt:LongStrings>
+      </Resources>
+    </VersionOverrides>
   </VersionOverrides>
 </OfficeApp>

@@ -14,7 +14,7 @@ export const config = {
   // Microsoft Graph
   graph: {
     baseUrl: "https://graph.microsoft.com/v1.0",
-    scopes: ["User.Read", "Mail.Read", "Calendars.Read"],
+    scopes: ["User.Read", "User.ReadBasic.All", "Mail.Read", "Calendars.Read"],
   },
 
   // EPFL RCP API (OpenAI-compatible)
@@ -24,11 +24,10 @@ export const config = {
       ? "https://expert-finder.epfl.ch/outlook/api/rcp"
       : "https://inference.rcp.epfl.ch/v1",
     apiKey: "", // User sets this in the UI settings, or stored in localStorage
-    defaultModel: "google/gemma-4-26B-A4B-it-bfloat16",
+    defaultModel: "moonshotai/Kimi-K2.6",
     embeddingModel: "Qwen/Qwen3-Embedding-8B",
     rerankerModel: "BAAI/bge-reranker-v2-m3",
-    filterModel: "google/gemma-4-E2B-it-bfloat16",
-    synthesisModel: "google/gemma-4-26B-A4B-it-bfloat16",
+    filterModel: "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
     completionsEndpoint: "/chat/completions",
     embeddingsEndpoint: "/embeddings",
     rerankEndpoint: "/rerank",
@@ -39,7 +38,8 @@ export const config = {
     maxEmailsToFetch: 50,
     maxEmailsForSummary: 30,
     maxEmailsPerParticipant: 200,
-    embeddingTopK: 200,
+    embeddingTopK: 400,
+    embeddingMinPerParticipant: 30,
     filterThreshold: 6,
     filterBatchSize: 30,
     recentMonths: 6,

@@ -39,6 +39,7 @@ Toutes les permissions sont **deleguees** (Delegated) et **en lecture seule**. L
 | Permission | Type | Raison | Admin consent requis par defaut ? |
 |---|---|---|---|
 | `User.Read` | Delegated | Lire le profil de l'utilisateur connecte (nom, email). Necessaire au fonctionnement de MSAL. | Non |
+| `User.ReadBasic.All` | Delegated | Rechercher n'importe quel collaborateur EPFL par nom dans l'annuaire (champs basic uniquement : nom, email, fonction, departement). Necessaire pour retrouver un contact par nom meme sans historique d'emails avec lui. | **Oui** |
 | `Mail.Read` | Delegated | Rechercher et lire les emails dans la boite de l'utilisateur. Necessaire pour retrouver les echanges avec les participants d'une reunion et les emails lies au sujet. | Non |
 | `Calendars.Read` | Delegated | Lire les evenements du calendrier de l'utilisateur. Necessaire pour extraire les participants, le sujet et les details d'une reunion a preparer. | Non |
 
@@ -54,11 +55,13 @@ Toutes les permissions sont **deleguees** (Delegated) et **en lecture seule**. L
 
 ## 4. Admin Consent
 
-Si le tenant EPFL a une politique qui bloque le consentement utilisateur (parametre "User consent settings" dans Entra ID > Enterprise Applications), nous demandons un **admin consent tenant-wide** pour les 3 permissions ci-dessus.
+`User.ReadBasic.All` necessite **obligatoirement un admin consent tenant-wide**, contrairement aux 3 autres permissions qui passent en user-consent par defaut. Sans admin consent sur ce scope, l'add-in continue de fonctionner mais la recherche de contact est limitee a l'historique d'emails de l'utilisateur (le code detecte le refus et bascule en mode degrade pour la session).
 
-Sans admin consent, chaque utilisateur verra un message "Admin approval required" et ne pourra pas utiliser l'add-in.
+Pour les autres permissions : si le tenant EPFL a une politique qui bloque le consentement utilisateur (parametre "User consent settings" dans Entra ID > Enterprise Applications), nous demandons un **admin consent tenant-wide** pour celles-ci aussi. Sinon chaque utilisateur verra un message "Admin approval required" et ne pourra pas utiliser l'add-in.
 
-**Ou verifier :** Entra ID > Enterprise Applications > Consent and permissions > User consent settings
+**Action attendue cote admin :** Entra ID > App registrations > EPFL Mail AI > API permissions > "Grant admin consent for EPFL".
+
+**Ou verifier le parametre tenant :** Entra ID > Enterprise Applications > Consent and permissions > User consent settings
 
 ---
 

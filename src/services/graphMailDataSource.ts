@@ -3,7 +3,7 @@
  * Simply delegates to the existing graphMailService functions.
  */
 
-import type { MailDataSource } from "./mailDataSource";
+import type { MailDataSource, ParticipantCollectStats } from "./mailDataSource";
 import {
   CalendarEvent,
   EmailMessage,
@@ -22,8 +22,11 @@ export class GraphMailDataSource implements MailDataSource {
     return getCalendarEvent(eventId);
   }
 
-  collectEmailsWithParticipant(participantEmail: string): Promise<LightEmail[]> {
-    return collectEmailsWithParticipant(participantEmail);
+  collectEmailsWithParticipant(
+    participantEmail: string,
+    onStats?: (stats: ParticipantCollectStats) => void
+  ): Promise<LightEmail[]> {
+    return collectEmailsWithParticipant(participantEmail, undefined, onStats);
   }
 
   searchEmailsByKeyword(keyword: string, maxResults?: number): Promise<LightEmail[]> {

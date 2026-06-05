@@ -2,7 +2,12 @@ import {
   AgentMessage,
   chatCompletionWithToolsStream,
 } from "./rcpApiService";
-import { AGENT_TOOLS, executeTool, PRESERVED_TOOLS, ToolProgressFn } from "./agentTools";
+import { AGENT_TOOLS, executeTool, PRESERVED_TOOLS, CORE_TOOL_NAMES, ToolProgressFn } from "./agentTools";
+import { replaceEmailIdsWithRefs, resolveEmailRef as _resolveEmailRef } from "./emailRefs";
+import { getSkillTools } from "../skills/skillRegistry";
+
+// Re-export so existing AssistantView import path keeps working.
+export const resolveEmailRef = _resolveEmailRef;
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -53,16 +58,20 @@ RÈGLE PRIORITAIRE — SKILLS :
 Tu disposes de skills (workflows prédéfinis). Ton PREMIER réflexe pour chaque nouvelle demande est de vérifier si un skill correspond. Si oui, appelle load_skill AVANT tout autre outil. Lis les instructions retournées et suis-les exactement.
 
 RÈGLE STREAMING — ANTI-RÉPÉTITION :
-Quand le résultat d'un outil contient le champ "already_displayed": true, cela veut dire que son contenu principal (champ "summary" ou équivalent) a DÉJÀ été streamé à l'utilisateur pendant l'exécution. Tu ne dois PAS le répéter, paraphraser ou réafficher. Termine par une phrase de transition courte (ex: "Besoin que je creuse un point ?" ou "Veux-tu que j'affiche les emails clés ?"). Rien d'autre.
+Quand le résultat d'un outil contient le champ "already_displayed": true, cela veut dire que son contenu principal (champ "summary", "briefing" ou équivalent) a DÉJÀ été streamé à l'utilisateur pendant l'exécution. Tu ne dois PAS le répéter, paraphraser ou réafficher. Termine par une phrase de transition courte (ex: "Besoin que je creuse un point ?" ou "Veux-tu que j'affiche les emails clés ?"). Rien d'autre.
 
 Règles importantes :
+- Distinguer "afficher" et "résumer" les emails d'un contact :
+  * get_email_interactions — récupère/affiche les emails échangés avec un contact. SANS query, la liste cliquable complète s'affiche automatiquement dans l'UI (pas de synthèse). AVEC query, tu reçois les emails triés par pertinence pour les filtrer toi-même puis appeler display_emails. Utiliser pour "montre/affiche/liste/donne-moi/quels sont les emails échangés avec X", "voir mes emails avec Y".
+  * summarize_email_interactions — GÉNÈRE UN RÉSUMÉ / SYNTHÈSE des échanges. Utiliser uniquement si l'utilisateur demande explicitement un résumé, une synthèse, un bilan, un point ("résume mes échanges avec X", "fais-moi un point sur mes emails avec Y").
+  En cas de doute entre les deux, préférer get_email_interactions (afficher est l'action neutre par défaut).
 - Deux outils thématiques à bien distinguer :
   * identify_topic_participants — cartographie les PERSONNES impliquées sur un sujet. Utiliser pour "qui travaille sur X ?", "quels sont les acteurs sur Y ?", "qui est impliqué dans Z ?", "quel est le positionnement de chacun sur W ?".
   * summarize_topic_status — POINT D'AVANCEMENT chronologique d'un projet/dossier en cours. Utiliser pour "où on en est de X ?", "état d'avancement de Y ?", "fais-moi un point sur Z", "résume l'avancée du dossier W".
   Ne demande PAS de précisions — lance directement l'outil adapté. IMPORTANT : le paramètre topic sert au classement sémantique (embeddings). Un mot seul est trop vague. Développe en description riche avec synonymes et termes associés (ex: "intelligence artificielle, IA, machine learning, LLM, modèles de langage, deep learning, ChatGPT, Copilot" au lieu de juste "IA").
-- Quand l'utilisateur mentionne un contact par nom (ex: "Dupont", "Martin"), utilise TOUJOURS l'outil search_contacts d'abord pour trouver l'adresse email exacte avant d'appeler d'autres outils.
+- Quand l'utilisateur mentionne un contact par nom (ex: "Dupont", "Martin"), utilise TOUJOURS l'outil search_contacts d'abord pour trouver l'adresse email exacte avant d'appeler d'autres outils. search_contacts couvre l'annuaire EPFL complet (n'importe quel collaborateur, même sans historique d'échange) ainsi que les emails de l'utilisateur (utile pour les contacts externes).
 - Si search_contacts retourne un seul résultat, utilise-le directement sans demander confirmation.
-- Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Ne demande confirmation que si tu hésites vraiment entre deux contacts plausibles.
+- Si search_contacts retourne plusieurs résultats, choisis celui dont le nom correspond le mieux à la requête de l'utilisateur (même avec des fautes d'orthographe). Si plusieurs personnes EPFL portent le même nom, utilise les champs jobTitle/department quand ils sont fournis pour désambiguïser. Ne demande confirmation que si tu hésites vraiment.
 - Si search_contacts ne retourne aucun résultat pertinent, utilise search_contacts_in_servicedesk pour chercher dans les tickets ServiceNow (certains échanges passent par le ServiceDesk et le vrai nom de la personne n'apparaît que dans le corps du mail).
 - Si aucun outil ne trouve le contact, dis-le à l'utilisateur et suggère de reformuler.
 - Quand l'utilisateur mentionne une période temporelle, convertis-la en paramètres start_date et end_date au format ISO 8601. Fais très attention à l'année mentionnée — ne remplace JAMAIS une année explicite par l'année courante. Exemples :
@@ -76,52 +85,60 @@ Règles importantes :
 - Réponds dans la langue utilisée par l'utilisateur.
 - Sois concis et structuré dans tes réponses.
 - Utilise le format Markdown pour structurer tes réponses.
-- LIENS EMAILS CLIQUABLES : Quand tu listes des emails et que tu disposes de leur ID, utilise le format [Sujet — Date](email:ID) pour créer des liens cliquables. L'utilisateur pourra cliquer pour ouvrir l'email directement dans Outlook. Utilise ce format systématiquement pour chaque email que tu mentionnes.`;
+- EMAIL OUVERT : pour RÉSUMER / analyser l'email actuellement ouvert (corps + pièces jointes), charge le skill email_courant. Si l'utilisateur veut répondre, tu peux proposer un texte de réponse DANS LE CHAT (il le copiera/collera) — l'add-in ne rédige pas dans le brouillon Outlook.
+- PIÈCES JOINTES : Tu PEUX lire le contenu texte des pièces jointes (PDF, Word/DOCX, TXT, CSV, HTML) via l'outil read_email_attachments(email_id=<ref>). Les résultats d'emails marquent has_attachments:true quand un email a des pièces jointes, et summarize_email_interactions retourne attachments_available (refs des emails avec PJ). Ne lis une pièce jointe QUE lorsqu'elle est jugée importante pour la demande (un seul email par appel, jamais en masse ni « au cas où » — cela sature le contexte). Tu n'as PAS accès à SharePoint/OneDrive, aux images, ni aux fichiers non joints à un email.
+- LIENS EMAILS CLIQUABLES : Quand tu listes des emails et que tu disposes de leur ID, utilise le format [Sujet — Date](email:ID) pour créer des liens cliquables. L'utilisateur pourra cliquer pour ouvrir l'email directement dans Outlook. Utilise ce format systématiquement pour chaque email que tu mentionnes.
+- AFFICHAGE DE LISTES D'EMAILS — DÉCISION AVANT D'APPELER L'OUTIL :
+  Pose-toi la question : « la demande contient-elle un critère de filtrage de contenu ? » (ex: "concernant X", "sur le sujet Y", "à propos de Z", "qui parlent de W", "liés à V", "le recrutement", "l'IA", "le budget", "les importants").
+  * NON, juste un contact (et éventuellement une période) → get_email_interactions(name, email, [start_date], [end_date]) SANS query. La liste cliquable complète s'affiche automatiquement.
+  * OUI, il y a un critère → get_email_interactions(name, email, query="<sujet enrichi avec synonymes>"), PUIS :
+      1. Lis les sujets+previews retournés. Choisis TOI-MÊME les refs réellement pertinents (le ranking par embeddings n'est qu'un pré-tri, certains hors-sujet remontent quand même — c'est ton boulot de les écarter).
+      2. display_emails(email_ids=[refs sélectionnés], context_label="<sujet>")
+  Dans les DEUX cas : après l'appel final, écris UNIQUEMENT une phrase d'introduction courte (ex: "Voici les 8 emails sur le recrutement échangés avec Martin Rajman."). Ne JAMAIS recopier la liste à la main avec [Sujet](email:ref_X) — l'UI s'en charge.`;
 }
 
-const MAX_ITERATIONS = 8;
+const MAX_ITERATIONS = 20;
 
-// ─── Email ID reference mapping ────────────────────────────────────
-// Tool results contain very long Graph API email IDs (100+ chars).
-// We replace them with short refs (ref_0, ref_1...) so the LLM can
-// reliably include them in markdown links like [Subject](email:ref_0).
-// The UI resolves refs back to real IDs at click time.
+/**
+ * Detect when the assistant presents availability slots (a free/busy listing), so
+ * we can verify it actually called find_common_slots instead of inventing them.
+ * Requires an availability keyword AND at least 2 time-of-day patterns (a table).
+ */
+function presentsSlots(text: string): boolean {
+  const hasAvailabilityWord = /(cr[ée]neau|disponib|libre|occup[ée])/i.test(text);
+  const timeCount = (text.match(/\b\d{1,2}\s*[h:]\s*\d{2}\b/g) || []).length;
+  return hasAvailabilityWord && timeCount >= 2;
+}
 
-let emailRefCounter = 0;
-const emailRefMap = new Map<string, string>(); // ref → real ID
-
-function replaceEmailIdsWithRefs(jsonStr: string): string {
+/**
+ * Hand off any tool result of shape `{type: "email_list", emails: [...]}`
+ * to the UI callback, then return a compact marker for the LLM. The LLM
+ * only needs to know the list was shown — it shouldn't re-emit markdown.
+ * Used by get_email_interactions (no-query full list) and display_emails (LLM-filtered subset).
+ */
+function handleEmailListResult(
+  rawResult: string,
+  onEmailList?: EmailListCallback
+): string {
   try {
-    const data = JSON.parse(jsonStr);
-    const items = data.results || data.emails || data.email_list;
-    if (Array.isArray(items)) {
-      for (const item of items) {
-        if (item.id && typeof item.id === "string" && item.id.length > 20) {
-          const ref = `ref_${emailRefCounter++}`;
-          emailRefMap.set(ref, item.id);
-          item.id = ref;
-        }
-      }
+    const parsed = JSON.parse(rawResult);
+    if (
+      parsed.type === "email_list" &&
+      Array.isArray(parsed.emails) &&
+      onEmailList
+    ) {
+      onEmailList(parsed.name ?? "", parsed.emails);
+      return JSON.stringify({
+        already_displayed: true,
+        type: "email_list",
+        name: parsed.name ?? null,
+        count: parsed.count ?? parsed.emails.length,
+      });
     }
-    // Also handle get_email_interactions format
-    if (Array.isArray(data.emails)) {
-      for (const item of data.emails) {
-        if (item.id && typeof item.id === "string" && item.id.length > 20) {
-          const ref = `ref_${emailRefCounter++}`;
-          emailRefMap.set(ref, item.id);
-          item.id = ref;
-        }
-      }
-    }
-    return JSON.stringify(data);
   } catch {
-    return jsonStr;
+    // Fall through and return raw result; the LLM will see the full payload.
   }
-}
-
-/** Resolve a short ref (ref_0) to the real Graph API email ID. */
-export function resolveEmailRef(ref: string): string | undefined {
-  return emailRefMap.get(ref);
+  return replaceEmailIdsWithRefs(rawResult);
 }
 
 // ─── Agent Loop ─────────────────────────────────────────────────────
@@ -136,7 +153,8 @@ export async function runAgent(
   onToolProgress: ToolProgressCallback,
   onStream: StreamCallback,
   onLog?: LogCallback,
-  onEmailList?: EmailListCallback
+  onEmailList?: EmailListCallback,
+  signal?: AbortSignal
 ): Promise<{ response: string; updatedHistory: AgentMessage[] }> {
   const log = (msg: string) => {
     console.log(`[Agent] ${msg}`);
@@ -150,17 +168,46 @@ export async function runAgent(
   ];
 
   let iterations = 0;
+  let calledFindSlots = false; // find_common_slots was invoked this turn
+  let forcedSlotRetry = false;
+
+  // Progressive tool disclosure: start with the core tools only; loading a skill
+  // unlocks its tools. Re-derive already-loaded skills from prior turns
+  // (load_skill is preserved in history) so their tools stay available.
+  const activeToolNames = new Set<string>(CORE_TOOL_NAMES);
+  const loadedSkills = new Set<string>();
+  for (const msg of conversationHistory) {
+    if (msg.role === "assistant" && msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        if (tc.function.name === "load_skill") {
+          try {
+            const sid = JSON.parse(tc.function.arguments).skill_id as string;
+            if (sid) {
+              loadedSkills.add(sid);
+              getSkillTools(sid).forEach((t) => activeToolNames.add(t));
+            }
+          } catch {
+            /* ignore malformed args */
+          }
+        }
+      }
+    }
+  }
 
   while (iterations < MAX_ITERATIONS) {
+    if (signal?.aborted) throw new DOMException("Aborted by user", "AbortError");
     iterations++;
-    log(`Iteration ${iterations} — appel LLM avec ${AGENT_TOOLS.length} outils`);
+    const activeTools = AGENT_TOOLS.filter((t) => activeToolNames.has(t.function.name));
+    log(`Iteration ${iterations} — appel LLM avec ${activeTools.length} outils (skills: ${[...loadedSkills].join(", ") || "aucun"})`);
 
     // Call LLM with streaming — content tokens are streamed in real-time,
     // tool_calls are accumulated from SSE deltas
     const streamResult = await chatCompletionWithToolsStream(
       messages,
-      AGENT_TOOLS,
-      onStream // Stream content tokens directly to UI
+      activeTools,
+      onStream, // Stream content tokens directly to UI
+      undefined,
+      signal
     );
 
     const assistantMessage = streamResult.message;
@@ -212,6 +259,7 @@ export async function runAgent(
       });
 
       // Execute each tool call
+      let onlySkillLoads = true;
       for (const toolCall of assistantMessage.tool_calls) {
         const toolName = toolCall.function.name;
         let args: Record<string, unknown> = {};
@@ -221,8 +269,27 @@ export async function runAgent(
         } catch {
           log(`ERREUR parse arguments: ${toolCall.function.arguments}`);
         }
+        if (toolName !== "load_skill") onlySkillLoads = false;
 
         log(`Tool call: ${toolName}(${JSON.stringify(args)})`);
+
+        // Progressive disclosure: loading an already-loaded skill is a no-op (its
+        // tools are already active) — short-circuit without re-fetching, so the
+        // model can't loop on load_skill.
+        if (toolName === "load_skill") {
+          const sid = String((args as Record<string, unknown>).skill_id || "");
+          if (sid && loadedSkills.has(sid)) {
+            onToolProgress(toolName, "calling", JSON.stringify(args));
+            onToolProgress(toolName, "done");
+            messages.push({
+              role: "tool",
+              content: JSON.stringify({ skill_id: sid, note: "Skill déjà chargé, ses outils sont disponibles." }),
+              tool_call_id: toolCall.id,
+            });
+            continue;
+          }
+        }
+
         onToolProgress(toolName, "calling", JSON.stringify(args));
 
         try {
@@ -232,12 +299,31 @@ export async function runAgent(
           // résultat tardif bloqué. Le tool signale alors already_displayed:true pour
           // que l'agent ne recopie pas le texte ensuite.
           const toolStreamFn = (chunk: string) => onStream(chunk);
-          const rawResult = await executeTool(toolName, args, onLog, progressFn, toolStreamFn);
+          const rawResult = await executeTool(toolName, args, onLog, progressFn, toolStreamFn, signal);
           log(`Tool ${toolName} OK — résultat: ${rawResult.slice(0, 500)}${rawResult.length > 500 ? '...' : ''}`);
+          // Progressive disclosure: a freshly-loaded skill unlocks its tools for
+          // the next iterations.
+          if (toolName === "load_skill" && !rawResult.includes('"error"')) {
+            const sid = String((args as Record<string, unknown>).skill_id || "");
+            if (sid) {
+              loadedSkills.add(sid);
+              getSkillTools(sid).forEach((t) => activeToolNames.add(t));
+            }
+          }
+          if (toolName === "find_common_slots") calledFindSlots = true;
           onToolProgress(toolName, "done");
 
-          // Replace long email IDs with short refs for the LLM
-          const result = toolName === "load_skill" ? rawResult : replaceEmailIdsWithRefs(rawResult);
+          // Any tool result of shape {type:"email_list",...} (get_email_interactions
+          // without query, display_emails) is rendered directly in the UI via
+          // onEmailList, and the LLM sees only a compact marker. Other results get
+          // their long Graph IDs swapped for short refs. load_skill is passed through
+          // verbatim so its instructions aren't mangled.
+          let result: string;
+          if (toolName === "load_skill") {
+            result = rawResult;
+          } else {
+            result = handleEmailListResult(rawResult, onEmailList);
+          }
 
           // Add tool result to conversation
           messages.push({
@@ -246,6 +332,8 @@ export async function runAgent(
             tool_call_id: toolCall.id,
           });
         } catch (err) {
+          // Propagate user-triggered abort up to the caller; don't swallow as a tool error.
+          if (err instanceof Error && err.name === "AbortError") throw err;
           const errorMsg = err instanceof Error ? err.message : String(err);
           log(`Tool ${toolName} ERREUR: ${errorMsg}`);
           onToolProgress(toolName, "error", errorMsg);
@@ -258,12 +346,39 @@ export async function runAgent(
         }
       }
 
+      // load_skill calls don't consume the work budget (their number is bounded
+      // by the catalog size, and re-loads are no-ops) — refund this iteration if
+      // nothing but skill-loading happened.
+      if (onlySkillLoads) iterations = Math.max(0, iterations - 1);
+
       // Continue the loop — LLM will process tool results
       continue;
     }
 
     // No tool calls — this is the final text response (already streamed to UI)
     const finalContent = assistantMessage.content || "";
+
+    // Anti-invention guard for scheduling: if find_common_slots is available
+    // (scheduling skill loaded) and the answer presents slots but the tool wasn't
+    // called this turn, those slots are invented — force ONE corrective call.
+    if (
+      !forcedSlotRetry &&
+      !calledFindSlots &&
+      activeToolNames.has("find_common_slots") &&
+      presentsSlots(finalContent)
+    ) {
+      forcedSlotRetry = true;
+      log("Garde planification: créneaux présentés sans appel find_common_slots — relance forcée");
+      onStream(null); // discard the invented streamed text
+      messages.push({ role: "assistant", content: finalContent });
+      messages.push({
+        role: "system",
+        content:
+          "STOP. Tu présentes des créneaux/disponibilités mais tu n'as PAS appelé find_common_slots ce tour-ci — ces créneaux sont donc INVENTÉS. Appelle find_common_slots MAINTENANT (avec les emails des participants obtenus via search_contacts) et présente UNIQUEMENT ses résultats réels. Ne fabrique JAMAIS de créneaux.",
+      });
+      continue;
+    }
+
     log(`Réponse finale (${finalContent.length} chars)`);
 
     // Build the updated history (without system prompt), preserving tool_calls

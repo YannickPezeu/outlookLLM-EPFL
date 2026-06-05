@@ -65,13 +65,65 @@ function getRcpConfig() {
   };
 }
 
+// Reasoning models served by RCP (self-hosted vLLM) emit a chain-of-thought
+// before the answer/tool call. We don't need it for tool orchestration or
+// summaries and it adds large latency (minutes on long context → timeouts), and
+// our SSE parser discards reasoning_content anyway. Kimi's chat template gates
+// reasoning on a boolean `thinking` kwarg passed via chat_template_kwargs.
+// NOTE: it is `thinking`, NOT `enable_thinking` (that's the Qwen3 convention and
+// is silently ignored by Kimi). Each model family has its own key, so we scope by
+// model name. Verified on RCP 2026-05-28 (DPO-Agent probe_kimi_thinking.py):
+// chat_template_kwargs.thinking=false → 0 reasoning chars, ~1s vs 2-4s.
+function applyModelTweaks(body: Record<string, unknown>): Record<string, unknown> {
+  const model = typeof body.model === "string" ? body.model : "";
+  if (/kimi-k2/i.test(model)) {
+    const existing = (body.chat_template_kwargs as Record<string, unknown>) ?? {};
+    body.chat_template_kwargs = { ...existing, thinking: false };
+    // Moonshot's published spec for NON-thinking mode requires these sampling
+    // params (temperature 0.6, top_p 0.95, n 1, presence_penalty 0.0). Sending a
+    // lower temperature (e.g. our default 0.3) can error or degrade output, so we
+    // override them for Kimi only. See DPO-Agent docs/disable-kimi-thinking-rcp.md.
+    body.temperature = 0.6;
+    body.top_p = 0.95;
+    body.n = 1;
+    body.presence_penalty = 0.0;
+  }
+  return body;
+}
+
+/**
+ * Build a chat/completions request body shared by all RCP calls, so request
+ * params (temperature, max_tokens, per-model tweaks) live in one place.
+ */
+function buildChatBody(opts: {
+  model: string;
+  messages: ChatMessage[] | AgentMessage[];
+  stream: boolean;
+  tools?: ToolDefinition[];
+  maxTokens?: number;
+}): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: opts.model,
+    messages: opts.messages,
+    temperature: 0.3,
+    max_tokens: opts.maxTokens ?? 8192,
+    stream: opts.stream,
+  };
+  if (opts.tools && opts.tools.length > 0) {
+    body.tools = opts.tools;
+    body.tool_choice = "auto";
+  }
+  return applyModelTweaks(body);
+}
+
 /**
  * Send a chat completion request to the RCP API (OpenAI-compatible).
  * Returns the full response.
  */
 export async function chatCompletion(
   messages: ChatMessage[],
-  model?: string
+  model?: string,
+  maxTokens: number = 8192
 ): Promise<ChatCompletionResponse> {
   const cfg = getRcpConfig();
 
@@ -89,13 +141,7 @@ export async function chatCompletion(
       "Content-Type": "application/json",
       Authorization: `Bearer ${cfg.apiKey}`,
     },
-    body: JSON.stringify({
-      model: model || cfg.model,
-      messages,
-      temperature: 0.3,
-      max_tokens: 8192,
-      stream: false,
-    }),
+    body: JSON.stringify(buildChatBody({ model: model || cfg.model, messages, stream: false, maxTokens })),
   });
 
   if (!response.ok) {
@@ -123,7 +169,8 @@ function extractContent(response: ChatCompletionResponse): string {
 export async function chatCompletionStream(
   messages: ChatMessage[],
   onChunk: (text: string) => void,
-  model?: string
+  model?: string,
+  signal?: AbortSignal
 ): Promise<string> {
   const cfg = getRcpConfig();
 
@@ -137,13 +184,8 @@ export async function chatCompletionStream(
       "Content-Type": "application/json",
       Authorization: `Bearer ${cfg.apiKey}`,
     },
-    body: JSON.stringify({
-      model: model || cfg.model,
-      messages,
-      temperature: 0.3,
-      max_tokens: 8192,
-      stream: true,
-    }),
+    body: JSON.stringify(buildChatBody({ model: model || cfg.model, messages, stream: true })),
+    signal,
   });
 
   if (!response.ok) {
@@ -198,7 +240,8 @@ export async function chatCompletionStream(
 export async function chatCompletionWithTools(
   messages: AgentMessage[],
   tools: ToolDefinition[],
-  model?: string
+  model?: string,
+  signal?: AbortSignal
 ): Promise<ToolCallResponse> {
   const cfg = getRcpConfig();
 
@@ -206,18 +249,7 @@ export async function chatCompletionWithTools(
     throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
   }
 
-  const body: Record<string, unknown> = {
-    model: model || cfg.model,
-    messages,
-    temperature: 0.3,
-    max_tokens: 8192,
-    stream: false,
-  };
-
-  if (tools.length > 0) {
-    body.tools = tools;
-    body.tool_choice = "auto";
-  }
+  const body = buildChatBody({ model: model || cfg.model, messages, stream: false, tools });
 
   console.log("[RCP] Tool-calling request, tools:", tools.map((t) => t.function.name));
 
@@ -228,6 +260,7 @@ export async function chatCompletionWithTools(
       Authorization: `Bearer ${cfg.apiKey}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!response.ok) {
@@ -259,7 +292,8 @@ export async function chatCompletionWithToolsStream(
   messages: AgentMessage[],
   tools: ToolDefinition[],
   onChunk: (text: string) => void,
-  model?: string
+  model?: string,
+  signal?: AbortSignal
 ): Promise<{
   message: { role: string; content: string | null; tool_calls?: ToolCall[] };
   finish_reason: string;
@@ -270,18 +304,7 @@ export async function chatCompletionWithToolsStream(
     throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
   }
 
-  const body: Record<string, unknown> = {
-    model: model || cfg.model,
-    messages,
-    temperature: 0.3,
-    max_tokens: 8192,
-    stream: true,
-  };
-
-  if (tools.length > 0) {
-    body.tools = tools;
-    body.tool_choice = "auto";
-  }
+  const body = buildChatBody({ model: model || cfg.model, messages, stream: true, tools });
 
   console.log("[RCP] Streaming tool-calling request, tools:", tools.map((t) => t.function.name));
 
@@ -292,6 +315,7 @@ export async function chatCompletionWithToolsStream(
       Authorization: `Bearer ${cfg.apiKey}`,
     },
     body: JSON.stringify(body),
+    signal,
   });
 
   if (!response.ok) {
@@ -371,6 +395,24 @@ export async function chatCompletionWithToolsStream(
     ? Array.from(toolCallsMap.values())
     : undefined;
 
+  // vLLM bug: certains modèles (Mistral 3.2 sur RCP) émettent un stream complètement
+  // vide quand ils décident d'appeler un outil — le tool-call parser streaming avale
+  // la sortie. Détection : tools fournis, stream sans contenu et sans tool_calls.
+  // Fallback : refaire l'appel en non-streaming, qui retourne bien les tool_calls.
+  if (tools.length > 0 && !toolCalls && !fullContent) {
+    console.warn("[RCP] Stream empty (likely vLLM tool-call parser issue), retrying non-streaming");
+    const fallback = await chatCompletionWithTools(messages, tools, model, signal);
+    const choice = fallback.choices[0];
+    return {
+      message: {
+        role: choice.message.role,
+        content: choice.message.content,
+        tool_calls: choice.message.tool_calls,
+      },
+      finish_reason: choice.finish_reason,
+    };
+  }
+
   return {
     message: {
       role: "assistant",
@@ -382,34 +424,6 @@ export async function chatCompletionWithToolsStream(
 }
 
 // ─── High-level functions ────────────────────────────────────────────
-
-/**
- * Summarize a single email body.
- */
-export async function summarizeEmail(
-  emailBody: string,
-  onChunk?: (text: string) => void
-): Promise<string> {
-  const messages: ChatMessage[] = [
-    {
-      role: "system",
-      content:
-        "Tu es un assistant qui résume des emails de manière concise et structurée en français. " +
-        "Identifie les points clés, les actions demandées, et les décisions prises.",
-    },
-    {
-      role: "user",
-      content: `Résume cet email :\n\n${emailBody}`,
-    },
-  ];
-
-  if (onChunk) {
-    return chatCompletionStream(messages, onChunk);
-  }
-
-  const response = await chatCompletion(messages);
-  return extractContent(response);
-}
 
 /**
  * Summarize all interactions with a specific person.
@@ -429,7 +443,8 @@ export async function summarizeInteractions(
     conversationId?: string;
   }>,
   onChunk?: (text: string) => void,
-  model?: string
+  model?: string,
+  signal?: AbortSignal
 ): Promise<string> {
   if (emails.length === 0) {
     return `Aucun échange trouvé avec ${personName}.`;
@@ -488,40 +503,11 @@ export async function summarizeInteractions(
   ];
 
   if (onChunk) {
-    return chatCompletionStream(messages, onChunk, model);
+    return chatCompletionStream(messages, onChunk, model, signal);
   }
 
   const response = await chatCompletion(messages, model);
   return extractContent(response);
-}
-
-/**
- * Ask the LLM to suggest a folder name for an email.
- */
-export async function suggestFolder(
-  emailSubject: string,
-  emailBody: string,
-  existingFolders: string[]
-): Promise<string> {
-  const messages: ChatMessage[] = [
-    {
-      role: "system",
-      content:
-        "Tu es un assistant qui organise des emails dans des dossiers. " +
-        "Réponds UNIQUEMENT avec le nom du dossier recommandé, rien d'autre. " +
-        "Utilise un dossier existant si pertinent, sinon suggère un nouveau nom court.",
-    },
-    {
-      role: "user",
-      content:
-        `Dossiers existants : ${existingFolders.join(", ")}\n\n` +
-        `Email :\nSujet: ${emailSubject}\n${emailBody.slice(0, 300)}\n\n` +
-        `Dans quel dossier classer cet email ?`,
-    },
-  ];
-
-  const response = await chatCompletion(messages);
-  return extractContent(response).trim() || "Inbox";
 }
 
 // ─── Reranker (BAAI/bge-reranker-v2-m3) ─────────────────────────────
@@ -641,12 +627,35 @@ export async function rerank(
 
 // ─── Settings persistence ────────────────────────────────────────────
 
-export function saveRcpSettings(baseUrl: string, apiKey: string, model: string): void {
+export function saveRcpSettings(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  relevanceFilterEnabled?: boolean
+): void {
   localStorage.setItem("rcp_base_url", baseUrl);
   localStorage.setItem("rcp_api_key", apiKey);
   localStorage.setItem("rcp_model", model);
+  if (typeof relevanceFilterEnabled === "boolean") {
+    // Storage key kept as "rcp_gemma_filter_enabled" for backward compat — don't
+    // rename it or existing users' disabled setting silently resets to enabled.
+    localStorage.setItem("rcp_gemma_filter_enabled", relevanceFilterEnabled ? "1" : "0");
+  }
 }
 
-export function loadRcpSettings(): { baseUrl: string; apiKey: string; model: string } {
-  return getRcpConfig();
+export function loadRcpSettings(): {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  relevanceFilterEnabled: boolean;
+} {
+  return { ...getRcpConfig(), relevanceFilterEnabled: isRelevanceFilterEnabled() };
+}
+
+/**
+ * Whether the relevance-filter pass (meeting prep Phase 4) is enabled.
+ * Default: true. Disable for faster runs in testing at the cost of relevance precision.
+ */
+export function isRelevanceFilterEnabled(): boolean {
+  return localStorage.getItem("rcp_gemma_filter_enabled") !== "0";
 }

@@ -8,7 +8,7 @@ import { App } from "./App";
 Office.onReady(() => {
   const root = createRoot(document.getElementById("root")!);
   root.render(
-    <FluentProvider theme={webLightTheme}>
+    <FluentProvider theme={webLightTheme} style={{ height: "100%" }}>
       <App />
     </FluentProvider>
   );

@@ -11,8 +11,10 @@ import {
   tokens,
   Badge,
 } from "@fluentui/react-components";
-import { Send24Regular, Bot24Regular, ArrowReset24Regular } from "@fluentui/react-icons";
+import { Send24Regular, Bot24Regular, ArrowReset24Regular, Stop24Filled, DocumentText24Regular } from "@fluentui/react-icons";
 import { runAgent, resolveEmailRef, type ToolProgressCallback, type StreamCallback, type EmailListCallback, type EmailListItem, type LogCallback } from "../services/agentService";
+import { clearEmailRefs } from "../services/emailRefs";
+import { loadConv, saveConv, removeConv } from "../services/convStorage";
 import { Mail24Regular } from "@fluentui/react-icons";
 import { type AgentMessage } from "../services/rcpApiService";
 
@@ -62,6 +64,8 @@ const useStyles = makeStyles({
   },
   messagesArea: {
     flex: 1,
+    minHeight: 0, // allow the flex child to shrink and scroll INSIDE itself,
+    // so the header (+ quick action) above stays pinned instead of scrolling away
     overflow: "auto",
     display: "flex",
     flexDirection: "column",
@@ -114,6 +118,16 @@ const useStyles = makeStyles({
         textDecoration: "underline",
       },
     },
+  },
+  thinking: {
+    alignSelf: "flex-start",
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "6px 10px",
+    fontSize: tokens.fontSizeBase200,
+    fontStyle: "italic",
+    color: tokens.colorNeutralForeground3,
   },
   tracePanel: {
     alignSelf: "flex-start",
@@ -244,10 +258,19 @@ const TOOL_LABELS: Record<string, string> = {
   summarize_email_interactions: "Résumé des échanges",
   get_calendar_events: "Consultation du calendrier",
   search_emails: "Recherche dans les emails",
-  show_emails: "Affichage des emails",
+  display_emails: "Affichage de la sélection",
   prepare_meeting: "Préparation de réunion",
   identify_topic_participants: "Identification des acteurs",
   summarize_topic_status: "Point d'avancement",
+  summarize_current_email: "Lecture de l'email ouvert",
+  load_skill: "Chargement du savoir-faire",
+  find_common_slots: "Recherche de créneaux",
+};
+
+/** True when the Office item is an editable (compose/reply) message. */
+const detectComposeMode = (): boolean => {
+  const item = (window as any).Office?.context?.mailbox?.item;
+  return !!(item && item.body && typeof item.body.setAsync === "function");
 };
 
 // ─── Markdown renderer ──────────────────────────────────────────────
@@ -363,18 +386,106 @@ const SUGGESTIONS = [
 
 // ─── Component ──────────────────────────────────────────────────────
 
+// Persist chat across remounts AND across surfaces. Outlook loads the task pane
+// as a separate instance per surface (read pane vs reply/compose window). The
+// conversation is stored via OfficeRuntime.storage (shared across surfaces and
+// persistent on web + desktop) with a localStorage mirror for instant initial
+// paint and cross-instance live-sync — see services/convStorage.ts.
+const CONV_STORAGE_KEY = "epfl-mail-ai-conversation";
+
+interface PersistedConv {
+  messages: ChatMessage[];
+  conversation: AgentMessage[];
+}
+
+function loadPersistedConv(): PersistedConv {
+  try {
+    const raw = localStorage.getItem(CONV_STORAGE_KEY);
+    if (!raw) return { messages: [], conversation: [] };
+    const data = JSON.parse(raw);
+    return {
+      messages: Array.isArray(data.messages) ? data.messages : [],
+      conversation: Array.isArray(data.conversation) ? data.conversation : [],
+    };
+  } catch {
+    return { messages: [], conversation: [] };
+  }
+}
+
 export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = true }) => {
   const styles = useStyles();
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const initialConv = useMemo(() => loadPersistedConv(), []);
+  const [messages, setMessages] = useState<ChatMessage[]>(initialConv.messages);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [liveTraces, setLiveTraces] = useState<ToolTrace[]>([]);
   const [streamingContent, setStreamingContent] = useState("");
+  const [isCompose, setIsCompose] = useState(detectComposeMode);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const conversationRef = useRef<AgentMessage[]>([]);
+  const conversationRef = useRef<AgentMessage[]>(initialConv.conversation);
   const pendingEmailListRef = useRef<{ name: string; emails: EmailListItem[] } | null>(null);
   const tracesRef = useRef<ToolTrace[]>([]);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Persist messages + LLM history whenever the chat changes.
+  // conversationRef is set just before setMessages in handleSend, so by the
+  // time this effect runs (post-render), both are in sync.
+  useEffect(() => {
+    if (messages.length === 0) {
+      void removeConv(CONV_STORAGE_KEY);
+      return;
+    }
+    void saveConv(
+      CONV_STORAGE_KEY,
+      JSON.stringify({ messages, conversation: conversationRef.current })
+    );
+  }, [messages]);
+
+  // Reconcile with OfficeRuntime.storage on mount. The synchronous initial load
+  // (loadPersistedConv) reads localStorage for instant paint, but on desktop the
+  // localStorage may be isolated/empty while OfficeRuntime.storage holds the real
+  // shared conversation — so adopt it if we currently have nothing.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const raw = await loadConv(CONV_STORAGE_KEY);
+      if (cancelled || !raw) return;
+      try {
+        const data = JSON.parse(raw);
+        if (!Array.isArray(data.messages) || data.messages.length === 0) return;
+        setMessages((prev) => {
+          if (prev.length > 0) return prev; // already populated (sync load or user input)
+          conversationRef.current = Array.isArray(data.conversation) ? data.conversation : [];
+          return data.messages;
+        });
+      } catch {
+        // ignore malformed payloads
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Live-sync the conversation across task-pane instances (e.g. the read pane
+  // stays pinned while a reply window opens its own instance). The storage event
+  // fires in the OTHER instances when one updates localStorage. Skip while a turn
+  // is running here so we don't disrupt an in-progress stream.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== CONV_STORAGE_KEY || e.newValue == null || loading) return;
+      try {
+        const data = JSON.parse(e.newValue);
+        if (Array.isArray(data.messages)) {
+          conversationRef.current = Array.isArray(data.conversation) ? data.conversation : [];
+          setMessages(data.messages);
+        }
+      } catch {
+        // ignore malformed payloads
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [loading]);
   // Accumulates every streamed chunk of the turn (tool outputs + final agent reply)
   // so the final persisted message contains the full text, not just runAgent.response.
   const streamBufferRef = useRef("");
@@ -393,8 +504,13 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     }
   }, [isActive, loading]);
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
+  // Re-check read vs compose surface once mounted (Office may be loading at first render)
+  useEffect(() => {
+    setIsCompose(detectComposeMode());
+  }, []);
+
+  const handleSend = useCallback(async (overrideText?: string) => {
+    const text = (typeof overrideText === "string" ? overrideText : input).trim();
     if (!text || loading) return;
 
     setInput("");
@@ -465,6 +581,9 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
       pendingEmailListRef.current = { name, emails };
     };
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       const { response, updatedHistory } = await runAgent(
         text,
@@ -472,7 +591,8 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
         onToolProgress,
         onStream,
         onLog,
-        onEmailList
+        onEmailList,
+        controller.signal
       );
 
       conversationRef.current = updatedHistory;
@@ -496,22 +616,42 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
       tracesRef.current = [];
       setLiveTraces([]);
     } catch (err: any) {
-      const errorMsg = err.message || "Erreur inattendue";
+      const wasAborted = err?.name === "AbortError" || controller.signal.aborted;
       const finalTraces = tracesRef.current;
+      // Mark any still-running tool traces as errored so the UI doesn't keep spinning.
+      if (wasAborted) {
+        for (const t of finalTraces) {
+          if (t.status === "calling") {
+            t.status = "error";
+            t.errorMsg = "Arrêté par l'utilisateur";
+          }
+        }
+      }
+      const partial = streamBufferRef.current;
+      const content = wasAborted
+        ? (partial ? `${partial}\n\n_⏹ Arrêté par l'utilisateur._` : "_⏹ Arrêté par l'utilisateur._")
+        : `**Erreur :** ${err?.message || "Erreur inattendue"}`;
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: `**Erreur :** ${errorMsg}`,
+          content,
           traces: finalTraces.length > 0 ? finalTraces : undefined,
         },
       ]);
+      setStreamingContent("");
+      streamBufferRef.current = "";
       tracesRef.current = [];
       setLiveTraces([]);
     } finally {
+      abortControllerRef.current = null;
       setLoading(false);
     }
   }, [input, loading]);
+
+  const handleStop = useCallback(() => {
+    abortControllerRef.current?.abort();
+  }, []);
 
   const handleSuggestion = (suggestion: string) => {
     setInput(suggestion);
@@ -544,6 +684,8 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     setStreamingContent("");
     conversationRef.current = [];
     pendingEmailListRef.current = null;
+    void removeConv(CONV_STORAGE_KEY);
+    clearEmailRefs();
   }, []);
 
   return (
@@ -569,6 +711,28 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
       </div>
 
       <div className={styles.messagesArea}>
+        {/* Quick action at the START of the conversation — inside the scroll area,
+            so it simply scrolls away with the content (no need to hide it). */}
+        {!isCompose && (
+          <div style={{ display: "flex" }}>
+            <Tooltip content="Résume le mail actuellement ouvert dans Outlook (corps + pièces jointes), puis continue la discussion" relationship="label">
+              <Button
+                size="small"
+                appearance="outline"
+                icon={<DocumentText24Regular />}
+                disabled={loading}
+                onClick={() =>
+                  handleSend(
+                    "Résume l'email actuellement ouvert dans Outlook (corps et pièces jointes compris)."
+                  )
+                }
+              >
+                Résumer l'email ouvert
+              </Button>
+            </Tooltip>
+          </div>
+        )}
+
         {isEmpty && (
           <div className={styles.emptyState}>
             <Bot24Regular style={{ fontSize: "32px" }} />
@@ -626,6 +790,17 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
           <TracePanelView traces={liveTraces} isLive styles={styles} />
         )}
 
+        {/* "Thinking" indicator: the LLM is running an inference (deciding the next
+            tool or composing the answer) with nothing streaming yet and no tool
+            currently executing — otherwise the UI looks frozen during that gap. */}
+        {loading && !streamingContent &&
+          !(liveTraces[liveTraces.length - 1]?.status === "calling") && (
+          <div className={styles.thinking}>
+            <Spinner size="tiny" />
+            <span>Réflexion en cours…</span>
+          </div>
+        )}
+
         {/* Streaming response */}
         {streamingContent && (
           <MarkdownContent content={streamingContent} className={styles.assistantBubble} onEmailClick={handleEmailClick} />
@@ -660,12 +835,22 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
           onKeyDown={(e) => e.key === "Enter" && handleSend()}
           disabled={loading}
         />
-        <Button
-          appearance="primary"
-          icon={<Send24Regular />}
-          onClick={handleSend}
-          disabled={loading || !input.trim()}
-        />
+        {loading ? (
+          <Tooltip content="Arrêter" relationship="label">
+            <Button
+              appearance="primary"
+              icon={<Stop24Filled />}
+              onClick={handleStop}
+            />
+          </Tooltip>
+        ) : (
+          <Button
+            appearance="primary"
+            icon={<Send24Regular />}
+            onClick={() => handleSend()}
+            disabled={!input.trim()}
+          />
+        )}
       </div>
     </div>
   );

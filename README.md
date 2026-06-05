@@ -52,16 +52,13 @@ Configuration centrale de l'application. Contient les placeholders pour :
 | Fichier | Role |
 |---|---|
 | `authService.ts` | **Authentification Microsoft.** Initialise MSAL.js en essayant d'abord le mode NAA (Nested App Auth, SSO transparent dans le nouveau Outlook) puis fallback sur MSAL SPA standard. Expose `getGraphToken()` qui acquiert silencieusement un token Graph API avec fallback popup interactif. Gere aussi `signOut()` et l'etat d'auth. |
-| `graphMailService.ts` | **Client Microsoft Graph API.** Fournit toutes les operations sur la boite mail : `searchEmailsFromSender()` et `searchEmailsSentTo()` pour trouver les emails echanges avec un contact, `getAllInteractions()` qui combine les deux, `listFolders()` / `createFolder()` / `moveMessage()` pour l'organisation. Gere la pagination automatique via `@odata.nextLink`. |
-| `rcpApiService.ts` | **Client API RCP (LLM).** Envoie des requetes au format OpenAI chat completions. Supporte le mode streaming SSE (`chatCompletionStream`) pour afficher le resume progressivement, et le mode classique (`chatCompletion`). Fournit 3 fonctions haut niveau : `summarizeEmail()`, `summarizeInteractions()`, `suggestFolder()`. Les settings (URL, cle, modele) sont persistes dans `localStorage` et editables depuis l'onglet Config. |
+| `graphMailService.ts` | **Client Microsoft Graph API.** Fournit toutes les operations sur la boite mail : `searchEmailsFromSender()` et `searchEmailsSentTo()` pour trouver les emails echanges avec un contact, `getAllInteractions()` qui combine les deux. Gere la pagination automatique via `@odata.nextLink`. |
+| `rcpApiService.ts` | **Client API RCP (LLM).** Envoie des requetes au format OpenAI chat completions. Supporte le mode streaming SSE (`chatCompletionStream`) pour afficher le resume progressivement, et le mode classique (`chatCompletion`). Fournit `summarizeInteractions()` comme fonction haut niveau. Les settings (URL, cle, modele) sont persistes dans `localStorage` et editables depuis l'onglet Config. |
 
 ### `src/components/` - Vues UI
 
 | Fichier | Role |
 |---|---|
-| `InteractionsView.tsx` | **Vue P0 (priorite haute).** Champ de saisie d'adresse email (pre-rempli depuis le sender du mail ouvert via Office.js). Au clic, fetche tous les emails envoyes et recus via Graph API, puis envoie le tout au RCP API pour un resume structure et streame. Affiche des badges avec le nombre d'emails trouves. |
-| `SummarizeView.tsx` | **Vue P1.** Bouton "Resumer cet email". Lit le body du mail actuellement ouvert via `Office.context.mailbox.item.body.getAsync()`, l'envoie au RCP API, et affiche le resume en streaming. |
-| `OrganizeView.tsx` | **Vue P2.** Affiche l'arbre des dossiers mail (via Graph API). Permet de creer un nouveau dossier, de deplacer le mail courant dans un dossier selectionne, et de demander une suggestion IA de classement (le LLM analyse le mail et propose un dossier existant ou nouveau). |
 | `SettingsView.tsx` | **Vue Config.** Affiche le statut d'authentification Microsoft (connecte/deconnecte, mode NAA ou non, username). Formulaire pour configurer l'API RCP : URL, cle API, modele. Les valeurs sont sauvegardees dans `localStorage`. |
 
 ## Demarrage rapide

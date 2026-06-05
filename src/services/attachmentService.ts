@@ -1,7 +1,12 @@
 import * as pdfjsLib from "pdfjs-dist";
 
-// Disable worker for simplicity in add-in context
-pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+// pdfjs-dist v5 requires a real worker — setting workerSrc to "" makes
+// getDocument() fail. Let webpack 5 emit the worker asset and resolve its URL
+// (handles publicPath automatically for dev "/", k8s "/outlook/", ghpages).
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url
+).toString();
 
 export interface AttachmentText {
   name: string;
@@ -26,7 +31,11 @@ const SUPPORTED_TYPES = [
   "text/html",
 ];
 
-const MAX_TEXT_LENGTH = 10000;
+// Default per-attachment extraction cap. Callers that summarize a single open
+// email pass a much larger budget (Kimi K2.6 has a 256k-token context), while
+// read_email_attachments / meeting prep keep this moderate default so reading
+// several attachments at once doesn't blow the context window.
+const MAX_TEXT_LENGTH = 30000;
 
 function base64ToArrayBuffer(base64: string): ArrayBuffer {
   const binary = atob(base64);
@@ -52,8 +61,11 @@ async function extractPdfText(arrayBuffer: ArrayBuffer): Promise<string> {
     }
 
     return textParts.join("\n").trim();
-  } catch {
-    return "[Contenu PDF non extractible]";
+  } catch (err) {
+    // Surface the real cause in dev (worker setup, corrupt file…) instead of
+    // silently passing a fake placeholder to the LLM.
+    console.error("[attachmentService] PDF extraction failed:", err);
+    return "";
   }
 }
 
@@ -94,7 +106,8 @@ export function filterSupportedAttachments(attachments: GraphAttachment[]): Grap
 }
 
 export async function extractTextFromAttachments(
-  attachments: GraphAttachment[]
+  attachments: GraphAttachment[],
+  maxLength: number = MAX_TEXT_LENGTH
 ): Promise<AttachmentText[]> {
   const supported = filterSupportedAttachments(attachments);
   const results: AttachmentText[] = [];
@@ -114,10 +127,10 @@ export async function extractTextFromAttachments(
       text = extractPlainText(arrayBuffer);
     }
 
-    if (text && text.length > 0) {
+    if (text && text.trim().length > 0) {
       results.push({
         name: attachment.name,
-        text: text.slice(0, MAX_TEXT_LENGTH),
+        text: text.slice(0, maxLength),
       });
     }
   }

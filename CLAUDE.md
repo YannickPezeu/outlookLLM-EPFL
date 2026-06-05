@@ -49,7 +49,7 @@ src/taskpane/App.tsx                # Composant racine, 5 onglets, init auth
 
 src/services/authService.ts        # MSAL init (NAA + fallback), getGraphToken()
 src/services/graphMailService.ts   # Client Graph API (emails, calendrier, contacts, dossiers)
-src/services/rcpApiService.ts      # Client RCP LLM (chat completions, streaming, suggestFolder)
+src/services/rcpApiService.ts      # Client RCP LLM (chat completions, streaming)
 src/services/embeddingService.ts   # Embeddings + cosine similarity + reranking
 src/services/meetingPrepService.ts # Pipeline complet de préparation de réunion
 src/services/agentService.ts       # Boucle agent multi-tour avec tool calling
@@ -58,9 +58,6 @@ src/services/attachmentService.ts  # Extraction texte pièces jointes (PDF, DOCX
 
 src/components/AssistantView.tsx   # Interface chat assistant IA conversationnel
 src/components/MeetingPrepView.tsx # UI préparation de réunion
-src/components/SummarizeView.tsx   # Résumé du mail courant
-src/components/InteractionsView.tsx # Résumé des interactions avec un contact
-src/components/OrganizeView.tsx    # Organisation emails dans dossiers (suggestion IA)
 src/components/SettingsView.tsx    # Config RCP API + statut auth
 ```
 
@@ -69,12 +66,12 @@ src/components/SettingsView.tsx    # Config RCP API + statut auth
 ### 1. Assistant (AssistantView)
 Interface de chat conversationnel avec le LLM. L'agent utilise des outils (tool calling) pour :
 - `search_contacts` — recherche de contacts avec matching flou (Levenshtein)
-- `get_email_interactions` — liste des emails échangés avec un contact
+- `get_email_interactions` — emails échangés avec un contact ; sans `query` affiche la liste cliquable complète dans l'UI, avec `query` trie par pertinence sémantique pour sélection + `display_emails`
+- `display_emails` — affiche une sous-liste d'emails cliquables (refs sélectionnés par l'agent)
 - `summarize_email_interactions` — résumé IA des échanges avec un contact
 - `get_calendar_events` — consultation du calendrier sur une plage de dates
 - `search_emails` — recherche plein texte dans les emails
 - `search_contacts_in_servicedesk` — recherche dans les tickets ServiceNow
-- `show_emails` — affichage d'une liste d'emails cliquables dans le chat
 
 La boucle agent (agentService.ts) gère max 8 itérations d'appels d'outils, avec streaming des réponses et callbacks de progression.
 
@@ -86,17 +83,8 @@ Pipeline automatique de préparation de réunion :
 4. Lecture complète : Graph API → body complet des top 20 emails
 5. Synthèse LLM : résumé par participant (parallélisé) → méta-résumé final (streaming)
 
-### 3. Résumé (SummarizeView)
-Résumé du mail actuellement ouvert dans Outlook via le LLM.
-
-### 4. Interactions (InteractionsView)
-Résumé des échanges avec un contact spécifique.
-
-### 5. Config (SettingsView)
+### 3. Config (SettingsView)
 Configuration de la clé API RCP et affichage du statut d'authentification.
-
-### (Non intégré) Organisation (OrganizeView)
-Suggestion IA de dossier de destination pour un email, avec vue arborescente des dossiers.
 
 ## Déploiement
 
@@ -111,7 +99,7 @@ Le code supporte un mode dev sans Entra : mettre un token Graph Explorer dans `l
 
 ## Contraintes importantes
 
-- **Lecture seule** : l'add-in ne modifie jamais les emails/calendrier (sauf déplacement dans dossiers via OrganizeView)
+- **Lecture seule** : l'add-in ne modifie jamais les emails/calendrier
 - **Pas de backend** : tout tourne dans le navigateur
 - **Secrets** : le `.env` contient les credentials Entra et la clé RCP, il est dans `.gitignore`
 - **Langue** : l'interface est en français, le code et les commentaires en français/anglais

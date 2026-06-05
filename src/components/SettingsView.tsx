@@ -11,16 +11,16 @@ import {
   Badge,
   Combobox,
   Option,
+  Switch,
 } from "@fluentui/react-components";
 import { Settings24Regular, Checkmark24Regular } from "@fluentui/react-icons";
 import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
 import { isAuthenticated, isUsingNaa, getAccount, signOut, getGraphToken } from "../services/authService";
 
 const AVAILABLE_MODELS = [
+  "moonshotai/Kimi-K2.6",
   "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
-  "google/gemma-4-26B-A4B-it-bfloat16",
-  "google/gemma-4-31B-it-bfloat16",
-  "google/gemma-4-E4B-it",
+  "openai/gpt-oss-120b",
 ];
 
 const useStyles = makeStyles({
@@ -43,6 +43,7 @@ export const SettingsView: React.FC = () => {
   const [rcpUrl, setRcpUrl] = useState("");
   const [rcpKey, setRcpKey] = useState("");
   const [rcpModel, setRcpModel] = useState("");
+  const [relevanceFilterEnabled, setRelevanceFilterEnabled] = useState(true);
   const [graphToken, setGraphToken] = useState("");
   const [saved, setSaved] = useState(false);
 
@@ -51,11 +52,12 @@ export const SettingsView: React.FC = () => {
     setRcpUrl(settings.baseUrl);
     setRcpKey(settings.apiKey);
     setRcpModel(settings.model);
+    setRelevanceFilterEnabled(settings.relevanceFilterEnabled);
     setGraphToken(localStorage.getItem("graph_dev_token") || "");
   }, []);
 
   const handleSave = () => {
-    saveRcpSettings(rcpUrl, rcpKey, rcpModel);
+    saveRcpSettings(rcpUrl, rcpKey, rcpModel, relevanceFilterEnabled);
     if (graphToken.trim()) {
       localStorage.setItem("graph_dev_token", graphToken.trim());
     } else {
@@ -84,7 +86,7 @@ export const SettingsView: React.FC = () => {
               <Badge appearance="filled" color="success">
                 Connecté
               </Badge>
-              <Text size={200}>{account?.username}</Text>
+              <Text size={200}>{account?.username ?? "Token dev"}</Text>
               {isUsingNaa() && (
                 <Badge appearance="outline" color="informative">
                   NAA
@@ -191,7 +193,6 @@ export const SettingsView: React.FC = () => {
             freeform
             placeholder="Choisir ou saisir un modèle"
             value={rcpModel}
-            selectedOptions={[rcpModel]}
             onOptionSelect={(_, data) => setRcpModel(data.optionValue ?? data.optionText ?? "")}
             onChange={(e) => setRcpModel((e.target as HTMLInputElement).value)}
           >
@@ -201,6 +202,18 @@ export const SettingsView: React.FC = () => {
               </Option>
             ))}
           </Combobox>
+        </div>
+
+        <div className={styles.field}>
+          <Switch
+            checked={relevanceFilterEnabled}
+            onChange={(_, data) => setRelevanceFilterEnabled(data.checked)}
+            label="Filtrage de pertinence (préparation de réunion)"
+          />
+          <Text size={100}>
+            Désactiver pour accélérer la préparation de réunion (skip Phase 4).
+            Qualité du tri légèrement réduite — utile pour les tests.
+          </Text>
         </div>
 
         <div className={styles.row}>

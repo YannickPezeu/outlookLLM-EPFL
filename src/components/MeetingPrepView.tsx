@@ -48,6 +48,51 @@ const useStyles = makeStyles({
     fontSize: tokens.fontSizeBase100,
     color: tokens.colorNeutralForeground3,
   },
+  logPanel: {
+    width: "100%",
+    backgroundColor: tokens.colorNeutralBackground2,
+    borderRadius: tokens.borderRadiusMedium,
+    padding: "6px 10px",
+    fontSize: tokens.fontSizeBase100,
+    color: tokens.colorNeutralForeground3,
+    "& > summary": {
+      cursor: "pointer",
+      userSelect: "none",
+      display: "flex",
+      alignItems: "center",
+      gap: "6px",
+      fontWeight: tokens.fontWeightSemibold,
+    },
+  },
+  logList: {
+    margin: "6px 0 4px 0",
+    padding: 0,
+    listStyle: "none",
+    display: "flex",
+    flexDirection: "column",
+    gap: "2px",
+  },
+  logEntry: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: "6px",
+    fontSize: tokens.fontSizeBase100,
+    lineHeight: tokens.lineHeightBase200,
+  },
+  logPhase: {
+    fontFamily: tokens.fontFamilyMonospace,
+    color: tokens.colorNeutralForeground3,
+    minWidth: "150px",
+  },
+  logMessage: {
+    color: tokens.colorNeutralForeground2,
+    flex: 1,
+    wordBreak: "break-word",
+  },
+  logDetail: {
+    color: tokens.colorNeutralForeground3,
+    fontStyle: "italic",
+  },
   briefingBox: {
     fontSize: tokens.fontSizeBase200,
     lineHeight: tokens.lineHeightBase300,
@@ -117,11 +162,40 @@ const MarkdownRenderer: React.FC<{ content: string; className?: string }> = ({
   );
 };
 
+const NOT_APPOINTMENT_MSG =
+  "L'élément ouvert n'est pas un événement calendrier (c'est probablement un email). " +
+  "Ouvrez un événement dans Outlook, ou demandez à l'Assistant de préparer une réunion par son nom.";
+
+/** Whether an Office item type string designates a calendar appointment. */
+const isAppointment = (itemType: unknown): boolean =>
+  String(itemType).toLowerCase().includes("appointment");
+
+/**
+ * Resolve an item's EWS id. In read mode `item.itemId` is available
+ * synchronously, but in the calendar organizer/attendee form (compose surface)
+ * it is null and must be fetched via getItemIdAsync.
+ */
+const getItemEwsId = (item: any): Promise<string | null> =>
+  new Promise((resolve) => {
+    if (item?.itemId) {
+      resolve(item.itemId);
+      return;
+    }
+    if (typeof item?.getItemIdAsync === "function") {
+      item.getItemIdAsync((res: Office.AsyncResult<string>) => {
+        resolve(res.status === Office.AsyncResultStatus.Succeeded ? res.value : null);
+      });
+    } else {
+      resolve(null);
+    }
+  });
+
 export const MeetingPrepView: React.FC = () => {
   const styles = useStyles();
   const { item: dialogItem } = useOutlookItem();
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<PipelineProgress | null>(null);
+  const [progressLog, setProgressLog] = useState<Array<{ phase: string; message: string; detail?: string; ts: number }>>([]);
   const [briefingText, setBriefingText] = useState("");
   const [briefingData, setBriefingData] = useState<MeetingBriefing | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -138,6 +212,7 @@ export const MeetingPrepView: React.FC = () => {
     setBriefingText("");
     setBriefingData(null);
     setProgress(null);
+    setProgressLog([]);
     abortRef.current = false;
 
     try {
@@ -147,13 +222,18 @@ export const MeetingPrepView: React.FC = () => {
 
       if (dialogItem) {
         // Dialog mode: use data relayed from taskpane
+        if (!isAppointment(dialogItem.itemType)) {
+          setError(NOT_APPOINTMENT_MSG);
+          setLoading(false);
+          return;
+        }
         restId = dialogItem.itemId;
-        subject = dialogItem.subject || "Réunion";
-        startDate = dialogItem.start;
+        subject = typeof dialogItem.subject === "string" ? dialogItem.subject : "Réunion";
+        startDate = typeof dialogItem.start === "string" ? dialogItem.start : null;
       } else {
         // Taskpane mode: read Office.context directly
         const item = Office.context?.mailbox?.item;
-        if (!item || !item.itemId) {
+        if (!item) {
           setError(
             "Aucun événement sélectionné. Ouvrez un événement calendrier dans Outlook pour préparer la réunion."
           );
@@ -161,17 +241,41 @@ export const MeetingPrepView: React.FC = () => {
           return;
         }
 
-        restId = item.itemId;
+        // Guard: this pipeline reads a calendar event (/me/events/{id}). Viewing
+        // an email here would 404 against /me/events with a confusing error.
+        if (!isAppointment(item.itemType)) {
+          setError(NOT_APPOINTMENT_MSG);
+          setLoading(false);
+          return;
+        }
+
+        // In compose surfaces (organizer/attendee form), item.subject and
+        // item.start are async-getter OBJECTS, not plain values — using them
+        // directly would render an object and crash React. The real subject/date
+        // come from Graph (extractContext) anyway; use safe placeholders here.
+        subject = typeof item.subject === "string" ? item.subject : "Réunion";
+        startDate = typeof item.start === "string" ? item.start : null;
+
+        // In the organizer/attendee form (compose surface), item.itemId is null;
+        // the EWS id must be fetched asynchronously via getItemIdAsync.
+        const ewsId = await getItemEwsId(item);
+        if (!ewsId) {
+          setError(
+            "Impossible de récupérer l'identifiant de cet événement. " +
+            "S'il vient d'être créé, enregistrez-le d'abord, puis réessayez."
+          );
+          setLoading(false);
+          return;
+        }
+        restId = ewsId;
         try {
           restId = Office.context.mailbox.convertToRestId(
-            item.itemId,
+            ewsId,
             Office.MailboxEnums.RestVersion.v2_0
           );
         } catch {
           // If conversion fails, use original ID
         }
-        subject = item.subject || "Réunion";
-        startDate = item.start ? (item.start as unknown as string) : null;
       }
 
       setEventInfo({
@@ -192,7 +296,14 @@ export const MeetingPrepView: React.FC = () => {
         new GraphMailDataSource(),
         restId,
         (prog: PipelineProgress) => {
-          if (!abortRef.current) setProgress(prog);
+          if (abortRef.current) return;
+          setProgress(prog);
+          setProgressLog((prev) => {
+            // Skip exact-duplicate consecutive messages (same phase + same text + same detail)
+            const last = prev[prev.length - 1];
+            if (last && last.phase === prog.phase && last.message === prog.message && last.detail === prog.detail) return prev;
+            return [...prev, { phase: prog.phase, message: prog.message, detail: prog.detail, ts: Date.now() }];
+          });
         },
         (chunk) => {
           if (!abortRef.current) setBriefingText((prev) => prev + chunk);
@@ -227,6 +338,7 @@ export const MeetingPrepView: React.FC = () => {
     setBriefingText("");
     setBriefingData(null);
     setProgress(null);
+    setProgressLog([]);
     setError(null);
     setEventInfo(null);
     abortRef.current = true;
@@ -236,7 +348,7 @@ export const MeetingPrepView: React.FC = () => {
     extracting_context: "Contexte",
     collecting_emails: "Collecte emails",
     embedding_ranking: "Analyse sémantique",
-    filtering_emails: "Filtrage intelligent",
+    filtering_emails: "Chargement en contexte",
     searching_nonparticipants: "Recherche hors participants",
     reading_emails: "Lecture emails",
     summarizing_participants: "Résumés participants",
@@ -309,6 +421,26 @@ export const MeetingPrepView: React.FC = () => {
             <Text className={styles.progressDetail}>{progress.detail}</Text>
           )}
         </div>
+      )}
+
+      {/* Persistent log of all pipeline steps — visible during AND after the run */}
+      {progressLog.length > 0 && (
+        <details className={styles.logPanel} open={loading}>
+          <summary>
+            Étapes du pipeline — {progressLog.length} évènement{progressLog.length > 1 ? "s" : ""}
+          </summary>
+          <ul className={styles.logList}>
+            {progressLog.map((entry, i) => (
+              <li key={i} className={styles.logEntry}>
+                <span className={styles.logPhase}>[{phaseLabel[entry.phase] || entry.phase}]</span>
+                <span className={styles.logMessage}>
+                  {entry.message}
+                  {entry.detail && <span className={styles.logDetail}> — {entry.detail}</span>}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
 
       {/* Error */}

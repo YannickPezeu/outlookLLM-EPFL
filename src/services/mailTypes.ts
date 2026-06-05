@@ -61,9 +61,18 @@ export interface GraphAttachment {
   "@odata.type"?: string;
 }
 
+export interface ParticipantCollectStats {
+  rawReceived: number;
+  rawSent: number;
+  deduped: number;
+}
+
 export interface MailDataSource {
   getCalendarEvent(eventId: string): Promise<CalendarEvent>;
-  collectEmailsWithParticipant(participantEmail: string): Promise<LightEmail[]>;
+  collectEmailsWithParticipant(
+    participantEmail: string,
+    onStats?: (stats: ParticipantCollectStats) => void
+  ): Promise<LightEmail[]>;
   searchEmailsByKeyword(keyword: string, maxResults?: number): Promise<LightEmail[]>;
   /** Search ServiceDesk emails (from 1234@epfl.ch) mentioning a person by name. */
   searchServiceDeskEmailsForPerson(personName: string, maxResults?: number): Promise<LightEmail[]>;

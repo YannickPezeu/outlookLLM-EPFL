@@ -6,7 +6,13 @@ L'utilisateur veut PREPARER une reunion, obtenir un BRIEFING, ou se renseigner a
 ## Workflow obligatoire
 
 1. **Identifier la reunion** : Utilise `get_calendar_events` pour trouver l'evenement.
-   - Si l'utilisateur mentionne "demain", "lundi prochain", etc., calcule les dates appropriees.
+   - **Utilise TOUJOURS une fenetre large** : ne cale JAMAIS `end_date` sur l'heure exacte
+     supposee de la reunion. Meme si l'utilisateur dit "dans 30 min" ou "a 13h30", cherche
+     sur toute la journee (start = debut de journee, end = fin de journee) — sinon tu risques
+     de rater l'evenement (la borne `end_date` est exclusive, et l'heure annoncee par
+     l'utilisateur est souvent approximative).
+   - Si l'utilisateur mentionne "demain", "lundi prochain", etc., calcule les dates appropriees
+     et couvre la journee entiere correspondante.
    - Si plusieurs evenements correspondent, demande a l'utilisateur de preciser lequel.
    - Si un seul evenement correspond, utilise-le directement.
    - Tu as besoin de l'`id` de l'evenement pour l'etape suivante.
@@ -19,6 +25,12 @@ L'utilisateur veut PREPARER une reunion, obtenir un BRIEFING, ou se renseigner a
    - Ne reformule PAS le briefing, affiche-le directement en Markdown.
    - Tu peux ajouter une phrase d'introduction avant le briefing.
    - Mentionne le nombre de participants et d'emails analyses (champs `participantCount` et `emailsAnalyzed`).
+
+## Pour TROUVER UNE DATE / un créneau
+Ce n'est PAS ce skill. Si l'utilisateur veut ORGANISER une réunion ou trouver une disponibilité
+commune (« organise une réu avec X et Y », « trouve un créneau »), c'est le skill
+`schedule_meeting` (outil `find_common_slots`). Ici, `prepare_meeting` ne fait qu'un BRIEFING d'une
+réunion déjà existante.
 
 ## Exemple d'introduction
 ```

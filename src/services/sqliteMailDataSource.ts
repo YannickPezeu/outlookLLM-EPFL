@@ -82,7 +82,10 @@ export class SqliteMailDataSource implements MailDataSource {
   }
 
   // ── collectEmailsWithParticipant ──────────────────────────────────
-  async collectEmailsWithParticipant(participantEmail: string): Promise<LightEmail[]> {
+  async collectEmailsWithParticipant(
+    participantEmail: string,
+    onStats?: (stats: { rawReceived: number; rawSent: number; deduped: number }) => void
+  ): Promise<LightEmail[]> {
     const rows = this.db
       .prepare(
         `SELECT id, subject, body_preview, from_name, from_address,
@@ -122,6 +125,9 @@ export class SqliteMailDataSource implements MailDataSource {
       });
     }
 
+    // SQLite path doesn't separate received/sent — report total raw rows
+    // under rawReceived for compatibility, leave rawSent at 0.
+    onStats?.({ rawReceived: rows.length, rawSent: 0, deduped: deduplicated.length });
     return deduplicated;
   }
 

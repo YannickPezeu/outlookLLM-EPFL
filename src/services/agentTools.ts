@@ -12,14 +12,18 @@ import {
   getCalendarView,
   getEmailsBatch,
   getSchedule,
+  getMessageAttachments,
+  getEmail,
   DateRange,
 } from "./graphMailService";
 import { getAccount } from "./authService";
 import { batchEmbed, rankBySimilarity } from "./embeddingService";
-import { cleanEmailBodyFull } from "./cleanEmailBody";
+import { cleanEmailBodyFull, cleanEmailBody } from "./cleanEmailBody";
 import { getSkillCatalogForPrompt, getSkillIds, loadSkillContent } from "../skills/skillRegistry";
 import { prepareMeeting } from "./meetingPrepService";
 import { GraphMailDataSource } from "./graphMailDataSource";
+import { resolveEmailRef, resolveEmailRefMetadata } from "./emailRefs";
+import { extractTextFromAttachments } from "./attachmentService";
 
 // ─── Tool Definitions (OpenAI function-calling format) ──────────────
 
@@ -31,7 +35,18 @@ import { GraphMailDataSource } from "./graphMailDataSource";
 export const PRESERVED_TOOLS = new Set<string>([
   "get_calendar_events",
   "search_contacts",
+  // Keep the open email's body + attachments in context so the user can ask
+  // follow-up questions about it ("et la méthodo ?", "rédige une réponse").
+  "summarize_current_email",
+  // Keep load_skill calls in history so the agent loop can re-derive which skills
+  // (and thus which tools) are active on subsequent turns, and so the loaded
+  // playbook stays resident in context.
+  "load_skill",
 ]);
+
+// Progressive tool disclosure: the only tools exposed before any skill is loaded.
+// Everything else is unlocked by loading the matching skill (see skillRegistry).
+export const CORE_TOOL_NAMES = ["load_skill", "search_contacts"];
 
 export const AGENT_TOOLS: ToolDefinition[] = [
   {
@@ -39,9 +54,10 @@ export const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "search_contacts",
       description:
-        "Recherche des contacts par nom dans les emails de l'utilisateur. " +
+        "Recherche des contacts par nom dans l'annuaire EPFL ET dans les emails de l'utilisateur. " +
+        "Trouve n'importe quel collaborateur EPFL même sans historique d'échange. " +
         "Gère les noms partiels, les accents manquants, etc. " +
-        "Retourne une liste de contacts avec nom et adresse email. " +
+        "Retourne une liste de contacts avec nom, email, et le cas échéant fonction/département. " +
         "TOUJOURS utiliser cet outil avant les autres quand l'utilisateur mentionne un contact par nom.",
       parameters: {
         type: "object",
@@ -60,10 +76,15 @@ export const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "get_email_interactions",
       description:
-        "Récupère la liste des emails échangés avec un contact (reçus, envoyés, et tickets ServiceDesk). " +
-        "Retourne les sujets, dates et comptages. Nécessite le nom et l'adresse email. " +
-        "Supporte le filtrage par période temporelle via start_date/end_date. " +
-        "Si query est fourni, les emails sont triés par pertinence sémantique (embeddings) par rapport à la query.",
+        "Récupère les emails échangés avec un contact (reçus, envoyés, et tickets ServiceDesk). " +
+        "Nécessite le nom et l'adresse email. Supporte le filtrage par période via start_date/end_date.\n" +
+        "DEUX MODES selon la présence de 'query' :\n" +
+        "• SANS query → affiche directement dans l'interface la LISTE COMPLÈTE des emails sous forme de cartes cliquables " +
+        "(rendues par l'UI — tu n'as PAS à les réécrire). À utiliser quand l'utilisateur veut VOIR / MONTRER / LISTER " +
+        "ses emails avec un contact, sans critère de contenu. Le filtrage par dates reste possible.\n" +
+        "• AVEC query → trie les emails par pertinence sémantique (embeddings) et te retourne leurs refs+sujets+previews " +
+        "pour que TU sélectionnes les pertinents, puis appelles display_emails. À utiliser dès qu'il y a un critère de contenu " +
+        "(sujet, thème, mot-clé).",
       parameters: {
         type: "object",
         properties: {
@@ -106,11 +127,16 @@ export const AGENT_TOOLS: ToolDefinition[] = [
         properties: {
           start_date: {
             type: "string",
-            description: "Date de début au format ISO 8601 (ex: 2025-01-15T00:00:00). Par défaut: maintenant.",
+            description:
+              "Date de début au format ISO 8601 en heure LOCALE de l'utilisateur (ex: 2025-01-15T00:00:00). Par défaut: maintenant.",
           },
           end_date: {
             type: "string",
-            description: "Date de fin au format ISO 8601. Par défaut: 7 jours après start_date.",
+            description:
+              "Date de fin au format ISO 8601 en heure LOCALE. Par défaut: 7 jours après start_date. " +
+              "Utilise une fenêtre LARGE : ne cale JAMAIS end_date sur l'heure exacte supposée d'un événement " +
+              "(la borne est exclusive et l'heure donnée par l'utilisateur est souvent approximative). " +
+              "Pour chercher un événement « aujourd'hui » ou « dans X min », couvre toute la journée (jusqu'à 23:59).",
           },
         },
         required: [],
@@ -176,12 +202,15 @@ export const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "summarize_email_interactions",
       description:
-        "Génère un résumé structuré des échanges email avec un contact. " +
+        "Génère un RÉSUMÉ / SYNTHÈSE structuré(e) des échanges email avec un contact. " +
+        "À utiliser UNIQUEMENT quand l'utilisateur demande explicitement un résumé, une synthèse, " +
+        "un point, un bilan des échanges (mots-clés : RÉSUME, SYNTHÉTISE, FAIS-MOI UN POINT, BILAN). " +
         "Déduplique par conversation (garde le dernier Re: de chaque thread), " +
         "nettoie le HTML, et produit un résumé IA incluant les sujets abordés, " +
         "les décisions prises, les points en suspens, et une liste de to-dos pour la suite. " +
         "Nécessite le nom et l'adresse email du contact. " +
-        "Utiliser get_email_interactions si on veut juste la LISTE des emails sans résumé.",
+        "NE PAS utiliser quand l'utilisateur veut juste VOIR / AFFICHER / LISTER les emails — " +
+        "dans ce cas utiliser get_email_interactions (sans query) à la place.",
       parameters: {
         type: "object",
         properties: {
@@ -213,34 +242,69 @@ export const AGENT_TOOLS: ToolDefinition[] = [
   {
     type: "function",
     function: {
-      name: "show_emails",
+      name: "display_emails",
       description:
-        "Ouvre la recherche Outlook filtrée dans un nouvel onglet pour afficher les emails d'un contact. " +
-        "Utiliser quand l'utilisateur veut VOIR/AFFICHER/MONTRER ses échanges (pas les résumer). " +
-        "Retourne un lien cliquable que l'utilisateur peut ouvrir. " +
-        "Supporte le filtrage par période temporelle via start_date/end_date.",
+        "Affiche dans l'interface une LISTE FILTRÉE d'emails sous forme de cartes cliquables. " +
+        "À utiliser après avoir récupéré une liste via get_email_interactions / search_emails " +
+        "et SÉLECTIONNÉ les emails réellement pertinents (par sujet, expéditeur, date, ou tout autre critère du user). " +
+        "Tu fournis uniquement les refs courts (ex: ['ref_3', 'ref_7']) — l'UI génère automatiquement la liste. " +
+        "Ne JAMAIS écrire toi-même les liens markdown des emails après cet appel : juste une phrase d'introduction. " +
+        "Préférer cette voie à la rédaction manuelle de [Sujet](email:ref_X) — c'est beaucoup plus rapide.",
       parameters: {
         type: "object",
         properties: {
-          name: {
-            type: "string",
-            description: "Le nom complet du contact",
+          email_ids: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Liste ordonnée des refs des emails à afficher (ex: ['ref_3', 'ref_7', 'ref_12']). " +
+              "Doivent provenir d'un appel précédent dans CETTE conversation (get_email_interactions, search_emails, etc.).",
           },
-          email: {
+          context_label: {
             type: "string",
-            description: "L'adresse email du contact",
-          },
-          start_date: {
-            type: "string",
-            description: "Date de début pour filtrer les emails (format ISO 8601, ex: 2023-05-01T00:00:00Z). Optionnel.",
-          },
-          end_date: {
-            type: "string",
-            description: "Date de fin pour filtrer les emails (format ISO 8601, ex: 2023-06-01T00:00:00Z). Optionnel.",
+            description:
+              "Optionnel : étiquette courte pour identifier le filtrage (ex: 'IA', 'Patrick Saladino', 'budget 2025'). Affiché en en-tête.",
           },
         },
-        required: ["name", "email"],
+        required: ["email_ids"],
       },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_email_attachments",
+      description:
+        "Lit et extrait le CONTENU TEXTE des pièces jointes d'UN email précis " +
+        "(formats supportés : PDF, DOCX, TXT, CSV, HTML ; max 5 Mo/fichier ; ~10 000 caractères extraits par fichier ; " +
+        "les images et éléments inline sont ignorés). " +
+        "À utiliser UNIQUEMENT quand la pièce jointe est jugée IMPORTANTE pour répondre " +
+        "(ex: l'utilisateur demande ce que contient un document, ou un fichier est central dans la conversation). " +
+        "Les résultats d'emails marquent has_attachments:true quand un email a des pièces jointes. " +
+        "NE PAS appeler en masse ni « au cas où » : chaque appel consomme du contexte. Un seul email par appel.",
+      parameters: {
+        type: "object",
+        properties: {
+          email_id: {
+            type: "string",
+            description:
+              "Le ref court de l'email dont lire les pièces jointes (ex: 'ref_7'). " +
+              "Doit provenir d'un résultat précédent de CETTE conversation (get_email_interactions, search_emails, summarize_email_interactions…).",
+          },
+        },
+        required: ["email_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "summarize_current_email",
+      description:
+        "Lit l'email ACTUELLEMENT OUVERT dans Outlook (corps + pièces jointes : PDF, DOCX, TXT, CSV, HTML) et retourne son contenu complet pour que TU le résumes. " +
+        "À utiliser dès que l'utilisateur demande de résumer / analyser / expliquer « cet email », « ce mail », « le message ouvert », « ce qui est demandé dans ce mail » et ses pièces jointes — sans qu'il ait besoin de préciser un contact ni un ref. " +
+        "Ne prend AUCUN paramètre. Après l'appel, rédige le résumé structuré en suivant le champ \"instructions\" du résultat.",
+      parameters: { type: "object", properties: {}, required: [] },
     },
   },
   {
@@ -270,22 +334,35 @@ export const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "find_common_slots",
       description:
-        "Trouve les créneaux horaires où tous les participants sont simultanément disponibles, " +
-        "en consultant leur free/busy via l'API Graph getSchedule. " +
+        "Trouve des créneaux horaires de réunion en consultant le free/busy des participants via l'API Graph getSchedule. " +
         "Ne voit PAS le détail des événements des collègues, seulement libre/occupé/tentatif/absent. " +
-        "Par défaut inclut l'utilisateur courant, cherche sur 7 jours, créneaux de 30 min en heures ouvrées (9h–18h, lun–ven). " +
-        "Usage typique : 'trouve un créneau pour une réunion avec X et Y' — fournir les adresses email des participants.",
+        "Par défaut cherche sur 7 jours en heures ouvrées (9h–18h, lun–ven), créneaux de 30 min. " +
+        "Comportement : (1) si des créneaux où TOUT LE MONDE est libre existent, ils sont retournés en priorité " +
+        "(`all_free_slot_found: true`). (2) Sinon, FALLBACK automatique : retourne les meilleurs créneaux disponibles " +
+        "ordonnés par nombre de personnes libres (`fallback_mode: true`, `best_score` = nb max de libres trouvé). " +
+        "Chaque créneau indique `free_participants` et `busy_participants` — utilise ces listes pour expliquer à l'utilisateur " +
+        "qui est libre et qui ne l'est pas, afin qu'il puisse arbitrer (ex: 'le lundi 10 à 14h tout le monde est libre sauf Alice'). " +
+        "Usage typique : 'trouve un créneau avec X et Y' (include_self=true) ou 'quand est libre Alexandre ?' (include_self=false).",
       parameters: {
         type: "object",
         properties: {
           participants: {
             type: "array",
             items: { type: "string" },
-            description: "Liste des adresses email des participants (max 20).",
+            description: "Liste des adresses email des participants à interroger (max 20).",
+          },
+          include_self: {
+            type: "boolean",
+            description:
+              "OBLIGATOIRE — décider en fonction de l'intention utilisateur. " +
+              "true si la réunion doit inclure l'utilisateur courant (ex: 'organise une réunion avec X et moi', " +
+              "'trouve un créneau pour qu'on se voie avec Y'). " +
+              "false si on cherche uniquement la disponibilité d'autres personnes sans inclure l'utilisateur " +
+              "(ex: 'quand est libre Alexandre ?', 'donne-moi les slots libres de X cette semaine').",
           },
           duration_minutes: {
             type: "number",
-            description: "Durée souhaitée de la réunion en minutes (défaut: 30, multiples de 30 recommandés).",
+            description: "Durée souhaitée du créneau en minutes (défaut: 30, multiples de 30 recommandés).",
           },
           start_date: {
             type: "string",
@@ -295,28 +372,44 @@ export const AGENT_TOOLS: ToolDefinition[] = [
             type: "string",
             description: "Fin de la fenêtre de recherche (ISO 8601). Défaut: 7 jours après start_date.",
           },
+          days_of_week: {
+            type: "array",
+            items: { type: "number" },
+            description:
+              "Liste des jours autorisés (0=dimanche, 1=lundi, 2=mardi, 3=mercredi, 4=jeudi, 5=vendredi, 6=samedi). " +
+              "Ex: [1, 5] pour 'uniquement lundi et vendredi', [2, 4] pour 'mardi et jeudi'. " +
+              "Si absent, utilise include_weekends pour décider lun-ven vs lun-dim.",
+          },
+          time_restriction: {
+            type: "object",
+            description:
+              "Fenêtre horaire stricte dans la journée (override working_hours_*). " +
+              "À utiliser quand l'utilisateur précise une plage : 'entre 15h et 17h', 'le matin (8h-12h)'. " +
+              "Format 'HH:MM'. Le créneau entier doit tenir dans cette fenêtre.",
+            properties: {
+              start: { type: "string", description: "Heure de début 'HH:MM' (ex: '15:00')." },
+              end: { type: "string", description: "Heure de fin 'HH:MM' (ex: '17:00')." },
+            },
+            required: ["start", "end"],
+          },
           working_hours_start: {
             type: "number",
-            description: "Heure de début de journée de travail, 0-23 (défaut: 9).",
+            description: "Heure de début de journée par défaut, 0-23 (défaut: 9). Ignoré si time_restriction est fourni.",
           },
           working_hours_end: {
             type: "number",
-            description: "Heure de fin de journée de travail, 0-23 (défaut: 18).",
+            description: "Heure de fin de journée par défaut, 0-23 (défaut: 18). Ignoré si time_restriction est fourni.",
           },
           include_weekends: {
             type: "boolean",
-            description: "Inclure samedi et dimanche (défaut: false).",
-          },
-          include_self: {
-            type: "boolean",
-            description: "Inclure l'utilisateur courant dans les participants (défaut: true).",
+            description: "Inclure samedi et dimanche (défaut: false). Ignoré si days_of_week est fourni.",
           },
           max_results: {
             type: "number",
             description: "Nombre maximum de créneaux candidats à retourner (défaut: 10).",
           },
         },
-        required: ["participants"],
+        required: ["participants", "include_self"],
       },
     },
   },
@@ -415,13 +508,34 @@ type ToolExecutor = (
   args: Record<string, unknown>,
   log: LogFn,
   onProgress?: ToolProgressFn,
-  onStream?: ToolStreamFn
+  onStream?: ToolStreamFn,
+  signal?: AbortSignal
 ) => Promise<string>;
+
+const SIX_MONTHS_MS = 180 * 24 * 60 * 60 * 1000;
 
 function extractDateRange(args: Record<string, unknown>): DateRange | undefined {
   const startDate = args.start_date as string | undefined;
   const endDate = args.end_date as string | undefined;
   return (startDate || endDate) ? { startDate, endDate } : undefined;
+}
+
+/**
+ * Convertit une borne temporelle fournie par le LLM en string UTC pour Graph.
+ *
+ * Graph /calendarView interprète startDateTime/endDateTime SANS offset comme de
+ * l'UTC (le header Prefer: outlook.timezone ne change QUE le format des dates
+ * retournées, pas l'interprétation des bornes). Or le LLM produit des heures
+ * locales naïves (ex: "2026-06-04T13:30:00" = heure de Zurich, GMT+2).
+ *
+ * new Date() parse une string ISO sans offset comme heure LOCALE du navigateur,
+ * donc .toISOString() la convertit correctement en UTC. Si un offset/Z est déjà
+ * présent, la conversion reste correcte.
+ */
+function toGraphUtc(dateTime: string): string {
+  const d = new Date(dateTime);
+  if (Number.isNaN(d.getTime())) return dateTime; // fallback: laisse Graph trancher
+  return d.toISOString();
 }
 
 function formatLocalDateTime(dateTime: string, timeZone: string): string {
@@ -451,20 +565,29 @@ const executors: Record<string, ToolExecutor> = {
   async get_email_interactions(args, log) {
     const name = args.name as string;
     const email = args.email as string;
-    const dateRange = extractDateRange(args);
+    const explicitRange = extractDateRange(args);
     const query = args.query as string | undefined;
 
-    // Default to last 6 months if no date range specified
-    const effectiveDateRange = dateRange || {
-      startDate: new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString(),
-      endDate: new Date().toISOString(),
-    };
-    const usingDefault = !dateRange;
+    // Two modes, depending on whether a content filter (query) was given:
+    //  • no query → "show all": collect everything (all-time unless dates given)
+    //    and hand the full clickable list straight to the UI (email_list marker).
+    //  • query → semantic search: bound the pool (default 6 months), rank by
+    //    relevance, return ref summaries so the LLM can pick + call display_emails.
+    const dateRange = explicitRange || (query
+      ? { startDate: new Date(Date.now() - SIX_MONTHS_MS).toISOString(), endDate: new Date().toISOString() }
+      : undefined);
+    const usingDefault = !explicitRange && !!query;
+
+    // Per-direction cap. The default (30) is too low for "show all" over a wide
+    // range — it would keep only the 30 most recent and silently drop the rest of
+    // the period. Use a high cap so the full clickable list (and the semantic pool)
+    // covers the whole range.
+    const MAX_PER_DIRECTION = 200;
 
     // Skip direct email search if no email address (ServiceDesk-only contacts)
     const [{ received, sent }, serviceDeskEmails] = await Promise.all([
-      email ? getAllInteractions(email, undefined, effectiveDateRange) : Promise.resolve({ received: [], sent: [] }),
-      getServiceDeskEmailsForPerson(name, undefined, effectiveDateRange),
+      email ? getAllInteractions(email, MAX_PER_DIRECTION, dateRange) : Promise.resolve({ received: [], sent: [] }),
+      getServiceDeskEmailsForPerson(name, MAX_PER_DIRECTION, dateRange),
     ]);
 
     log(`Emails collectés: ${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk${usingDefault ? " (limité aux 6 derniers mois par défaut)" : ""}`);
@@ -476,6 +599,25 @@ const executors: Record<string, ToolExecutor> = {
       ...serviceDeskEmails.map((e) => ({ ...e, direction: "servicedesk" as const, displayDate: e.receivedDateTime, subject: `[ServiceNow] ${e.subject}` })),
     ];
 
+    // ── No query → render the full clickable list directly in the UI ──
+    // (this is the former show_emails behaviour, folded in as the default mode)
+    if (!query) {
+      const list = allEmails
+        .map((e) => ({
+          id: e.id,
+          subject: e.subject,
+          date: e.displayDate,
+          from: e.direction === "sent" ? "Moi"
+            : e.direction === "servicedesk" ? "ServiceDesk"
+            : (e as any).from?.emailAddress?.name || (e as any).from?.emailAddress?.address || "?",
+          direction: e.direction === "sent" ? ("sent" as const) : ("received" as const),
+        }))
+        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      log(`Liste affichée: ${list.length} emails`);
+      return JSON.stringify({ type: "email_list", name, email, emails: list, count: list.length });
+    }
+
+    // ── Query → semantic ranking, return ref summaries for the LLM to filter ──
     let topEmails = allEmails;
 
     // Cap at 500 emails for embeddings
@@ -488,18 +630,17 @@ const executors: Record<string, ToolExecutor> = {
       log(`Cap appliqué: ${allEmails.length} emails réduits à ${MAX_EMAILS_FOR_EMBEDDINGS} (les plus récents)`);
     }
 
-    // Semantic search via embeddings if query is provided
-    if (query && topEmails.length > 0) {
+    if (topEmails.length > 0) {
       log(`Recherche sémantique: "${query}" sur ${topEmails.length} emails...`);
       const texts = topEmails.map((e) => {
         const body = e.body?.content
-          ? e.body.content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 2000)
+          ? e.body.content.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 4000)
           : e.bodyPreview?.slice(0, 500) || "";
         return `${e.subject} ${body}`;
       });
       const [queryEmbeddings, ...itemEmbeddings] = await batchEmbed([query, ...texts]);
       const ranked = rankBySimilarity(queryEmbeddings, itemEmbeddings);
-      const topN = Math.min(30, topEmails.length);
+      const topN = Math.min(100, topEmails.length);
       topEmails = ranked.slice(0, topN).map((r) => topEmails[r.index]);
       log(`Top ${topN} emails par pertinence sélectionnés (score max: ${ranked[0]?.score.toFixed(3)})`);
     }
@@ -512,18 +653,22 @@ const executors: Record<string, ToolExecutor> = {
       log(`  [${tag}] ${e.displayDate?.slice(0, 10)} | ${e.subject}`);
     }
 
-    const emailSummaries = topEmails.slice(0, 30).map((e) => ({
+    const emailSummaries = topEmails.slice(0, 100).map((e) => ({
       id: e.id,
       subject: e.subject,
       date: e.displayDate,
       direction: e.direction,
+      from: e.direction === "sent"
+        ? "Moi"
+        : (e as any).from?.emailAddress?.name || (e as any).from?.emailAddress?.address || "?",
       preview: e.bodyPreview?.slice(0, 200),
+      has_attachments: !!(e as any).hasAttachments,
     }));
 
     return JSON.stringify({
       total_count: allEmails.length,
       returned_count: emailSummaries.length,
-      query: query || null,
+      query,
       default_period: usingDefault ? "6 derniers mois" : null,
       capped: capped ? `Limité à 500 emails sur ${allEmails.length} total` : null,
       emails: emailSummaries,
@@ -532,10 +677,11 @@ const executors: Record<string, ToolExecutor> = {
 
   async get_calendar_events(args, _log) {
     const now = new Date();
-    const startDate = (args.start_date as string) || now.toISOString();
-    const endDate =
+    const startDate = toGraphUtc((args.start_date as string) || now.toISOString());
+    const endDate = toGraphUtc(
       (args.end_date as string) ||
-      new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString()
+    );
 
     const events = await getCalendarView(startDate, endDate);
 
@@ -566,15 +712,17 @@ const executors: Record<string, ToolExecutor> = {
     const results = emails.map((e) => ({
       id: e.id,
       subject: e.subject,
-      from: e.from?.emailAddress?.name || e.from?.emailAddress?.address,
+      from: e.from?.emailAddress?.name || e.from?.emailAddress?.address || "?",
       date: e.receivedDateTime,
+      direction: "received" as const,
       preview: e.bodyPreview?.slice(0, 200),
+      has_attachments: !!(e as any).hasAttachments,
     }));
 
     return JSON.stringify({ results, count: emails.length });
   },
 
-  async summarize_email_interactions(args, log, _onProgress, onStream) {
+  async summarize_email_interactions(args, log, _onProgress, onStream, signal) {
     const name = args.name as string;
     const email = args.email as string;
     const dateRange = extractDateRange(args);
@@ -586,7 +734,7 @@ const executors: Record<string, ToolExecutor> = {
     // filtering of a 1000-email pull needed.
     const effectiveDateRange = dateRange || (query
       ? {
-          startDate: new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString(),
+          startDate: new Date(Date.now() - SIX_MONTHS_MS).toISOString(),
           endDate: new Date().toISOString(),
         }
       : undefined);
@@ -631,16 +779,19 @@ const executors: Record<string, ToolExecutor> = {
         id: e.id, subject: e.subject, body: e.body?.content || e.bodyPreview || "",
         date: e.receivedDateTime, direction: "received" as const,
         conversationId: (e as any).conversationId as string | undefined,
+        hasAttachments: !!e.hasAttachments,
       })),
       ...sent.map((e) => ({
         id: e.id, subject: e.subject, body: e.body?.content || e.bodyPreview || "",
         date: e.sentDateTime || e.receivedDateTime, direction: "sent" as const,
         conversationId: (e as any).conversationId as string | undefined,
+        hasAttachments: !!e.hasAttachments,
       })),
       ...serviceDeskEmails.map((e) => ({
         id: e.id, subject: `[ServiceNow] ${e.subject}`, body: e.body?.content || e.bodyPreview || "",
         date: e.receivedDateTime, direction: "servicedesk" as const,
         conversationId: (e as any).conversationId as string | undefined,
+        hasAttachments: false,
       })),
     ];
 
@@ -718,10 +869,25 @@ const executors: Record<string, ToolExecutor> = {
       }
     }
 
+    // Compact list of attachment-bearing emails (refs + subject only, NO content)
+    // so the agent can selectively read the important ones via read_email_attachments.
+    // Capped to avoid bloating the tool result. replaceEmailIdsWithRefs() mints refs.
+    const attachmentsAvailable = emailsToSummarize
+      .filter((e) => e.hasAttachments)
+      .slice(0, 15)
+      .map((e) => ({
+        id: e.id,
+        subject: e.subject,
+        date: e.date,
+        direction: e.direction,
+      }));
+
     log(`Génération du résumé (${emailsToSummarize.length} emails, streaming=${!!onStream})...`);
 
+    // Synthesis uses the user-chosen model from Settings (falls back to default
+    // when none stored). Pass undefined so chatCompletionStream picks cfg.model.
     const summary = await summarizeInteractions(
-      name, email, emailsToSummarize, onStream, config.rcp.synthesisModel
+      name, email, emailsToSummarize, onStream, undefined, signal
     );
 
     return JSON.stringify({
@@ -731,64 +897,160 @@ const executors: Record<string, ToolExecutor> = {
       emails_total: allEmails.length,
       query: query || null,
       already_displayed: !!onStream,
+      attachments_available: attachmentsAvailable.length > 0 ? attachmentsAvailable : undefined,
       summary,
     });
   },
 
-  async show_emails(args, log) {
-    const name = args.name as string;
-    const email = args.email as string;
-    const dateRange = extractDateRange(args);
+  async display_emails(args, log) {
+    const refs = (args.email_ids as string[]) || [];
+    const contextLabel = (args.context_label as string | undefined) || undefined;
 
-    const [{ received, sent }, serviceDeskEmails] = await Promise.all([
-      email ? getAllInteractions(email, undefined, dateRange) : Promise.resolve({ received: [], sent: [] }),
-      getServiceDeskEmailsForPerson(name, undefined, dateRange),
-    ]);
+    const resolved: Array<{
+      id: string;
+      subject: string;
+      date: string;
+      from: string;
+      direction: "received" | "sent";
+    }> = [];
+    const missing: string[] = [];
 
-    // Build a unified list sorted by date
-    const allEmails = [
-      ...received.map((e) => ({
-        id: e.id,
-        subject: e.subject,
-        date: e.receivedDateTime,
-        from: e.from?.emailAddress?.name || e.from?.emailAddress?.address || "?",
-        direction: "received" as const,
-      })),
-      ...sent.map((e) => ({
-        id: e.id,
-        subject: e.subject,
-        date: e.sentDateTime || e.receivedDateTime,
-        from: "Moi",
-        direction: "sent" as const,
-      })),
-      ...serviceDeskEmails.map((e) => ({
-        id: e.id,
-        subject: `[ServiceNow] ${e.subject}`,
-        date: e.receivedDateTime,
-        from: "ServiceDesk",
-        direction: "received" as const,
-      })),
-    ].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    for (const ref of refs) {
+      const meta = resolveEmailRefMetadata(ref);
+      if (!meta) {
+        missing.push(ref);
+        continue;
+      }
+      resolved.push({
+        id: meta.realId,
+        subject: meta.subject,
+        date: meta.date,
+        from: meta.from,
+        direction: meta.direction,
+      });
+    }
 
-    log(`show_emails: ${allEmails.length} emails (${received.length} reçus, ${sent.length} envoyés, ${serviceDeskEmails.length} ServiceDesk)`);
+    log(`display_emails: ${resolved.length} emails résolus${missing.length ? `, ${missing.length} refs introuvables (${missing.join(", ")})` : ""}`);
+
+    if (resolved.length === 0) {
+      return JSON.stringify({
+        error: "Aucun email à afficher. Les refs fournis ne correspondent à aucun email vu dans cette conversation.",
+        invalid_refs: missing,
+      });
+    }
 
     return JSON.stringify({
       type: "email_list",
-      name,
-      email,
-      emails: allEmails,
-      count: allEmails.length,
+      name: contextLabel || null,
+      emails: resolved,
+      count: resolved.length,
+      missing_refs: missing.length > 0 ? missing : undefined,
     });
   },
 
-  async prepare_meeting(args, log, onProgress) {
+  async read_email_attachments(args, log) {
+    const ref = args.email_id as string;
+    const realId = resolveEmailRef(ref);
+    if (!realId) {
+      return JSON.stringify({
+        error: `Ref introuvable: "${ref}". Utilise un ref d'email vu plus tôt dans cette conversation.`,
+      });
+    }
+
+    log(`Lecture des pièces jointes de ${ref}...`);
+    const attachments = await getMessageAttachments(realId);
+    const texts = await extractTextFromAttachments(attachments as any);
+
+    if (texts.length === 0) {
+      return JSON.stringify({
+        ref,
+        attachments: [],
+        note: "Aucune pièce jointe exploitable (formats supportés : PDF, DOCX, TXT, CSV, HTML ; max 5 Mo ; images/inline ignorées).",
+      });
+    }
+
+    // Hard cap to protect the context window: at most 3 attachments per call
+    // (each already truncated to ~10k chars by extractTextFromAttachments).
+    const MAX_ATTACHMENTS = 3;
+    const returned = texts.slice(0, MAX_ATTACHMENTS);
+    log(
+      `${texts.length} pièce(s) jointe(s) extraite(s)` +
+        (texts.length > MAX_ATTACHMENTS ? `, ${MAX_ATTACHMENTS} retournées (cap contexte)` : "")
+    );
+
+    return JSON.stringify({
+      ref,
+      attachment_count: texts.length,
+      returned_count: returned.length,
+      truncated: texts.length > MAX_ATTACHMENTS,
+      attachments: returned.map((a) => ({ name: a.name, chars: a.text.length, text: a.text })),
+    });
+  },
+
+  async summarize_current_email(_args, log) {
+    const OfficeRef = (window as any).Office;
+    const item = OfficeRef?.context?.mailbox?.item;
+    if (!item || !item.itemId) {
+      return JSON.stringify({
+        error: "Aucun email ouvert dans Outlook. Demande à l'utilisateur d'ouvrir un email, puis réessaie.",
+      });
+    }
+    if (String(item.itemType).toLowerCase().includes("appointment")) {
+      return JSON.stringify({
+        error: "L'élément ouvert est un événement calendrier, pas un email. Pour préparer une réunion, utilise prepare_meeting.",
+      });
+    }
+
+    let restId = item.itemId as string;
+    try {
+      restId = OfficeRef.context.mailbox.convertToRestId(
+        item.itemId,
+        OfficeRef.MailboxEnums.RestVersion.v2_0
+      );
+    } catch {
+      // conversion failed — use the original id
+    }
+
+    log("Lecture de l'email ouvert...");
+    const email = await getEmail(restId);
+    const body = cleanEmailBody(email.body?.content || "");
+
+    let attachments: { name: string; text: string }[] = [];
+    if (email.hasAttachments) {
+      log("Lecture des pièces jointes...");
+      const raw = await getMessageAttachments(restId);
+      // Generous per-attachment budget: a single open email fits Kimi's 256k ctx.
+      attachments = await extractTextFromAttachments(raw as any, 500000);
+      log(`  ✓ ${attachments.length} pièce(s) jointe(s) exploitable(s)`);
+    }
+
+    if (!body.trim() && attachments.length === 0) {
+      return JSON.stringify({
+        error: "Email vide et aucune pièce jointe lisible — rien à résumer.",
+      });
+    }
+
+    return JSON.stringify({
+      subject: email.subject || "(sans objet)",
+      from: email.from?.emailAddress?.name || email.from?.emailAddress?.address || null,
+      body,
+      attachments,
+      attachments_analyzed: attachments.length,
+      instructions:
+        "Résume cet email pour un membre du personnel dirigeant EPFL, en français, en combinant le CORPS et les PIÈCES JOINTES " +
+        "(ne les traite pas séparément — synthétise l'ensemble). Structure en markdown avec exactement ces sections : " +
+        "## Contexte / projet, ## Ce qui est demandé, ## Échéances, ## Points d'attention. " +
+        "Reste factuel, n'invente rien, signale ce qui est ambigu ou absent. Si une section est vide, écris « Rien à signaler ».",
+    });
+  },
+
+  async prepare_meeting(args, log, onProgress, onStream) {
     const eventId = args.event_id as string;
 
     log("Démarrage de la préparation de réunion...");
     onProgress?.("Démarrage...");
 
     const ds = new GraphMailDataSource();
-    let briefingText = "";
 
     const result = await prepareMeeting(
       ds,
@@ -797,9 +1059,11 @@ const executors: Record<string, ToolExecutor> = {
         log(`[${progress.phase}] ${progress.message}${progress.detail ? ` — ${progress.detail}` : ""}`);
         onProgress?.(`${progress.message} (${progress.percent}%)`);
       },
-      (chunk) => {
-        briefingText += chunk;
-      }
+      // Phase 8 streams the final briefing token-by-token. Forward it straight to
+      // the UI so it appears live instead of accumulating invisibly (~40s blank),
+      // and flag already_displayed below so the agent doesn't re-emit the whole
+      // briefing on its next turn (which previously caused a double generation).
+      (chunk) => onStream?.(chunk)
     );
 
     return JSON.stringify({
@@ -807,6 +1071,7 @@ const executors: Record<string, ToolExecutor> = {
       participants: result.participants.map((p) => p.name),
       participantCount: result.participants.length,
       emailsAnalyzed: result.participantBriefings.reduce((sum, b) => sum + b.emailCount, 0),
+      already_displayed: true,
       briefing: result.finalBriefing,
     });
   },
@@ -814,12 +1079,48 @@ const executors: Record<string, ToolExecutor> = {
   async find_common_slots(args, log) {
     const participantsArg = (args.participants as string[]) || [];
     const durationMin = (args.duration_minutes as number) || 30;
-    const whStart = (args.working_hours_start as number) ?? 9;
-    const whEnd = (args.working_hours_end as number) ?? 18;
-    const includeWeekends = (args.include_weekends as boolean) ?? false;
-    const includeSelf = (args.include_self as boolean) ?? true;
+    const includeSelf = args.include_self as boolean | undefined;
+    if (typeof includeSelf !== "boolean") {
+      return JSON.stringify({ error: "Paramètre 'include_self' obligatoire (true/false)." });
+    }
     const maxResults = (args.max_results as number) || 10;
     const INTERVAL_MIN = 30;
+
+    // Resolve allowed days-of-week (JS getDay() convention: 0=Sun..6=Sat)
+    const dowArg = args.days_of_week as number[] | undefined;
+    let allowedDays: Set<number>;
+    if (Array.isArray(dowArg) && dowArg.length > 0) {
+      allowedDays = new Set(dowArg.filter((d) => d >= 0 && d <= 6));
+    } else {
+      const includeWeekends = (args.include_weekends as boolean) ?? false;
+      allowedDays = includeWeekends ? new Set([0, 1, 2, 3, 4, 5, 6]) : new Set([1, 2, 3, 4, 5]);
+    }
+
+    // Resolve in-day time window (in minutes-since-midnight)
+    const parseHHMM = (s: string): number | null => {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(s);
+      if (!m) return null;
+      const h = +m[1], mm = +m[2];
+      if (h < 0 || h > 24 || mm < 0 || mm > 59) return null;
+      return h * 60 + mm;
+    };
+    let dayStartMin: number;
+    let dayEndMin: number;
+    const tr = args.time_restriction as { start?: string; end?: string } | undefined;
+    if (tr && tr.start && tr.end) {
+      const a = parseHHMM(tr.start);
+      const b = parseHHMM(tr.end);
+      if (a == null || b == null || a >= b) {
+        return JSON.stringify({ error: `time_restriction invalide: '${tr.start}'–'${tr.end}' (format 'HH:MM' attendu, start < end).` });
+      }
+      dayStartMin = a;
+      dayEndMin = b;
+    } else {
+      const whStart = (args.working_hours_start as number) ?? 9;
+      const whEnd = (args.working_hours_end as number) ?? 18;
+      dayStartMin = whStart * 60;
+      dayEndMin = whEnd * 60;
+    }
 
     // Build final participants list (optionally add the signed-in user)
     const emails = [...participantsArg.map((e) => e.trim()).filter(Boolean)];
@@ -867,75 +1168,138 @@ const executors: Record<string, ToolExecutor> = {
     }
 
     const totalSlots = Math.floor((endDate.getTime() - alignedStart.getTime()) / 60000 / INTERVAL_MIN);
-    // Merge: '0' at index i only if ALL known participants are free at i.
-    // Missing participants are treated as busy to avoid false positives.
-    const merged: string[] = new Array(totalSlots).fill("0");
-    for (const email of emails) {
-      const view = schedById.get(email.toLowerCase());
-      if (!view) {
-        for (let i = 0; i < totalSlots; i++) merged[i] = "2";
-        continue;
-      }
-      for (let i = 0; i < totalSlots; i++) {
-        const c = view[i] ?? "2";
-        if (c !== "0") merged[i] = c;
-      }
+    const slotsNeeded = Math.max(1, Math.ceil(durationMin / INTERVAL_MIN));
+
+    // Per-participant availability views; missing data → treat as fully busy.
+    const participantViews = emails.map((email) => ({
+      email,
+      view: schedById.get(email.toLowerCase()) ?? "2".repeat(totalSlots),
+    }));
+
+    interface ScoredCandidate {
+      start: Date;
+      end: Date;
+      freeEmails: string[];
+      busyEmails: string[];
+      score: number; // === freeEmails.length
     }
 
-    const slotsNeeded = Math.max(1, Math.ceil(durationMin / INTERVAL_MIN));
-    const candidates: Array<{ start: Date; end: Date }> = [];
-    // Track one candidate per day first, then fill up to maxResults
-    const firstPerDay: Array<{ start: Date; end: Date }> = [];
-    const seenDays = new Set<string>();
+    // Walk every valid start position, score each by how many participants are
+    // free for the FULL duration (cells [k, k+slotsNeeded)). Apply day/time
+    // window filters before scoring so we only retain useful candidates.
+    const all: ScoredCandidate[] = [];
+    for (let k = 0; k + slotsNeeded <= totalSlots; k++) {
+      const slotStart = new Date(alignedStart.getTime() + k * INTERVAL_MIN * 60000);
+      const slotEnd = new Date(slotStart.getTime() + durationMin * 60000);
+      if (!allowedDays.has(slotStart.getDay())) continue;
+      if (slotEnd.getDate() !== slotStart.getDate() || slotEnd.getMonth() !== slotStart.getMonth()) continue;
+      const startMinOfDay = slotStart.getHours() * 60 + slotStart.getMinutes();
+      const endMinOfDay = slotEnd.getHours() * 60 + slotEnd.getMinutes();
+      if (startMinOfDay < dayStartMin || endMinOfDay > dayEndMin) continue;
 
-    let i = 0;
-    while (i < totalSlots) {
-      if (merged[i] !== "0") { i++; continue; }
-      let j = i;
-      while (j < totalSlots && merged[j] === "0") j++;
-      // Emit candidate start positions within the free run
-      for (let k = i; k + slotsNeeded <= j; k++) {
-        const slotStart = new Date(alignedStart.getTime() + k * INTERVAL_MIN * 60000);
-        const slotEnd = new Date(slotStart.getTime() + durationMin * 60000);
-        const day = slotStart.getDay();
-        if (!includeWeekends && (day === 0 || day === 6)) continue;
-        if (slotStart.getHours() < whStart) continue;
-        const endHr = slotEnd.getHours();
-        const endMin = slotEnd.getMinutes();
-        if (endHr > whEnd || (endHr === whEnd && endMin > 0)) continue;
-        // also skip slots that spill past the configured end-of-day on a different calendar day
-        if (slotEnd.getDate() !== slotStart.getDate()) continue;
+      const freeEmails: string[] = [];
+      const busyEmails: string[] = [];
+      for (const p of participantViews) {
+        let isFree = true;
+        for (let q = 0; q < slotsNeeded; q++) {
+          if (p.view[k + q] !== "0") { isFree = false; break; }
+        }
+        if (isFree) freeEmails.push(p.email);
+        else busyEmails.push(p.email);
+      }
 
-        const dayKey = slotStart.toISOString().slice(0, 10);
+      all.push({ start: slotStart, end: slotEnd, freeEmails, busyEmails, score: freeEmails.length });
+    }
+
+    const fmtMin = (mins: number) => `${String(Math.floor(mins / 60)).padStart(2, "0")}:${String(mins % 60).padStart(2, "0")}`;
+    const dayNames = ["dim", "lun", "mar", "mer", "jeu", "ven", "sam"];
+    const allowedDaysLabel = [...allowedDays].sort().map((d) => dayNames[d]).join(",");
+    const N = emails.length;
+
+    if (all.length === 0) {
+      return JSON.stringify({
+        participants: emails,
+        total_participants: N,
+        window_start: alignedStart.toISOString(),
+        window_end: endDate.toISOString(),
+        time_window: `${fmtMin(dayStartMin)}–${fmtMin(dayEndMin)}`,
+        allowed_days: allowedDaysLabel,
+        slots_found: 0,
+        all_free_slot_found: false,
+        fallback_mode: false,
+        slots: [],
+        note: "Aucun créneau ne tient dans la fenêtre temporelle/jours autorisés.",
+      });
+    }
+
+    // Bucket by score so we can walk highest → lowest in the fallback case.
+    const tiers = new Map<number, ScoredCandidate[]>();
+    for (const c of all) {
+      if (!tiers.has(c.score)) tiers.set(c.score, []);
+      tiers.get(c.score)!.push(c);
+    }
+    const maxScore = Math.max(...tiers.keys());
+    const allFreeAvailable = maxScore === N;
+
+    // Within a tier: prefer one slot per day first, then chronological filler.
+    const pickFromTier = (tierCandidates: ScoredCandidate[], limit: number): ScoredCandidate[] => {
+      const seenDays = new Set<string>();
+      const firstPerDay: ScoredCandidate[] = [];
+      const rest: ScoredCandidate[] = [];
+      for (const c of tierCandidates) {
+        const dayKey = c.start.toISOString().slice(0, 10);
         if (!seenDays.has(dayKey)) {
           seenDays.add(dayKey);
-          firstPerDay.push({ start: slotStart, end: slotEnd });
+          firstPerDay.push(c);
         } else {
-          candidates.push({ start: slotStart, end: slotEnd });
+          rest.push(c);
         }
       }
-      i = j;
+      return [...firstPerDay, ...rest].slice(0, limit);
+    };
+
+    const result: ScoredCandidate[] = [];
+    if (allFreeAvailable) {
+      // Everyone-free slots exist: only return those (fallback not needed).
+      result.push(...pickFromTier(tiers.get(N)!, maxResults));
+    } else {
+      // No slot fits everyone — walk down score tiers (N-1, N-2, ...).
+      const sortedScores = [...tiers.keys()].sort((a, b) => b - a);
+      for (const score of sortedScores) {
+        const remaining = maxResults - result.length;
+        if (remaining <= 0) break;
+        result.push(...pickFromTier(tiers.get(score)!, remaining));
+      }
     }
 
-    // Combine: one-per-day first (chronological), then fill with remaining
-    const combined = [...firstPerDay, ...candidates].slice(0, maxResults);
-
-    log(`${combined.length} créneau(x) trouvé(s) (${firstPerDay.length} jours distincts)`);
+    log(
+      `${result.length} créneau(x) ${allFreeAvailable ? "tous-libres" : `partiels (max ${maxScore}/${N} libres)`} retournés` +
+      (missing.length > 0 ? ` — ${missing.length} agenda(s) inaccessibles : ${missing.join(", ")}` : "")
+    );
 
     return JSON.stringify({
       participants: emails,
+      include_self: includeSelf,
       duration_minutes: durationMin,
       window_start: alignedStart.toISOString(),
       window_end: endDate.toISOString(),
-      working_hours: `${whStart}h–${whEnd}h`,
-      weekends_included: includeWeekends,
-      slots_found: combined.length,
+      time_window: `${fmtMin(dayStartMin)}–${fmtMin(dayEndMin)}`,
+      allowed_days: allowedDaysLabel,
+      total_participants: N,
+      all_free_slot_found: allFreeAvailable,
+      fallback_mode: !allFreeAvailable,
+      best_score: maxScore,
+      slots_found: result.length,
       missing_data: missing,
-      slots: combined.map((c) => ({
+      slots: result.map((c) => ({
         start: c.start.toISOString(),
         end: c.end.toISOString(),
         startLocal: c.start.toLocaleString("fr-CH", { dateStyle: "full", timeStyle: "short" }),
         endLocal: c.end.toLocaleString("fr-CH", { timeStyle: "short" }),
+        free_count: c.score,
+        busy_count: c.busyEmails.length,
+        free_participants: c.freeEmails,
+        busy_participants: c.busyEmails,
       })),
     });
   },
@@ -1047,7 +1411,7 @@ const executors: Record<string, ToolExecutor> = {
     ];
 
     log(`Analyse des rôles par le LLM...`);
-    const response = await chatCompletion(messages, config.rcp.synthesisModel);
+    const response = await chatCompletion(messages);
     const analysis = response.choices?.[0]?.message?.content || "Analyse non disponible.";
 
     return JSON.stringify({
@@ -1171,7 +1535,7 @@ const executors: Record<string, ToolExecutor> = {
     ];
 
     log(`Génération du point d'avancement par le LLM...`);
-    const response = await chatCompletion(messages, config.rcp.synthesisModel);
+    const response = await chatCompletion(messages);
     const analysis = response.choices?.[0]?.message?.content || "Analyse non disponible.";
 
     return JSON.stringify({
@@ -1218,7 +1582,8 @@ export async function executeTool(
   args: Record<string, unknown>,
   log?: LogFn,
   onProgress?: ToolProgressFn,
-  onStream?: ToolStreamFn
+  onStream?: ToolStreamFn,
+  signal?: AbortSignal
 ): Promise<string> {
   const executor = executors[toolName];
   if (!executor) {
@@ -1231,8 +1596,10 @@ export async function executeTool(
   };
 
   try {
-    return await executor(args, toolLog, onProgress, onStream);
+    return await executor(args, toolLog, onProgress, onStream, signal);
   } catch (err) {
+    // Let abort propagate so the agent loop can bail cleanly.
+    if (err instanceof Error && err.name === "AbortError") throw err;
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[Agent] Tool ${toolName} error:`, message);
     return JSON.stringify({ error: `Erreur lors de l'exécution de ${toolName}: ${message}` });

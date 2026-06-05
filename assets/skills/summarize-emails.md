@@ -19,8 +19,13 @@ L'utilisateur veut un RESUME ou une SYNTHESE de ses echanges email avec quelqu'u
 3. **Afficher le resume** : Affiche le resume retourne par l'outil VERBATIM, tel quel, sans le reformuler.
    - Si le nombre d'emails analyses est faible, mentionne-le et propose d'elargir la periode
 
+4. **Pieces jointes importantes (optionnel, avec parcimonie)** : Le resultat peut contenir un champ `attachments_available` (liste de refs d'emails ayant des pieces jointes, avec sujet et date).
+   - Regarde ces sujets : si une piece jointe semble CENTRALE pour la demande (ex: un document, un rapport, un compte-rendu, un budget, une presentation que le resume mentionne ou dont l'utilisateur a besoin), lis-la avec `read_email_attachments(email_id=<ref>)` puis complete le resume en 2-3 lignes avec ce qu'elle apporte.
+   - LIMITE-TOI a 1-3 pieces jointes maximum, et UNIQUEMENT celles jugees vraiment importantes. Ne lis JAMAIS toutes les pieces jointes « au cas ou » : chaque lecture consomme du contexte.
+   - Si aucune piece jointe ne semble determinante, n'appelle PAS l'outil.
+
 ## Erreurs courantes a eviter
-- Ne PAS utiliser `get_email_interactions` + resumer toi-meme : utilise `summarize_email_interactions` qui fait tout
-- Ne PAS utiliser `show_emails` quand l'utilisateur veut un resume
+- Ne PAS utiliser `get_email_interactions` (qui affiche/liste les emails) + resumer toi-meme : utilise `summarize_email_interactions` qui fait tout
 - Ne PAS reformuler le resume genere par l'outil, affiche-le tel quel
 - Ne PAS oublier `search_contacts` en premier
+- Ne PAS lire les pieces jointes en masse : seulement celles jugees importantes (1-3 max), via `read_email_attachments`

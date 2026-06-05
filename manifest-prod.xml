@@ -7,16 +7,22 @@
   xsi:type="MailApp">
 
   <!-- BEGIN: Add-in metadata -->
-  <Id>e4e7f5a0-1234-4abc-9def-000000000002</Id>
-  <Version>1.0.0.2</Version>
+  <Id>e4e7f5a0-1234-4abc-9def-055500000513</Id>
+  <Version>1.0.1.0</Version>
   <ProviderName>EPFL</ProviderName>
   <DefaultLocale>fr-FR</DefaultLocale>
-  <DisplayName DefaultValue="EPFL Mail AI (Dev)" />
-  <Description DefaultValue="Préparation de réunions et résumé d'emails avec l'IA - Propulsé par RCP EPFL" />
-  <IconUrl DefaultValue="https://localhost:3000/assets/icon-64.png" />
-  <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/icon-128.png" />
+  <DisplayName DefaultValue="EPFL Mail AI Prod" />
+  <Description DefaultValue="Préparation de réunions et résumé d'emails avec l'IA - Propulsé par RCP EPFL Prod" />
+  <IconUrl DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-64.png" />
+  <HighResolutionIconUrl DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-128.png" />
   <SupportUrl DefaultValue="https://github.com/YannickPezeu/outlookLLM-EPFL" />
   <!-- END: Add-in metadata -->
+
+  <AppDomains>
+    <AppDomain>https://inference.rcp.epfl.ch</AppDomain>
+    <AppDomain>https://graph.microsoft.com</AppDomain>
+    <AppDomain>https://login.microsoftonline.com</AppDomain>
+  </AppDomains>
 
   <Hosts>
     <Host Name="Mailbox" />
@@ -31,7 +37,7 @@
   <FormSettings>
     <Form xsi:type="ItemRead">
       <DesktopSettings>
-        <SourceLocation DefaultValue="https://localhost:3000/taskpane.html" />
+        <SourceLocation DefaultValue="https://expert-finder.epfl.ch/outlook/taskpane.html" />
         <RequestedHeight>450</RequestedHeight>
       </DesktopSettings>
     </Form>
@@ -61,7 +67,7 @@
           <!-- Extension point: button in the reading pane -->
           <ExtensionPoint xsi:type="MessageReadCommandSurface">
             <OfficeTab id="TabDefault">
-              <Group id="epflMailAiDevGroup">
+              <Group id="epflMailAiGroup">
                 <Label resid="GroupLabel" />
                 <Control xsi:type="Button" id="openTaskPaneBtn">
                   <Label resid="TaskPaneBtn.Label" />
@@ -85,7 +91,7 @@
           <!-- Extension point: button in the compose/reply pane -->
           <ExtensionPoint xsi:type="MessageComposeCommandSurface">
             <OfficeTab id="TabDefault">
-              <Group id="epflMailAiDevComposeGroup">
+              <Group id="epflMailAiComposeGroup">
                 <Label resid="GroupLabel" />
                 <Control xsi:type="Button" id="openTaskPaneComposeBtn">
                   <Label resid="TaskPaneBtn.Label" />
@@ -109,7 +115,7 @@
           <!-- Extension point: calendar event — when user is an attendee -->
           <ExtensionPoint xsi:type="AppointmentAttendeeCommandSurface">
             <OfficeTab id="TabDefault">
-              <Group id="epflMailAiDevAttendeeGroup">
+              <Group id="epflMailAiAttendeeGroup">
                 <Label resid="GroupLabel" />
                 <Control xsi:type="Button" id="openTaskPaneAttendeeBtn">
                   <Label resid="TaskPaneBtn.Label" />
@@ -134,7 +140,7 @@
           <!-- Extension point: calendar event — when user is the organizer -->
           <ExtensionPoint xsi:type="AppointmentOrganizerCommandSurface">
             <OfficeTab id="TabDefault">
-              <Group id="epflMailAiDevOrganizerGroup">
+              <Group id="epflMailAiOrganizerGroup">
                 <Label resid="GroupLabel" />
                 <Control xsi:type="Button" id="openTaskPaneOrganizerBtn">
                   <Label resid="TaskPaneBtn.Label" />
@@ -161,16 +167,16 @@
 
     <Resources>
       <bt:Images>
-        <bt:Image id="Icon.16x16" DefaultValue="https://localhost:3000/assets/icon-16.png" />
-        <bt:Image id="Icon.32x32" DefaultValue="https://localhost:3000/assets/icon-32.png" />
-        <bt:Image id="Icon.80x80" DefaultValue="https://localhost:3000/assets/icon-80.png" />
+        <bt:Image id="Icon.16x16" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-16.png" />
+        <bt:Image id="Icon.32x32" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-32.png" />
+        <bt:Image id="Icon.80x80" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-80.png" />
       </bt:Images>
       <bt:Urls>
-        <bt:Url id="TaskPane.Url" DefaultValue="https://localhost:3000/taskpane.html" />
+        <bt:Url id="TaskPane.Url" DefaultValue="https://expert-finder.epfl.ch/outlook/taskpane.html" />
       </bt:Urls>
       <bt:ShortStrings>
-        <bt:String id="GroupLabel" DefaultValue="EPFL Mail AI" />
-        <bt:String id="TaskPaneBtn.Label" DefaultValue="EPFL Mail AI" />
+        <bt:String id="GroupLabel" DefaultValue="EPFL Mail AI Prod" />
+        <bt:String id="TaskPaneBtn.Label" DefaultValue="EPFL Mail AI Prod" />
       </bt:ShortStrings>
       <bt:LongStrings>
         <bt:String id="TaskPaneBtn.Tooltip" DefaultValue="Ouvrir l'assistant IA pour préparer vos réunions et résumer vos emails" />
@@ -188,7 +194,7 @@
           <DesktopFormFactor>
             <ExtensionPoint xsi:type="MessageReadCommandSurface">
               <OfficeTab id="TabDefault">
-                <Group id="epflMailAiDevGroupV11">
+                <Group id="epflMailAiGroupV11">
                   <Label resid="GroupLabel" />
                   <Control xsi:type="Button" id="openTaskPaneBtnV11">
                     <Label resid="TaskPaneBtn.Label" />
@@ -211,7 +217,7 @@
             </ExtensionPoint>
             <ExtensionPoint xsi:type="MessageComposeCommandSurface">
               <OfficeTab id="TabDefault">
-                <Group id="epflMailAiDevComposeGroupV11">
+                <Group id="epflMailAiComposeGroupV11">
                   <Label resid="GroupLabel" />
                   <Control xsi:type="Button" id="openTaskPaneComposeBtnV11">
                     <Label resid="TaskPaneBtn.Label" />
@@ -234,7 +240,7 @@
             </ExtensionPoint>
             <ExtensionPoint xsi:type="AppointmentAttendeeCommandSurface">
               <OfficeTab id="TabDefault">
-                <Group id="epflMailAiDevAttendeeGroupV11">
+                <Group id="epflMailAiAttendeeGroupV11">
                   <Label resid="GroupLabel" />
                   <Control xsi:type="Button" id="openTaskPaneAttendeeBtnV11">
                     <Label resid="TaskPaneBtn.Label" />
@@ -257,7 +263,7 @@
             </ExtensionPoint>
             <ExtensionPoint xsi:type="AppointmentOrganizerCommandSurface">
               <OfficeTab id="TabDefault">
-                <Group id="epflMailAiDevOrganizerGroupV11">
+                <Group id="epflMailAiOrganizerGroupV11">
                   <Label resid="GroupLabel" />
                   <Control xsi:type="Button" id="openTaskPaneOrganizerBtnV11">
                     <Label resid="TaskPaneBtn.Label" />
@@ -283,16 +289,16 @@
       </Hosts>
       <Resources>
         <bt:Images>
-          <bt:Image id="Icon.16x16" DefaultValue="https://localhost:3000/assets/icon-16.png" />
-          <bt:Image id="Icon.32x32" DefaultValue="https://localhost:3000/assets/icon-32.png" />
-          <bt:Image id="Icon.80x80" DefaultValue="https://localhost:3000/assets/icon-80.png" />
+          <bt:Image id="Icon.16x16" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-16.png" />
+          <bt:Image id="Icon.32x32" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-32.png" />
+          <bt:Image id="Icon.80x80" DefaultValue="https://expert-finder.epfl.ch/outlook/assets/icon-80.png" />
         </bt:Images>
         <bt:Urls>
-          <bt:Url id="TaskPane.Url" DefaultValue="https://localhost:3000/taskpane.html" />
+          <bt:Url id="TaskPane.Url" DefaultValue="https://expert-finder.epfl.ch/outlook/taskpane.html" />
         </bt:Urls>
         <bt:ShortStrings>
-          <bt:String id="GroupLabel" DefaultValue="EPFL Mail AI" />
-          <bt:String id="TaskPaneBtn.Label" DefaultValue="EPFL Mail AI" />
+          <bt:String id="GroupLabel" DefaultValue="EPFL Mail AI Prod" />
+          <bt:String id="TaskPaneBtn.Label" DefaultValue="EPFL Mail AI Prod" />
         </bt:ShortStrings>
         <bt:LongStrings>
           <bt:String id="TaskPaneBtn.Tooltip" DefaultValue="Ouvrir l'assistant IA pour préparer vos réunions et résumer vos emails" />
