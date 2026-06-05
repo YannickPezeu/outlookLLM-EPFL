@@ -11,3 +11,5 @@ data/
 ADMIN_REQUEST.pdf
 results/
 manifest.zip
+manifest-prod.zip
+src/services/agentTools_backup.ts
