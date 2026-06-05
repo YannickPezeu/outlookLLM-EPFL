@@ -26,11 +26,12 @@ export const config = {
     apiKey: "", // User sets this in the UI settings, or stored in localStorage
     defaultModel: "moonshotai/Kimi-K2.6",
     embeddingModel: "Qwen/Qwen3-Embedding-8B",
-    rerankerModel: "BAAI/bge-reranker-v2-m3",
-    filterModel: "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
+    // Vision-LLM OCR for scanned PDF attachments (image-only pages). Same RCP
+    // endpoint/key as chat — see attachmentService. PaddleOCR-VL handles accented
+    // French far better than Tesseract eng-only (benchmarked in DPO-Agent).
+    ocrModel: "PaddlePaddle/PaddleOCR-VL",
     completionsEndpoint: "/chat/completions",
     embeddingsEndpoint: "/embeddings",
-    rerankEndpoint: "/rerank",
   },
 
   // Feature defaults
@@ -40,8 +41,6 @@ export const config = {
     maxEmailsPerParticipant: 200,
     embeddingTopK: 400,
     embeddingMinPerParticipant: 30,
-    filterThreshold: 6,
-    filterBatchSize: 30,
     recentMonths: 6,
     nonParticipantTopK: 20,
   },

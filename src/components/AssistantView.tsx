@@ -30,6 +30,19 @@ renderer.link = ({ href, text }: { href: string; text: string }) => {
 };
 marked.setOptions({ breaks: true, gfm: true, renderer });
 
+// Disable INDENTED code blocks (lines indented 4+ spaces). The agent's multi-step
+// narration ("Je vais chercher…  Pas de résultat…") often arrives indented across
+// streamed iterations, and CommonMark would render the whole thing as a <pre> code
+// block. We never want that in chat. Fenced code blocks (```) are untouched — they
+// go through the separate `fences` tokenizer.
+marked.use({
+  tokenizer: {
+    code() {
+      return undefined;
+    },
+  },
+});
+
 // ─── Types ──────────────────────────────────────────────────────────
 
 interface ToolTrace {
@@ -104,6 +117,24 @@ const useStyles = makeStyles({
     "& p": {
       margin: "4px 0",
     },
+    // Code blocks (intended, or an accidental ``` fence the model wrapped its
+    // reply in) must WRAP, not force horizontal page scroll in the narrow pane.
+    "& pre": {
+      whiteSpace: "pre-wrap",
+      overflowWrap: "anywhere",
+      wordBreak: "break-word",
+      backgroundColor: tokens.colorNeutralBackground3,
+      padding: "8px",
+      borderRadius: tokens.borderRadiusSmall,
+      margin: "4px 0",
+      maxWidth: "100%",
+      overflowX: "auto",
+    },
+    "& code": {
+      whiteSpace: "pre-wrap",
+      overflowWrap: "anywhere",
+      wordBreak: "break-word",
+    },
     "& .email-link": {
       display: "inline-flex",
       alignItems: "center",
@@ -154,21 +185,25 @@ const useStyles = makeStyles({
   },
   traceToolHeader: {
     display: "flex",
-    alignItems: "center",
+    alignItems: "flex-start",
     gap: "6px",
     fontSize: tokens.fontSizeBase100,
     color: tokens.colorNeutralForeground2,
     marginLeft: "4px",
+    minWidth: 0,
   },
   traceToolArgs: {
     fontFamily: tokens.fontFamilyMonospace,
     fontSize: tokens.fontSizeBase100,
     color: tokens.colorNeutralForeground3,
     opacity: 0.8,
-    maxWidth: "60%",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
+    // Flex child: minWidth:0 lets it shrink so the text WRAPS within the panel
+    // instead of forcing a horizontal scroll (default min-width:auto would keep
+    // the nowrap content at full width and overflow the container).
+    flex: "1 1 auto",
+    minWidth: 0,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
   },
   traceSteps: {
     margin: "2px 0 4px 20px",
@@ -176,6 +211,8 @@ const useStyles = makeStyles({
     listStyle: "disc",
     "& li": {
       margin: "2px 0",
+      overflowWrap: "anywhere",
+      wordBreak: "break-word",
     },
   },
   traceError: {
@@ -321,6 +358,7 @@ const formatToolArgs = (raw?: string): string => {
     if (args.topic) parts.push(`topic: "${String(args.topic).slice(0, 60)}${String(args.topic).length > 60 ? "…" : ""}"`);
     if (args.name) parts.push(`name: "${args.name}"`);
     if (args.query) parts.push(`query: "${args.query}"`);
+    if (args.sender) parts.push(`from: "${args.sender}"`);
     if (args.months) parts.push(`${args.months} mois`);
     if (args.max_emails) parts.push(`max_emails: ${args.max_emails}`);
     if (args.max_people) parts.push(`max_people: ${args.max_people}`);

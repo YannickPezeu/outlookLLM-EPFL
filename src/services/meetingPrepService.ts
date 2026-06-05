@@ -1,7 +1,7 @@
 import { config } from "../config";
 import type { CalendarEvent, LightEmail, EmailMessage, MailDataSource } from "./mailTypes";
 import { batchEmbed, rankBySimilarity } from "./embeddingService";
-import { chatCompletionStream, chatCompletion, ChatMessage, isRelevanceFilterEnabled, getContextBudgetChars } from "./rcpApiService";
+import { chatCompletionStream, ChatMessage, getContextBudgetChars } from "./rcpApiService";
 import { cleanEmailBody } from "./cleanEmailBody";
 import { cleanEmailBodyFull } from "./cleanEmailBody";
 import { getAccount } from "./authService";
@@ -229,7 +229,6 @@ interface RankedEmail {
   cleanBody?: string;
   cleanBodyFull?: string;
   fullEmail?: EmailMessage;
-  relevanceScore?: number;     // Set after relevance filter (Phase 4)
 }
 
 // Step 1 — flatten participant buckets, dedup by email id, then dedup by
@@ -504,141 +503,6 @@ async function embedAndRank(
   return topRanked;
 }
 
-// ─── Phase 4: Relevance Filter ──────────────────────────────────────
-
-const RELEVANCE_FILTER_SYSTEM_PROMPT = `Tu es un assistant expert qui filtre des emails avant une réunion.
-
-CONTEXTE : Les participants à cette réunion travaillent sur PLUSIEURS projets différents. Tu vas recevoir des emails échangés avec ces participants — certains sont utiles pour préparer cette réunion, d'autres non.
-
-CRITÈRE : L'email contient-il de l'information exploitable pour rédiger un briefing de cette réunion ?
-
-Échelle :
-- 9-10 : Indispensable. Décisions, résultats, problèmes critiques directement liés à la réunion.
-  Ex: "Les tests montrent une réduction de 40% de latence. Je recommande la prod."
-  Ex: "Le budget est réduit de 30%. Il faut couper le module NLP ou reporter."
-- 7-8 : Très utile. Avancées concrètes, engagements, questions ouvertes.
-  Ex: "L'intégration du module multilingue avance. Résultats FR/DE prometteurs."
-  Ex: "Le partenariat Milano est confirmé. 3 datasets d'ici fin mars."
-- 5-6 : Contexte secondaire. Logistique, coordination informative.
-  Ex: "Salle BC 410 réservée pour la démo du 20 mars."
-  Ex: "Budget GPU restant : 12'000 CHF. Arbitrage nécessaire."
-- 3-4 : Faible valeur. Accusés de réception, relances sans contenu.
-  Ex: "OK pour mardi."
-  Ex: "Bien reçu, on en parle jeudi."
-- 1-2 : Quasi inutile.
-- 0 : Aucun rapport avec la réunion.
-
-Réponds UNIQUEMENT en JSON : [{"index":0,"score":7},{"index":1,"score":3}, ...]`;
-
-async function filterByRelevance(
-  rankedEmails: RankedEmail[],
-  event: CalendarEvent,
-  participants: Participant[],
-  onProgress: ProgressCallback
-): Promise<RankedEmail[]> {
-  const BATCH_SIZE = config.defaults.filterBatchSize;
-  const THRESHOLD = config.defaults.filterThreshold;
-  const MAX_BODY_CHARS = 3000; // Cap body for context window safety
-  const CONCURRENCY = 5; // Parallel RCP calls (key supports ≥5 concurrent)
-
-  const participantNames = participants.map((p) => p.name).join(", ");
-  const eventDate = new Date(event.start.dateTime).toLocaleDateString("fr-FR");
-
-  // Build all batches up front so workers can pull from a shared queue.
-  const batches: RankedEmail[][] = [];
-  for (let i = 0; i < rankedEmails.length; i += BATCH_SIZE) {
-    batches.push(rankedEmails.slice(i, i + BATCH_SIZE));
-  }
-
-  onProgress({
-    phase: "filtering_emails",
-    message: `Filtrage intelligent de ${rankedEmails.length} emails (filtrage de pertinence, ${CONCURRENCY} appels en parallèle)...`,
-    percent: 50,
-  });
-
-  let scored = 0;
-  let parseFails = 0;
-  let batchesDone = 0;
-  let nextBatchIdx = 0; // shared index, incremented atomically by workers
-
-  async function processBatch(batch: RankedEmail[], batchNum: number): Promise<void> {
-    const emailsStr = batch.map((r, idx) => {
-      const body = (r.cleanBodyFull || r.cleanBody || r.email.bodyPreview).slice(0, MAX_BODY_CHARS);
-      return `[${idx}] Sujet: ${r.email.subject}\n${body}`;
-    }).join("\n\n---\n\n");
-
-    const userPrompt =
-      `## Réunion\nSujet : ${event.subject}\nDate : ${eventDate}\n` +
-      `Participants : ${participantNames}\n\n` +
-      `## Emails à noter\n\n${emailsStr}\n\nNote chaque email de 0 à 10.`;
-
-    const messages: ChatMessage[] = [
-      { role: "system", content: RELEVANCE_FILTER_SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ];
-
-    try {
-      const response = await chatCompletion(messages, config.rcp.filterModel);
-      const text = response.choices?.[0]?.message?.content || "";
-      const match = text.match(/\[[\s\S]*\]/);
-      if (match) {
-        const arr = JSON.parse(match[0]) as Array<{ index: number; score: number }>;
-        for (const s of arr) {
-          if (typeof s.index === "number" && s.index >= 0 && s.index < batch.length) {
-            batch[s.index].relevanceScore = s.score;
-            scored++;
-          }
-        }
-      } else {
-        parseFails++;
-        console.warn(`[MeetingPrep] Phase 4 — relevance filter parse fail on batch ${batchNum}`);
-      }
-    } catch (err) {
-      parseFails++;
-      console.warn(`[MeetingPrep] Phase 4 — relevance filter error on batch ${batchNum}:`, err);
-    }
-  }
-
-  async function worker(): Promise<void> {
-    while (true) {
-      const myIdx = nextBatchIdx++;
-      if (myIdx >= batches.length) return;
-      await processBatch(batches[myIdx], myIdx + 1);
-      batchesDone++;
-      const emailsAnalyzed = Math.min(batchesDone * BATCH_SIZE, rankedEmails.length);
-      onProgress({
-        phase: "filtering_emails",
-        message: `Filtrage : ${emailsAnalyzed}/${rankedEmails.length} emails analysés (${batchesDone}/${batches.length} batches)...`,
-        percent: 50 + (batchesDone / batches.length) * 12,
-      });
-    }
-  }
-
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batches.length) }, () => worker()));
-
-  // Filter by threshold
-  const filtered = rankedEmails.filter((r) => (r.relevanceScore ?? 0) >= THRESHOLD);
-
-  // Sort by relevance score desc (best first)
-  filtered.sort((a, b) => (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0));
-
-  console.log(`[MeetingPrep] Phase 4 — filtrage de pertinence: ${rankedEmails.length} → ${filtered.length} emails ` +
-    `(seuil≥${THRESHOLD}, scored=${scored}, parseFails=${parseFails})`);
-  console.log(`[MeetingPrep] Phase 4 — Score distribution: ` +
-    `≥9: ${rankedEmails.filter((r) => (r.relevanceScore ?? 0) >= 9).length}, ` +
-    `7-8: ${rankedEmails.filter((r) => (r.relevanceScore ?? 0) >= 7 && (r.relevanceScore ?? 0) < 9).length}, ` +
-    `5-6: ${rankedEmails.filter((r) => (r.relevanceScore ?? 0) >= 5 && (r.relevanceScore ?? 0) < 7).length}, ` +
-    `<5: ${rankedEmails.filter((r) => (r.relevanceScore ?? 0) < 5).length}`);
-
-  onProgress({
-    phase: "filtering_emails",
-    message: `${filtered.length} emails retenus après filtrage intelligent`,
-    percent: 62,
-  });
-
-  return filtered;
-}
-
 // ─── Phase 5: Non-Participant Email Search ──────────────────────────
 
 async function searchNonParticipantEmails(
@@ -741,9 +605,8 @@ function formatEmailBlock(r: RankedEmail): string {
   const e = r.fullEmail || r.email;
   const from = e.from?.emailAddress?.address || "inconnu";
   const date = new Date(e.receivedDateTime).toLocaleDateString("fr-FR");
-  const relevanceTag = r.relevanceScore !== undefined ? ` [pertinence: ${r.relevanceScore}/10]` : "";
   const bodyText = r.cleanBodyFull || r.cleanBody || e.bodyPreview;
-  let text = `[${date}] De: ${from} | Sujet: ${e.subject}${relevanceTag}\n${bodyText}`;
+  let text = `[${date}] De: ${from} | Sujet: ${e.subject}\n${bodyText}`;
 
   const full = r.fullEmail;
   if (full?.attachmentTexts && full.attachmentTexts.length > 0) {
@@ -1079,10 +942,10 @@ function buildTraceLog(
 
   for (const p of participants) {
     const emails = byParticipant.get(p.email) || [];
-    lines.push(`\n--- Emails de ${p.name} (${emails.length} retenus, seuil≥${config.defaults.filterThreshold}) ---`);
+    lines.push(`\n--- Emails de ${p.name} (${emails.length}) ---`);
     for (const r of emails) {
       const date = new Date(r.email.receivedDateTime).toLocaleDateString("fr-FR");
-      lines.push(`  [pertinence=${r.relevanceScore ?? "?"}] ${date} | ${r.email.subject}`);
+      lines.push(`  ${date} | ${r.email.subject}`);
     }
   }
 
@@ -1110,7 +973,8 @@ function buildTraceLog(
  *           (3b) Fetch full bodies (per-id, concurrency=4) → clean
  *           (3c) Embed on cleanBody[:10000] → rank → per-participant quota
  *                + global fill → top 400
- *   Phase 4: Relevance filter — Mistral Small (5 calls in parallel, batch 30, threshold ≥ 6)
+ *   (The former Mistral relevance filter is gone — the top embedding-ranked
+ *    emails that fit the model's context budget are loaded directly, see below.)
  *   Phase 5: Non-participant email search (Graph $search → embed → top 20)
  *   Phase 6: Per-participant summaries (modèle principal)
  *   Phase 7: Non-participant summary (modèle principal)
@@ -1122,9 +986,6 @@ export async function prepareMeeting(
   onProgress: ProgressCallback,
   onStream: StreamCallback
 ): Promise<MeetingBriefing> {
-  // Phase 4 now runs on Mistral Small (config.rcp.filterModel), which RCP keeps
-  // warm — no cold-start to hide, so the former Gemma E2B warmup is gone.
-
   // Phase 1: Extract context
   const { event, participants, query } = await extractContext(ds, eventId, onProgress);
 

@@ -7,9 +7,9 @@ import {
   makeStyles,
   tokens,
   Badge,
-  Switch,
   Textarea,
   InfoLabel,
+  Switch,
 } from "@fluentui/react-components";
 import { Settings24Regular, Checkmark24Regular } from "@fluentui/react-icons";
 import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
@@ -62,11 +62,12 @@ export const SettingsView: React.FC = () => {
   const [rcpUrl, setRcpUrl] = useState("");
   const [rcpKey, setRcpKey] = useState("");
   const [rcpModel, setRcpModel] = useState("");
-  const [relevanceFilterEnabled, setRelevanceFilterEnabled] = useState(true);
   const [customPrompt, setCustomPrompt] = useState("");
   // True when the user picked "Autre…" to type a model not in the preset list.
   const [customModelMode, setCustomModelMode] = useState(false);
   const [graphToken, setGraphToken] = useState("");
+  // OCR for scanned PDF attachments. On unless explicitly disabled (see attachmentService).
+  const [ocrEnabled, setOcrEnabled] = useState(true);
   const [saved, setSaved] = useState(false);
   // Don't persist during the initial load (when state is populated from storage),
   // otherwise the auto-save effect would fire and re-write the same values.
@@ -78,25 +79,28 @@ export const SettingsView: React.FC = () => {
     setRcpUrl(settings.baseUrl);
     setRcpKey(settings.apiKey);
     setRcpModel(settings.model);
-    setRelevanceFilterEnabled(settings.relevanceFilterEnabled);
     setCustomPrompt(settings.customPrompt);
     setGraphToken(localStorage.getItem("graph_dev_token") || "");
+    setOcrEnabled(localStorage.getItem("ocr_enabled") !== "false");
     loadedRef.current = true;
   }, []);
 
   // Auto-save on every change once the initial values are loaded.
   useEffect(() => {
     if (!loadedRef.current) return;
-    saveRcpSettings(rcpUrl, rcpKey, rcpModel, relevanceFilterEnabled, customPrompt);
+    saveRcpSettings(rcpUrl, rcpKey, rcpModel, customPrompt);
     if (graphToken.trim()) {
       localStorage.setItem("graph_dev_token", graphToken.trim());
     } else {
       localStorage.removeItem("graph_dev_token");
     }
+    // Store only the "off" state — absence of the key means OCR is on (default).
+    if (ocrEnabled) localStorage.removeItem("ocr_enabled");
+    else localStorage.setItem("ocr_enabled", "false");
     setSaved(true);
     clearTimeout(savedTimer.current);
     savedTimer.current = setTimeout(() => setSaved(false), 1500);
-  }, [rcpUrl, rcpKey, rcpModel, relevanceFilterEnabled, customPrompt, graphToken]);
+  }, [rcpUrl, rcpKey, rcpModel, customPrompt, graphToken, ocrEnabled]);
 
   const account = getAccount();
 
@@ -286,15 +290,25 @@ export const SettingsView: React.FC = () => {
         </div>
 
         <div className={styles.field}>
+          <InfoLabel
+            size="small"
+            info={
+              <>
+                Pour les PDF scannés (sans couche texte), reconnaît le texte des
+                pages-images via le modèle vision PaddleOCR-VL de l'API RCP. Ne se
+                déclenche que sur les pages sans texte natif. Plus lent (~1–12 s par
+                page scannée) et consomme l'API — désactivez-le si vous ne traitez
+                jamais de documents scannés.
+              </>
+            }
+          >
+            OCR des pièces jointes scannées
+          </InfoLabel>
           <Switch
-            checked={relevanceFilterEnabled}
-            onChange={(_, data) => setRelevanceFilterEnabled(data.checked)}
-            label="Filtrage de pertinence (préparation de réunion)"
+            checked={ocrEnabled}
+            onChange={(_, data) => setOcrEnabled(data.checked)}
+            label={ocrEnabled ? "Activé" : "Désactivé"}
           />
-          <Text size={100}>
-            Désactiver pour accélérer la préparation de réunion (skip Phase 4).
-            Qualité du tri légèrement réduite — utile pour les tests.
-          </Text>
         </div>
 
         <div className={styles.row}>

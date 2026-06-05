@@ -38,6 +38,7 @@ export interface LightEmail {
   id: string;
   subject: string;
   bodyPreview: string;
+  body?: { contentType: string; content: string };
   from?: { emailAddress: { name: string; address: string } };
   toRecipients?: Array<{ emailAddress: { name: string; address: string } }>;
   receivedDateTime: string;
@@ -983,31 +984,52 @@ export async function searchContactsByName(
 
 /**
  * Full-text search across all messages.
+ *
+ * `sender` (optional) restricts to emails FROM a given person (name or address),
+ * combined with the free-text query in a SINGLE Graph $search via the KQL
+ * `from:` operator — so "from:matéo docling" is one fast request, no embeddings.
  */
 export async function searchEmails(
   query: string,
   maxResults = 20,
-  dateRange?: DateRange
+  dateRange?: DateRange,
+  sender?: string
 ): Promise<LightEmail[]> {
-  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId,hasAttachments";
+  // Include `body` in the projection so the search returns the full content in
+  // the SAME paginated request (like searchEmailsFromSender) — no per-email
+  // fetch. Lets callers read the actual content (e.g. extract a URL).
+  const select = "id,subject,bodyPreview,body,from,toRecipients,receivedDateTime,conversationId,hasAttachments";
 
   if (dateRange) {
-    // Can't combine $search + $filter on messages, so $filter date + post-filter text client-side
+    // Can't combine $search + $filter on messages, so $filter date + post-filter
+    // text client-side. Sender is also matched client-side here (against from
+    // name/address). The body is in the projection, so deep matches count too.
     const dateFilter = buildDateFilter(dateRange);
     const url = `${GRAPH}/me/messages?$filter=${encodeURI(dateFilter)}&$orderby=receivedDateTime desc&$select=${select}&$top=50`;
     const results = await fetchAllPages<LightEmail>(url, 1000);
     const lower = query.toLowerCase();
-    const filtered = results.filter(e =>
-      e.subject?.toLowerCase().includes(lower) ||
-      e.bodyPreview?.toLowerCase().includes(lower) ||
-      e.from?.emailAddress?.name?.toLowerCase().includes(lower) ||
-      e.from?.emailAddress?.address?.toLowerCase().includes(lower)
-    );
+    const senderLower = sender?.toLowerCase();
+    const filtered = results.filter(e => {
+      const textMatch = !lower ||
+        e.subject?.toLowerCase().includes(lower) ||
+        e.bodyPreview?.toLowerCase().includes(lower) ||
+        e.body?.content?.toLowerCase().includes(lower) ||
+        e.from?.emailAddress?.name?.toLowerCase().includes(lower) ||
+        e.from?.emailAddress?.address?.toLowerCase().includes(lower);
+      const senderMatch = !senderLower ||
+        e.from?.emailAddress?.name?.toLowerCase().includes(senderLower) ||
+        e.from?.emailAddress?.address?.toLowerCase().includes(senderLower);
+      return textMatch && senderMatch;
+    });
     return filtered.slice(0, maxResults);
   }
 
-  const encodedQuery = encodeURIComponent(query);
-  const url = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=${select}&$top=50`;
+  // KQL: `from:<sender>` narrows to the sender, ANDed with the free-text query.
+  // Quote the sender if it contains spaces (e.g. a full name) so KQL treats it
+  // as one phrase rather than two terms.
+  const fromClause = sender ? `from:${/\s/.test(sender) ? `"${sender}"` : sender} ` : "";
+  const kql = `${fromClause}${query}`.trim();
+  const url = `${GRAPH}/me/messages?$search="${encodeURIComponent(kql)}"&$select=${select}&$top=50`;
   return fetchAllPages<LightEmail>(url, maxResults);
 }
 

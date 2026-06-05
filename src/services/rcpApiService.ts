@@ -449,6 +449,71 @@ export async function chatCompletionWithToolsStream(
   };
 }
 
+// ─── OCR (vision LLM) ────────────────────────────────────────────────
+
+// Prompt mirrors DPO-Agent's PaddleOCR-VL prompt: raw text, no commentary, no
+// markdown fences, reading order preserved.
+const OCR_PROMPT =
+  "OCR this page. Return the full text exactly as written, preserving line " +
+  "breaks and reading order. No commentary, no markdown fences.";
+
+// A dense A4 French page ≈ 1000 completion tokens; 6000 gives headroom without
+// making a runaway repetition loop dramatically worse (attachmentService's
+// degenerate-output detector is the real safety net).
+const OCR_MAX_TOKENS = 6000;
+
+/**
+ * OCR a single page image via the RCP vision model (PaddleOCR-VL).
+ * `imageDataUrl` must be a full data URL (e.g. "data:image/png;base64,...").
+ * Returns the extracted text, or throws on network/HTTP/parse failure so the
+ * caller can fall back (skip the page) rather than poison the result silently.
+ */
+export async function ocrImageViaRcp(
+  imageDataUrl: string,
+  signal?: AbortSignal
+): Promise<string> {
+  const cfg = getRcpConfig();
+
+  if (!cfg.apiKey) {
+    throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
+  }
+
+  const body = {
+    model: config.rcp.ocrModel,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: OCR_PROMPT },
+          { type: "image_url", image_url: { url: imageDataUrl } },
+        ],
+      },
+    ],
+    max_tokens: OCR_MAX_TOKENS,
+    temperature: 0,
+    stream: false,
+  };
+
+  const response = await fetch(`${cfg.baseUrl}${config.rcp.completionsEndpoint}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${cfg.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`RCP OCR error ${response.status}: ${errorText}`);
+  }
+
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  return typeof text === "string" ? text.trim() : "";
+}
+
 // ─── High-level functions ────────────────────────────────────────────
 
 /**
@@ -542,138 +607,17 @@ export async function summarizeInteractions(
   return extractContent(response);
 }
 
-// ─── Reranker (BAAI/bge-reranker-v2-m3) ─────────────────────────────
-
-interface RerankApiResponse {
-  id: string;
-  results: Array<{
-    index: number;
-    relevance_score: number;
-    document?: { text: string };
-  }>;
-}
-
-export interface RerankResult {
-  index: number;
-  score: number;
-}
-
-function isRerankLengthError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /maximum context length|context length is|exceeds.*tokens|too long/i.test(msg);
-}
-
-async function callRerankApi(query: string, documents: string[], model: string): Promise<RerankResult[]> {
-  const cfg = getRcpConfig();
-  if (!cfg.apiKey) {
-    throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
-  }
-
-  const response = await fetch(`${cfg.baseUrl}${config.rcp.rerankEndpoint}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${cfg.apiKey}`,
-    },
-    body: JSON.stringify({ model, query, documents }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`RCP rerank error ${response.status}: ${errorText}`);
-  }
-
-  const json: RerankApiResponse = await response.json();
-  return json.results.map((r) => ({ index: r.index, score: r.relevance_score }));
-}
-
-const RERANK_BATCH_SIZE = 50;
-
-/**
- * Rerank a single batch, with token-level truncation on length error.
- */
-async function rerankBatchWithRetry(
-  query: string,
-  documents: string[],
-  model: string
-): Promise<RerankResult[]> {
-  try {
-    return await callRerankApi(query, documents, model);
-  } catch (err) {
-    if (!isRerankLengthError(err)) throw err;
-
-    console.log(`[Rerank] Length error on batch of ${documents.length}, truncating with char limit fallback...`);
-
-    // Simple char-based truncation instead of tokenizer (which hangs on large docs)
-    const MAX_DOC_CHARS = 10000;
-    const MAX_QUERY_CHARS = 2000;
-
-    const truncQuery = query.length > MAX_QUERY_CHARS ? query.slice(0, MAX_QUERY_CHARS) : query;
-    let truncCount = 0;
-    const truncDocs = documents.map((d) => {
-      if (d.length > MAX_DOC_CHARS) {
-        truncCount++;
-        return d.slice(0, MAX_DOC_CHARS);
-      }
-      return d;
-    });
-    console.log(`[Rerank] Truncated ${truncCount}/${documents.length} docs to ${MAX_DOC_CHARS} chars (query: ${truncQuery.length} chars)`);
-
-    return await callRerankApi(truncQuery, truncDocs, model);
-  }
-}
-
-/**
- * Rerank documents against a query using BAAI/bge-reranker-v2-m3.
- *
- * Splits documents into batches of 50 to avoid socket errors on large payloads.
- * Each batch is scored independently, then results are merged and sorted globally.
- *
- * Returns results sorted by relevance_score descending.
- */
-export async function rerank(
-  query: string,
-  documents: string[],
-  model: string = config.rcp.rerankerModel
-): Promise<RerankResult[]> {
-  if (documents.length === 0) return [];
-
-  if (documents.length <= RERANK_BATCH_SIZE) {
-    return await rerankBatchWithRetry(query, documents, model);
-  }
-
-  console.log(`[Rerank] Splitting ${documents.length} docs into batches of ${RERANK_BATCH_SIZE}`);
-  const allResults: RerankResult[] = [];
-
-  for (let i = 0; i < documents.length; i += RERANK_BATCH_SIZE) {
-    const batchDocs = documents.slice(i, i + RERANK_BATCH_SIZE);
-    const batchResults = await rerankBatchWithRetry(query, batchDocs, model);
-    for (const r of batchResults) {
-      allResults.push({ index: i + r.index, score: r.score });
-    }
-  }
-
-  allResults.sort((a, b) => b.score - a.score);
-  return allResults;
-}
-
 // ─── Settings persistence ────────────────────────────────────────────
 
 export function saveRcpSettings(
   baseUrl: string,
   apiKey: string,
   model: string,
-  relevanceFilterEnabled?: boolean,
   customPrompt?: string
 ): void {
   localStorage.setItem("rcp_base_url", baseUrl);
   localStorage.setItem("rcp_api_key", apiKey);
   localStorage.setItem("rcp_model", model);
-  if (typeof relevanceFilterEnabled === "boolean") {
-    // Storage key kept as "rcp_gemma_filter_enabled" for backward compat — don't
-    // rename it or existing users' disabled setting silently resets to enabled.
-    localStorage.setItem("rcp_gemma_filter_enabled", relevanceFilterEnabled ? "1" : "0");
-  }
   if (typeof customPrompt === "string") {
     const trimmed = customPrompt.trim();
     if (trimmed) localStorage.setItem("user_custom_prompt", trimmed);
@@ -685,12 +629,10 @@ export function loadRcpSettings(): {
   baseUrl: string;
   apiKey: string;
   model: string;
-  relevanceFilterEnabled: boolean;
   customPrompt: string;
 } {
   return {
     ...getRcpConfig(),
-    relevanceFilterEnabled: isRelevanceFilterEnabled(),
     customPrompt: getUserCustomPrompt(),
   };
 }
@@ -702,12 +644,4 @@ export function loadRcpSettings(): {
  */
 export function getUserCustomPrompt(): string {
   return localStorage.getItem("user_custom_prompt") || "";
-}
-
-/**
- * Whether the relevance-filter pass (meeting prep Phase 4) is enabled.
- * Default: true. Disable for faster runs in testing at the cost of relevance precision.
- */
-export function isRelevanceFilterEnabled(): boolean {
-  return localStorage.getItem("rcp_gemma_filter_enabled") !== "0";
 }

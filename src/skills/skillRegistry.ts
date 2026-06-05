@@ -14,9 +14,9 @@ export interface SkillMeta {
 export const SKILL_CATALOG: SkillMeta[] = [
   {
     id: "show_emails",
-    name: "Afficher les emails d'un contact",
+    name: "Afficher / rechercher des emails",
     description:
-      "Quand l'utilisateur veut VOIR, MONTRER ou AFFICHER ses emails avec quelqu'un",
+      "Quand l'utilisateur veut VOIR, MONTRER, AFFICHER ou TROUVER des emails — soit avec un contact, soit par sujet/mot-clé dans toute sa boîte (ex: 'trouve mes mails qui parlent de docling', 'le mail avec l'endpoint RCP')",
     file: "show-emails.md",
     tools: [
       "get_email_interactions",
