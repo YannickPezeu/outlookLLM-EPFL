@@ -1,4 +1,4 @@
-import { getGraphToken } from "./authService";
+import { getGraphToken, markAuthFailed } from "./authService";
 import { config } from "../config";
 import { distance as levenshtein } from "fastest-levenshtein";
 import type { ParticipantCollectStats } from "./mailTypes";
@@ -168,7 +168,16 @@ async function graphFetch<T>(
   }
 
   if (response.status === 401) {
-    const freshToken = await recoverToken();
+    let freshToken: string;
+    try {
+      freshToken = await recoverToken();
+    } catch (err) {
+      // Token recovery itself failed (silent refresh + interactive both gave up):
+      // the session is broken, not a transient blip. Flip the auth badge so the
+      // user sees "Non connecté" and can hit "Reconnecter".
+      markAuthFailed();
+      throw err;
+    }
     const retry = await fetch(url, {
       ...options,
       headers: {
@@ -180,6 +189,9 @@ async function graphFetch<T>(
     if (!retry.ok) {
       const errorBody = await retry.text();
       console.error(`[Graph] Error ${retry.status} after token recovery:`, errorBody);
+      // A 401 even with a freshly-refreshed token means the session is genuinely
+      // broken (revoked/expired refresh token) — surface it in the UI.
+      if (retry.status === 401) markAuthFailed();
       throw new Error(`Graph API error ${retry.status}: ${errorBody}`);
     }
     return retry.json();

@@ -30,6 +30,12 @@ let tokenAuthenticated = false;
 // MSAL account cache survives. This flag makes the sign-out stick in the UI
 // until the next successful token acquisition.
 let userSignedOut = false;
+// Set when a Graph call keeps getting 401 even after a forced token refresh:
+// the session is genuinely broken (expired/revoked refresh token, dead broker
+// session) while the MSAL account cache still survives. Without this, the badge
+// stays "Connecté" because getAccount() returns a cached account. This flag makes
+// the UI honestly show "Non connecté" until the next successful token acquisition.
+let authFailed = false;
 const authListeners = new Set<() => void>();
 
 /**
@@ -46,9 +52,10 @@ function notifyAuthChanged(): void {
 
 /** Record a successful token acquisition and surface the account to MSAL's cache. */
 function markAuthenticated(result: AuthenticationResult): void {
-  const wasAuthenticated = tokenAuthenticated && !userSignedOut;
+  const wasAuthenticated = tokenAuthenticated && !userSignedOut && !authFailed;
   tokenAuthenticated = true;
   userSignedOut = false;
+  authFailed = false;
   if (result.account) {
     try {
       msalInstance?.setActiveAccount(result.account);
@@ -57,6 +64,19 @@ function markAuthenticated(result: AuthenticationResult): void {
     }
   }
   if (!wasAuthenticated) notifyAuthChanged();
+}
+
+/**
+ * Record that the session is genuinely broken — called by the Graph client when
+ * a request keeps returning 401 even after a forced token refresh. Flips the auth
+ * badge to "Non connecté" so the user can trigger reconnect(); cleared on the next
+ * successful token acquisition (markAuthenticated).
+ */
+export function markAuthFailed(): void {
+  if (authFailed) return;
+  authFailed = true;
+  tokenAuthenticated = false;
+  notifyAuthChanged();
 }
 
 /**
@@ -265,13 +285,21 @@ export async function signOut(): Promise<void> {
  */
 export async function reconnect(): Promise<void> {
   userSignedOut = false;
+  authFailed = false;
   tokenAuthenticated = false;
   localStorage.removeItem("graph_popout_token");
   // Reflect the "reconnecting" state immediately in the UI.
   notifyAuthChanged();
-  // forceRefresh bypasses the cached (possibly broken) token; markAuthenticated
-  // inside getGraphToken restores tokenAuthenticated + notifies on success.
-  await getGraphToken(true);
+  try {
+    // forceRefresh bypasses the cached (possibly broken) token; markAuthenticated
+    // inside getGraphToken restores tokenAuthenticated + notifies on success.
+    await getGraphToken(true);
+  } catch (err) {
+    // Reconnection failed (silent + interactive both gave up) — keep the badge
+    // honest at "Non connecté" so the user isn't shown a false "Connecté".
+    markAuthFailed();
+    throw err;
+  }
 }
 
 /**
@@ -279,7 +307,7 @@ export async function reconnect(): Promise<void> {
  * Returns true for MSAL accounts, dev tokens, or relayed popout tokens.
  */
 export function isAuthenticated(): boolean {
-  if (userSignedOut) return false;
+  if (userSignedOut || authFailed) return false;
   if (tokenAuthenticated) return true;
   if (getAccount() !== null) return true;
   if (localStorage.getItem("graph_dev_token")) return true;
