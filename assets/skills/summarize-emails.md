@@ -1,43 +1,44 @@
-# Skill : Resumer les echanges avec un contact
+# Skill : Résumer les échanges avec une/plusieurs personnes
 
 ## Objectif
-L'utilisateur veut un RESUME ou une SYNTHESE de ses echanges email avec quelqu'un, OU faire
-LE POINT / resumer LA SITUATION vis-a-vis d'une PERSONNE (ou de plusieurs personnes nommees).
-La cle : la demande nomme une PERSONNE, pas un projet. (Pour un sujet/dossier sans personne
-nommee, c'est le skill sujet_dossier.)
+L'utilisateur veut un RÉSUMÉ / une SYNTHÈSE de ses échanges email avec une PERSONNE, ou faire LE POINT
+sur ses échanges avec PLUSIEURS personnes nommées. La clé : la demande nomme des PERSONNES, pas un projet.
+(Pour un sujet/dossier sans personne nommée → skill `sujet_dossier`.)
 
-## Plusieurs personnes
-Si l'utilisateur nomme PLUSIEURS personnes (« la situation avec X et Y »), traite-les
-une par une : `search_contacts` puis `summarize_email_interactions` pour CHACUNE, puis
-presente les resumes par personne.
+## Outil unique : `summarize_exchanges`
+Il prend TOUS les emails échangés avec les personnes sur la période (pas de mots-clés — les personnes
+sont le filtre), et produit un résumé + un rapport Word téléchargé. Deux profondeurs :
+- **soft** = résumé global rapide (+ Word : résumé + emails sources cliquables par personne) ;
+- **deep** = analyse approfondie 20-par-20 → Word : chronologie détaillée + épurée + décisions majeures +
+  synthèse, avec liens cliquables (relevé exhaustif et vérifiable).
 
 ## Workflow obligatoire
 
-1. **Identifier le contact** : Utilise `search_contacts` avec le nom mentionne.
-   - Si un seul resultat : utilise-le directement
-   - Si plusieurs resultats : choisis celui dont le nom correspond le mieux
-   - Si aucun resultat : essaie `search_contacts_in_servicedesk`
+### Étape 1 — Cadrer (demander avant de lancer)
+1. **PROFONDEUR** (`mode`) :
+   > « Tu veux un **résumé global rapide**, ou une **analyse approfondie** très précise qui garde une
+   > trace de chaque échange (plus long) ? »
+   - « global / rapide » → `soft` (défaut). « approfondi / précis / exhaustif » → `deep`.
+2. **PÉRIODE** (`start_date` / `end_date`) : demande-la (défaut : 6 derniers mois, fin = aujourd'hui).
+3. **ANGLE D'ATTAQUE** (`focus`) : demande EXPLICITEMENT sous quel angle l'utilisateur veut le résumé
+   (ex : « avancement du projet X », « aspects budgétaires », « relationnel »). **S'il n'a pas d'angle
+   particulier → résumé général** (laisse `focus` vide). Ne devine pas un angle non demandé.
+4. **LANGUE** (`language`) : la langue de l'utilisateur (défaut français).
 
-2. **Generer le resume** : Utilise `summarize_email_interactions` avec le nom et l'email trouves.
-   - Si l'utilisateur mentionne une periode : ajoute start_date/end_date
-   - Si l'utilisateur mentionne un sujet precis : ajoute le parametre `query` pour le filtrage semantique
-   - Par defaut, couvre les 6 derniers mois
-   - Cet outil deduplique les conversations, nettoie le HTML, et genere un resume structure avec to-dos
+### Étape 2 — Résoudre les personnes
+Pour CHAQUE personne nommée, utilise `search_contacts` (puis `search_contacts_in_servicedesk` en repli)
+pour obtenir le **nom complet + l'email exact**. Constitue la liste `people` = [{name, email}, …].
 
-3. **Afficher le resume** : Affiche le resume retourne par l'outil VERBATIM, tel quel, sans le reformuler.
-   - Si le nombre d'emails analyses est faible, mentionne-le et propose d'elargir la periode
-   - **Indique le decompte de provenance** que l'outil retourne : `direct_count` (emails directs
-     avec la personne, dont `received_count` recus + `sent_count` envoyes) et `servicedesk_count`
-     (tickets ServiceDesk la mentionnant). Ex : « Base : 12 emails directs avec Sandrine
-     (8 recus, 4 envoyes) + 5 tickets ServiceDesk la mentionnant. »
+### Étape 3 — Lancer
+Appelle `summarize_exchanges` avec `people`, `mode`, `focus`, `language`, `start_date`/`end_date`.
+Préviens que le deep prend plus de temps.
 
-4. **Pieces jointes importantes (optionnel, avec parcimonie)** : Le resultat peut contenir un champ `attachments_available` (liste de refs d'emails ayant des pieces jointes, avec sujet et date).
-   - Regarde ces sujets : si une piece jointe semble CENTRALE pour la demande (ex: un document, un rapport, un compte-rendu, un budget, une presentation que le resume mentionne ou dont l'utilisateur a besoin), lis-la avec `read_email_attachments(email_id=<ref>)` puis complete le resume en 2-3 lignes avec ce qu'elle apporte.
-   - LIMITE-TOI a 1-3 pieces jointes maximum, et UNIQUEMENT celles jugees vraiment importantes. Ne lis JAMAIS toutes les pieces jointes « au cas ou » : chaque lecture consomme du contexte.
-   - Si aucune piece jointe ne semble determinante, n'appelle PAS l'outil.
+### Après l'outil
+Le résumé est **déjà streamé** (`already_displayed: true`) et le **Word est déjà téléchargé**. Ne recopie
+pas le contenu : termine par une phrase courte (rapport Word téléchargé, `report_downloaded`) et propose
+d'affiner (période, angle, profondeur) si besoin.
 
-## Erreurs courantes a eviter
-- Ne PAS utiliser `get_email_interactions` (qui affiche/liste les emails) + resumer toi-meme : utilise `summarize_email_interactions` qui fait tout
-- Ne PAS reformuler le resume genere par l'outil, affiche-le tel quel
-- Ne PAS oublier `search_contacts` en premier
-- Ne PAS lire les pieces jointes en masse : seulement celles jugees importantes (1-3 max), via `read_email_attachments`
+## Erreurs à éviter
+- Ne PAS oublier `search_contacts` pour obtenir les emails exacts avant `summarize_exchanges`.
+- Ne PAS demander de mots-clés : on prend tous les échanges avec les personnes.
+- Ne PAS reformuler le résumé streamé.

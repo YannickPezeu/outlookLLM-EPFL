@@ -25,6 +25,7 @@ export interface EmailMessage {
   // OWA deep link to open the message in the browser (used for clickable
   // email sources in generated Word reports).
   webLink?: string;
+  conversationId?: string;
 }
 
 export interface GraphAttachment {
@@ -246,7 +247,7 @@ export async function searchEmailsFromSender(
   dateRange?: DateRange,
   onPage?: (itemsSoFar: number) => void
 ): Promise<EmailMessage[]> {
-  const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead,hasAttachments";
+  const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead,hasAttachments,webLink,conversationId";
 
   // Narrow to this sender with $search (reliable for from/to via the search
   // index — unlike $filter on from/emailAddress/address, which under-returns).
@@ -273,7 +274,7 @@ export async function searchEmailsSentTo(
   dateRange?: DateRange,
   onPage?: (itemsSoFar: number) => void
 ): Promise<EmailMessage[]> {
-  const select = "id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId,hasAttachments";
+  const select = "id,subject,bodyPreview,body,toRecipients,sentDateTime,receivedDateTime,parentFolderId,hasAttachments,webLink,conversationId";
 
   // Same reliable approach as searchEmailsFromSender: $search narrows to this
   // recipient (search index), date pushed into the KQL query (sent:start..end)

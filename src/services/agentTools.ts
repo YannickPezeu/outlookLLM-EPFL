@@ -25,6 +25,7 @@ import { GraphMailDataSource } from "./graphMailDataSource";
 import { resolveEmailRef, resolveEmailRefMetadata } from "./emailRefs";
 import { extractTextFromAttachments } from "./attachmentService";
 import { extractTopicDecisions, countTopicEmails } from "./topicDecisionService";
+import { summarizeExchanges } from "./exchangeSummaryService";
 import { exportMeetingReport, exportDecisionReport } from "./exportService";
 
 // ─── Tool Definitions (OpenAI function-calling format) ──────────────
@@ -47,6 +48,7 @@ export const PRESERVED_TOOLS = new Set<string>([
   // the tool RESULT — preserve it so follow-ups ("les points importants ?",
   // "creuse le 2e point") can read the summary the user just saw.
   "summarize_email_interactions",
+  "summarize_exchanges",
   "prepare_meeting",
   "extract_topic_decisions",
   // Keep load_skill calls in history so the agent loop can re-derive which skills
@@ -630,6 +632,63 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           },
         },
         required: ["topic", "keywords", "question", "start_date"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "summarize_exchanges",
+      description:
+        "Résume les échanges email de l'utilisateur avec UNE ou PLUSIEURS personnes nommées. " +
+        "Prend TOUS les emails échangés avec ces personnes sur la période (pas de mots-clés). " +
+        "Deux modes : 'soft' = résumé global rapide (+ rapport Word avec emails sources cliquables par personne) ; " +
+        "'deep' = analyse approfondie 20-par-20 → rapport Word (chronologie détaillée + épurée + décisions majeures + synthèse, liens cliquables). " +
+        "L'angle d'attaque et la profondeur sont choisis par l'utilisateur. " +
+        "Le contenu est streamé (already_displayed) et le Word téléchargé automatiquement. " +
+        "À utiliser pour « résume mes échanges avec X », « fais le point sur X et Y ».",
+      parameters: {
+        type: "object",
+        properties: {
+          people: {
+            type: "array",
+            description: "Les personnes à analyser, résolues via search_contacts (nom + email exact).",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Nom complet de la personne" },
+                email: { type: "string", description: "Adresse email exacte" },
+              },
+              required: ["name", "email"],
+            },
+          },
+          mode: {
+            type: "string",
+            enum: ["soft", "deep"],
+            description:
+              "Profondeur, à DEMANDER à l'utilisateur. 'soft' = résumé global rapide ; " +
+              "'deep' = relevé exhaustif et vérifiable (plus long). Défaut: 'soft'.",
+          },
+          focus: {
+            type: "string",
+            description:
+              "Optionnel : ANGLE D'ATTAQUE choisi par l'utilisateur (ex: 'aspects budgétaires', 'conformité', " +
+              "'avancement du projet X'). En deep, sert aussi de filtre de pertinence. Laisse vide si neutre.",
+          },
+          language: {
+            type: "string",
+            description: "Langue de rédaction, d'après la langue de l'utilisateur (ex: 'français', 'english'). Défaut: français.",
+          },
+          start_date: {
+            type: "string",
+            description: "Début de période (ISO 8601). Demande-la à l'utilisateur. Défaut: 6 derniers mois.",
+          },
+          end_date: {
+            type: "string",
+            description: "Fin de période (ISO 8601). Défaut: aujourd'hui.",
+          },
+        },
+        required: ["people"],
       },
     },
   },
@@ -1841,6 +1900,47 @@ const executors: Record<string, ToolExecutor> = {
       note: result.emailsScanned > 0
         ? "Rapport Word téléchargé (décisions détaillées + liens cliquables vers les emails sources)."
         : "Aucun email trouvé — pas de rapport généré.",
+    });
+  },
+
+  async summarize_exchanges(args, log, onProgress, onStream, signal) {
+    const peopleRaw = (args.people as Array<{ name?: string; email?: string }>) || [];
+    const people = peopleRaw
+      .map((p) => ({ name: String(p?.name || "").trim(), email: String(p?.email || "").trim() }))
+      .filter((p) => p.name && p.email);
+    if (people.length === 0) {
+      return JSON.stringify({ error: "Paramètre requis : people (liste de {name, email}, résolus via search_contacts)." });
+    }
+    const mode = (args.mode as string)?.trim() === "deep" ? "deep" : "soft";
+    const focus = (args.focus as string)?.trim() || undefined;
+    const language = (args.language as string)?.trim() || undefined;
+    const startISO = (args.start_date as string)?.trim() || undefined;
+    const endISO = (args.end_date as string)?.trim() || undefined;
+
+    const result = await summarizeExchanges(
+      { people, mode, focus, language, startISO, endISO },
+      {
+        log,
+        onProgress: (m, p) => {
+          log(`[summarize_exchanges] ${m}`);
+          onProgress?.(`${m}${p != null ? ` (${p}%)` : ""}`);
+        },
+        onStream: (chunk) => onStream?.(chunk),
+        signal,
+      }
+    );
+
+    return JSON.stringify({
+      people: people.map((p) => p.name),
+      people_count: result.peopleCount,
+      emails_scanned: result.emailsScanned,
+      mode: result.mode,
+      report_downloaded: result.reportDownloaded,
+      already_displayed: !!onStream,
+      report: result.chatMarkdown,
+      note: result.emailsScanned > 0
+        ? "Résumé affiché + rapport Word téléchargé (avec emails sources cliquables)."
+        : "Aucun email trouvé.",
     });
   },
 

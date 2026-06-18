@@ -330,6 +330,7 @@ export interface DecisionReport {
   conclusion: string; // §4 — structured self-contained synthesis (markdown, no links)
   language?: string; // report language (localises the static labels below)
   mode?: "deep" | "soft"; // "soft" omits the §1 detailed mail-by-mail timeline
+  title?: string; // full title override (else "<titlePrefix><topic>")
 }
 
 /** One participant block of a meeting-prep report: name + profile + clickable sources. */
@@ -349,6 +350,7 @@ export interface MeetingReport {
   meetingDocs: string[]; // attachment names joined to the event
   language?: string;
   mode?: "deep" | "soft";
+  title?: string; // full title override (else "<mtgTitlePrefix><subject>")
 }
 
 // ─── Static-label localisation ─────────────────────────────────────────
@@ -851,7 +853,7 @@ export async function exportDecisionReport(report: DecisionReport): Promise<void
 
   children.push(
     new Paragraph({
-      children: [new TextRun({ text: `${L.titlePrefix}${report.topic}`, bold: true, size: 34, font: REPORT_FONT })],
+      children: [new TextRun({ text: report.title || `${L.titlePrefix}${report.topic}`, bold: true, size: 34, font: REPORT_FONT })],
       heading: HeadingLevel.TITLE,
       alignment: AlignmentType.CENTER,
       spacing: { after: 120 },
@@ -907,8 +909,8 @@ export async function exportDecisionReport(report: DecisionReport): Promise<void
     sections: [{ children }],
   });
   const blob = await Packer.toBlob(doc);
-  const safeTopic = report.topic.replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 60) || "topic";
-  downloadBlob(blob, `${L.fileWord}_${safeTopic}.docx`);
+  const safeTopic = (report.title || report.topic).replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 60) || "topic";
+  downloadBlob(blob, `${report.title ? safeTopic : `${L.fileWord}_${safeTopic}`}.docx`);
 }
 
 /**
@@ -922,7 +924,7 @@ export async function exportMeetingReport(report: MeetingReport): Promise<void> 
 
   children.push(
     new Paragraph({
-      children: [new TextRun({ text: `${L.mtgTitlePrefix}${report.subject}`, bold: true, size: 34, font: REPORT_FONT })],
+      children: [new TextRun({ text: report.title || `${L.mtgTitlePrefix}${report.subject}`, bold: true, size: 34, font: REPORT_FONT })],
       heading: HeadingLevel.TITLE,
       alignment: AlignmentType.CENTER,
       spacing: { after: 120 },
@@ -1003,8 +1005,8 @@ export async function exportMeetingReport(report: MeetingReport): Promise<void> 
     sections: [{ children }],
   });
   const blob = await Packer.toBlob(doc);
-  const safe = report.subject.replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 60) || "reunion";
-  downloadBlob(blob, `${L.mtgFileWord}_${safe}.docx`);
+  const safe = (report.title || report.subject).replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 60) || "reunion";
+  downloadBlob(blob, `${report.title ? safe : `${L.mtgFileWord}_${safe}`}.docx`);
 }
 
 /** Trigger a file download from a Blob. */

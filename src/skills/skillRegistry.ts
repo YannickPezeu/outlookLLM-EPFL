@@ -39,8 +39,7 @@ export const SKILL_CATALOG: SkillMeta[] = [
       "Pour un SUJET/dossier/projet (pas une personne nommée) → sujet_dossier.",
     file: "summarize-emails.md",
     tools: [
-      "summarize_email_interactions",
-      "read_email_attachments",
+      "summarize_exchanges",
       "search_contacts_in_servicedesk",
     ],
   },
