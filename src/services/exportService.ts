@@ -328,6 +328,25 @@ export interface DecisionReport {
   mode?: "deep" | "soft"; // "soft" omits the §1 detailed mail-by-mail timeline
 }
 
+/** One participant block of a meeting-prep report: name + profile + clickable sources. */
+export interface MeetingParticipantBlock {
+  name: string;
+  profile?: string; // "jobTitle, department"
+  sources: DecisionSource[];
+}
+
+export interface MeetingReport {
+  subject: string;
+  date: string; // display date of the meeting
+  generatedOn: string;
+  briefing: string; // synthesised briefing (markdown, language + angle aware)
+  participants: MeetingParticipantBlock[];
+  externalSources: DecisionSource[]; // non-participant emails used as context
+  meetingDocs: string[]; // attachment names joined to the event
+  language?: string;
+  mode?: "deep" | "soft";
+}
+
 // ─── Static-label localisation ─────────────────────────────────────────
 // The LLM-generated content follows the run's `language`; these structural
 // labels do too, via a small map. Unknown languages fall back to English,
@@ -354,6 +373,15 @@ interface ReportLabels {
   dash: string;
   meetingTag: string;
   attachmentTruncated: string;
+  // Meeting-prep report
+  mtgFileWord: string;
+  mtgTitlePrefix: string;
+  mtgMeta: (date: string, participants: number) => string;
+  secBriefing: string;
+  secParticipants: string;
+  secExternalContext: string;
+  secMeetingDocs: string;
+  lblSourceEmails: string;
 }
 
 const LABELS: Record<Locale, ReportLabels> = {
@@ -377,6 +405,14 @@ const LABELS: Record<Locale, ReportLabels> = {
     dash: "—",
     meetingTag: "[Réunion]",
     attachmentTruncated: "⚠ Pièce jointe partiellement analysée (tronquée) — voir l'email source pour le contenu complet.",
+    mtgFileWord: "Préparation",
+    mtgTitlePrefix: "Préparation de réunion — ",
+    mtgMeta: (d, n) => `Réunion du ${d} · ${n} participant(s)`,
+    secBriefing: "Briefing",
+    secParticipants: "Par participant",
+    secExternalContext: "Contexte externe (hors participants)",
+    secMeetingDocs: "Documents joints à la réunion",
+    lblSourceEmails: "Emails sources :",
   },
   en: {
     fileWord: "Decisions",
@@ -398,6 +434,14 @@ const LABELS: Record<Locale, ReportLabels> = {
     dash: "—",
     meetingTag: "[Meeting]",
     attachmentTruncated: "⚠ Attachment partially analysed (truncated) — see the source email for the full content.",
+    mtgFileWord: "Meeting-prep",
+    mtgTitlePrefix: "Meeting preparation — ",
+    mtgMeta: (d, n) => `Meeting on ${d} · ${n} participant(s)`,
+    secBriefing: "Briefing",
+    secParticipants: "By participant",
+    secExternalContext: "External context (non-participants)",
+    secMeetingDocs: "Meeting attachments",
+    lblSourceEmails: "Source emails:",
   },
   de: {
     fileWord: "Entscheidungen",
@@ -419,6 +463,14 @@ const LABELS: Record<Locale, ReportLabels> = {
     dash: "—",
     meetingTag: "[Besprechung]",
     attachmentTruncated: "⚠ Anhang teilweise analysiert (gekürzt) — vollständiger Inhalt in der Quell-E-Mail.",
+    mtgFileWord: "Besprechungsvorbereitung",
+    mtgTitlePrefix: "Besprechungsvorbereitung — ",
+    mtgMeta: (d, n) => `Besprechung am ${d} · ${n} Teilnehmer`,
+    secBriefing: "Briefing",
+    secParticipants: "Nach Teilnehmer",
+    secExternalContext: "Externer Kontext (Nicht-Teilnehmer)",
+    secMeetingDocs: "Besprechungsanhänge",
+    lblSourceEmails: "Quell-E-Mails:",
   },
   it: {
     fileWord: "Decisioni",
@@ -440,6 +492,14 @@ const LABELS: Record<Locale, ReportLabels> = {
     dash: "—",
     meetingTag: "[Riunione]",
     attachmentTruncated: "⚠ Allegato analizzato solo in parte (troncato) — vedere l'email di origine per il contenuto completo.",
+    mtgFileWord: "Preparazione-riunione",
+    mtgTitlePrefix: "Preparazione riunione — ",
+    mtgMeta: (d, n) => `Riunione del ${d} · ${n} partecipante/i`,
+    secBriefing: "Briefing",
+    secParticipants: "Per partecipante",
+    secExternalContext: "Contesto esterno (non partecipanti)",
+    secMeetingDocs: "Allegati della riunione",
+    lblSourceEmails: "Email di origine:",
   },
   es: {
     fileWord: "Decisiones",
@@ -461,6 +521,14 @@ const LABELS: Record<Locale, ReportLabels> = {
     dash: "—",
     meetingTag: "[Reunión]",
     attachmentTruncated: "⚠ Adjunto analizado parcialmente (truncado) — consulte el correo de origen para el contenido completo.",
+    mtgFileWord: "Preparacion-reunion",
+    mtgTitlePrefix: "Preparación de reunión — ",
+    mtgMeta: (d, n) => `Reunión del ${d} · ${n} participante(s)`,
+    secBriefing: "Briefing",
+    secParticipants: "Por participante",
+    secExternalContext: "Contexto externo (no participantes)",
+    secMeetingDocs: "Adjuntos de la reunión",
+    lblSourceEmails: "Correos de origen:",
   },
 };
 
@@ -777,6 +845,102 @@ export async function exportDecisionReport(report: DecisionReport): Promise<void
   const blob = await Packer.toBlob(doc);
   const safeTopic = report.topic.replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 60) || "topic";
   downloadBlob(blob, `${L.fileWord}_${safeTopic}.docx`);
+}
+
+/**
+ * Build and download a structured meeting-prep report (.docx): synthesised
+ * briefing + per-participant clickable source emails + external context +
+ * meeting documents. Static labels follow report.language.
+ */
+export async function exportMeetingReport(report: MeetingReport): Promise<void> {
+  const L = reportLabels(report.language);
+  const children: Paragraph[] = [];
+
+  children.push(
+    new Paragraph({
+      children: [new TextRun({ text: `${L.mtgTitlePrefix}${report.subject}`, bold: true, size: 34, font: REPORT_FONT })],
+      heading: HeadingLevel.TITLE,
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 120 },
+    })
+  );
+  children.push(
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 60 },
+      children: [
+        new TextRun({
+          text: `${L.mtgMeta(report.date, report.participants.length)} · ${report.generatedOn}`,
+          italics: true,
+          color: "666666",
+          size: 18,
+          font: REPORT_FONT,
+        }),
+      ],
+    })
+  );
+
+  // §1 Briefing (synthesis)
+  children.push(sectionHeading(L.secBriefing));
+  children.push(...richTextBlock(report.briefing || L.dash));
+
+  // §2 By participant — summary handled in the briefing; here, clickable sources.
+  children.push(sectionHeading(L.secParticipants));
+  if (report.participants.length === 0) {
+    children.push(new Paragraph({ children: [new TextRun({ text: L.dash, font: REPORT_FONT })] }));
+  } else {
+    report.participants.forEach((p, i) => {
+      if (i > 0) children.push(separatorParagraph());
+      children.push(
+        new Paragraph({
+          spacing: { before: 160, after: 40 },
+          children: [
+            new TextRun({ text: p.name, size: 26, color: "1F4E79", font: REPORT_FONT }),
+            ...(p.profile ? [new TextRun({ text: `  —  ${p.profile}`, size: 20, color: "666666", font: REPORT_FONT })] : []),
+          ],
+        })
+      );
+      if (p.sources.length > 0) {
+        children.push(
+          new Paragraph({
+            spacing: { after: 20 },
+            children: [new TextRun({ text: L.lblSourceEmails, italics: true, size: 18, color: "666666", font: REPORT_FONT })],
+          })
+        );
+        for (const s of p.sources) children.push(sourceLink(s, L));
+      } else {
+        children.push(new Paragraph({ children: [new TextRun({ text: L.dash, font: REPORT_FONT })] }));
+      }
+    });
+  }
+
+  // §3 External context
+  if (report.externalSources.length > 0) {
+    children.push(sectionHeading(L.secExternalContext));
+    children.push(
+      new Paragraph({
+        spacing: { after: 20 },
+        children: [new TextRun({ text: L.lblSourceEmails, italics: true, size: 18, color: "666666", font: REPORT_FONT })],
+      })
+    );
+    for (const s of report.externalSources) children.push(sourceLink(s, L));
+  }
+
+  // §4 Meeting documents
+  if (report.meetingDocs.length > 0) {
+    children.push(sectionHeading(L.secMeetingDocs));
+    for (const name of report.meetingDocs) {
+      children.push(new Paragraph({ bullet: { level: 0 }, spacing: { after: 20 }, children: [new TextRun({ text: name, font: REPORT_FONT })] }));
+    }
+  }
+
+  const doc = new Document({
+    styles: { default: { document: { run: { font: REPORT_FONT } } } },
+    sections: [{ children }],
+  });
+  const blob = await Packer.toBlob(doc);
+  const safe = report.subject.replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 60) || "reunion";
+  downloadBlob(blob, `${L.mtgFileWord}_${safe}.docx`);
 }
 
 /** Trigger a file download from a Blob. */

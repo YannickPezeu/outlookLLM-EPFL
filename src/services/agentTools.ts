@@ -25,6 +25,7 @@ import { GraphMailDataSource } from "./graphMailDataSource";
 import { resolveEmailRef, resolveEmailRefMetadata } from "./emailRefs";
 import { extractTextFromAttachments } from "./attachmentService";
 import { extractTopicDecisions, countTopicEmails } from "./topicDecisionService";
+import { exportMeetingReport } from "./exportService";
 
 // ─── Tool Definitions (OpenAI function-calling format) ──────────────
 
@@ -349,6 +350,21 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           event_id: {
             type: "string",
             description: "L'identifiant de l'événement calendrier (obtenu via get_calendar_events)",
+          },
+          mode: {
+            type: "string",
+            enum: ["deep", "soft"],
+            description:
+              "Profondeur du briefing. 'deep' = approfondi (recherche hors-participants, pièces jointes des emails, " +
+              "plus d'emails). 'soft' = rapide (sans hors-participants ni PJ d'emails, volume réduit). Défaut: 'deep'.",
+          },
+          language: {
+            type: "string",
+            description: "Langue de rédaction du briefing/rapport, d'après la langue de l'utilisateur (ex: 'français', 'english'). Défaut: français.",
+          },
+          focus: {
+            type: "string",
+            description: "Optionnel : angle/perspective pour orienter le briefing (ex: 'budget', 'aspects techniques', 'conformité'). Laisse vide si neutre.",
           },
         },
         required: ["event_id"],
@@ -1221,8 +1237,11 @@ const executors: Record<string, ToolExecutor> = {
 
   async prepare_meeting(args, log, onProgress, onStream) {
     const eventId = args.event_id as string;
+    const mode = (args.mode as string)?.trim() === "soft" ? "soft" : "deep";
+    const language = (args.language as string)?.trim() || undefined;
+    const focus = (args.focus as string)?.trim() || undefined;
 
-    log("Démarrage de la préparation de réunion...");
+    log(`Démarrage de la préparation de réunion (mode ${mode})...`);
     onProgress?.("Démarrage...");
 
     const ds = new GraphMailDataSource();
@@ -1238,16 +1257,34 @@ const executors: Record<string, ToolExecutor> = {
       // the UI so it appears live instead of accumulating invisibly (~40s blank),
       // and flag already_displayed below so the agent doesn't re-emit the whole
       // briefing on its next turn (which previously caused a double generation).
-      (chunk) => onStream?.(chunk)
+      (chunk) => onStream?.(chunk),
+      { mode, language, focus }
     );
+
+    // Build + download the structured Word report (briefing + clickable sources).
+    let reportDownloaded = false;
+    if (result.participants.length > 0) {
+      try {
+        await exportMeetingReport(result.report);
+        reportDownloaded = true;
+        log("Rapport Word de préparation téléchargé.");
+      } catch (err) {
+        log(`Échec génération du rapport Word : ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
 
     return JSON.stringify({
       event: result.event.subject,
       participants: result.participants.map((p) => p.name),
       participantCount: result.participants.length,
       emailsAnalyzed: result.participantBriefings.reduce((sum, b) => sum + b.emailCount, 0),
+      mode,
+      report_downloaded: reportDownloaded,
       already_displayed: true,
       briefing: result.finalBriefing,
+      note: reportDownloaded
+        ? "Briefing affiché + rapport Word téléchargé (briefing + emails sources cliquables par participant)."
+        : undefined,
     });
   },
 

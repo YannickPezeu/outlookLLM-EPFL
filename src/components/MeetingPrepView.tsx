@@ -30,7 +30,7 @@ import {
 } from "../services/meetingPrepService";
 import { GraphMailDataSource } from "../services/graphMailDataSource";
 import { useOutlookItem } from "./OutlookItemContext";
-import { exportToWord, exportToHtml } from "../services/exportService";
+import { exportToWord, exportToHtml, exportMeetingReport } from "../services/exportService";
 
 /* global Office */
 
@@ -491,9 +491,15 @@ export const MeetingPrepView: React.FC = () => {
             icon={<ArrowDownload24Regular />}
             size="small"
             onClick={() => {
-              const title = eventInfo?.subject || "Briefing";
-              const meta = { date: eventInfo?.date, attendees: eventInfo?.attendees };
-              exportToWord(briefingText, title, meta);
+              // Prefer the structured, source-linked report (briefing + clickable
+              // source emails per participant); fall back to the plain briefing.
+              if (briefingData?.report) {
+                exportMeetingReport(briefingData.report);
+              } else {
+                const title = eventInfo?.subject || "Briefing";
+                const meta = { date: eventInfo?.date, attendees: eventInfo?.attendees };
+                exportToWord(briefingText, title, meta);
+              }
             }}
           >
             Word

@@ -9,6 +9,34 @@ import { getUserByEmail } from "./graphMailService";
 // Dynamic import to avoid pulling pdfjs-dist in Node.js eval environment
 const loadAttachmentService = () => import("./attachmentService");
 import type { AttachmentText } from "./attachmentService";
+import type { MeetingReport, MeetingParticipantBlock, DecisionSource } from "./exportService";
+
+// ─── Report directives (angle + language), threaded into the briefing prompt ──
+// Inlined (not imported from topicDecisionService) to keep this module free of the
+// static attachmentService/pdfjs import that the Node eval environment avoids.
+function focusLine(focus?: string): string {
+  return focus && focus.trim()
+    ? `\nANGLE PRIORITAIRE DEMANDÉ PAR L'UTILISATEUR : « ${focus.trim()} ». ` +
+        "Oriente le briefing sous cet angle en priorité (sans ignorer les autres éléments importants)."
+    : "";
+}
+function langLine(language?: string): string {
+  const lang = language?.trim() || "français";
+  return `\nLANGUE DE RÉDACTION : produis TOUTE ta sortie rédigée en ${lang}.`;
+}
+function buildDirectives(focus?: string, language?: string): string {
+  return focusLine(focus) + langLine(language);
+}
+
+export type MeetingMode = "deep" | "soft";
+
+export interface MeetingPrepOptions {
+  language?: string;
+  focus?: string;
+  mode?: MeetingMode;
+}
+
+const SOFT_MAX_EMAILS = 60; // cap on emails loaded into the briefing in soft mode
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -34,6 +62,9 @@ export interface MeetingBriefing {
   participants: Participant[];
   participantBriefings: ParticipantBriefing[];
   finalBriefing: string;
+  // Structured, source-linked report data (built by the pipeline, rendered to
+  // .docx by exportMeetingReport in the browser).
+  report: MeetingReport;
 }
 
 export type PipelinePhase =
@@ -322,7 +353,8 @@ function flattenAndDedup(
 async function fetchAndCleanBodies(
   ds: MailDataSource,
   items: Array<{ email: LightEmail; participantEmail: string }>,
-  onProgress: ProgressCallback
+  onProgress: ProgressCallback,
+  readAttachments = true
 ): Promise<EnrichedEmail[]> {
   if (items.length === 0) return [];
 
@@ -335,7 +367,7 @@ async function fetchAndCleanBodies(
   const messageIds = items.map((it) => it.email.id);
   const fullEmails = await ds.getEmailsBatch(messageIds);
 
-  const emailsWithAttachments = fullEmails.filter((e) => e.hasAttachments);
+  const emailsWithAttachments = readAttachments ? fullEmails.filter((e) => e.hasAttachments) : [];
   if (emailsWithAttachments.length > 0) {
     onProgress({
       phase: "reading_emails",
@@ -891,6 +923,7 @@ async function generateFinalBriefing(
   nonParticipantSection: string,
   meetingDocsSection: string,
   contentKind: "résumés" | "emails",
+  directives: string,
   onStream: StreamCallback,
   onProgress: ProgressCallback
 ): Promise<string> {
@@ -910,8 +943,8 @@ async function generateFinalBriefing(
   });
 
   const sourceSentence = contentKind === "emails"
-    ? "À partir des emails échangés avec chaque participant (et du contexte externe éventuel), génère un briefing final structuré en français."
-    : "À partir des résumés d'échanges par participant, génère un briefing final structuré en français.";
+    ? "À partir des emails échangés avec chaque participant (et du contexte externe éventuel), génère un briefing final structuré."
+    : "À partir des résumés d'échanges par participant, génère un briefing final structuré.";
   const sectionHeader = contentKind === "emails" ? "Emails par participant" : "Résumés par participant";
 
   const messages: ChatMessage[] = [
@@ -928,7 +961,8 @@ async function generateFinalBriefing(
         "4. **Actions en attente** : engagements non tenus, questions ouvertes\n" +
         "5. **Emails clés à relire** : les plus importants avec date et sujet\n\n" +
         "Utilise le format Markdown. Sois concis, actionnable, et utile. " +
-        "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown).",
+        "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown)." +
+        directives,
     },
     {
       role: "user",
@@ -1028,8 +1062,11 @@ export async function prepareMeeting(
   ds: MailDataSource,
   eventId: string,
   onProgress: ProgressCallback,
-  onStream: StreamCallback
+  onStream: StreamCallback,
+  opts: MeetingPrepOptions = {}
 ): Promise<MeetingBriefing> {
+  const mode: MeetingMode = opts.mode === "soft" ? "soft" : "deep";
+  const directives = buildDirectives(opts.focus, opts.language);
   // Phase 1: Extract context
   const { event, participants, query, eventAttachmentsText } = await extractContext(
     ds, eventId, onProgress
@@ -1050,6 +1087,17 @@ export async function prepareMeeting(
       participants: [],
       participantBriefings: [],
       finalBriefing: reason,
+      report: {
+        subject: event.subject,
+        date: new Date(event.start.dateTime).toLocaleDateString("fr-CH"),
+        generatedOn: new Date().toLocaleDateString("fr-CH"),
+        briefing: reason,
+        participants: [],
+        externalSources: [],
+        meetingDocs: [],
+        language: opts.language,
+        mode,
+      },
     };
   }
 
@@ -1094,20 +1142,26 @@ export async function prepareMeeting(
     percent: 27,
   });
 
-  const enriched = await fetchAndCleanBodies(ds, dedupedLight, onProgress);
+  // SOFT skips per-email attachment extraction (slow) — meeting's own docs are
+  // still read in Phase 1.
+  const enriched = await fetchAndCleanBodies(ds, dedupedLight, onProgress, mode === "deep");
   let rankedEmails = await embedAndRank(query, enriched, onProgress);
+  // SOFT caps the email volume for a quick briefing.
+  if (mode === "soft" && rankedEmails.length > SOFT_MAX_EMAILS) {
+    rankedEmails = rankedEmails.slice(0, SOFT_MAX_EMAILS);
+    onProgress({ phase: "embedding_ranking", message: `Mode rapide : limité aux ${SOFT_MAX_EMAILS} emails les plus pertinents`, percent: 46 });
+  }
   console.log(
     `[MeetingPrep] Phase 3 — Pipeline: ${totalCollected} collectés → ${dedupedLight.length} après dedup → ` +
       `${enriched.length} avec bodies → top ${rankedEmails.length} ` +
       `(score max: ${rankedEmails[0]?.score.toFixed(3) || "N/A"}, min: ${rankedEmails[rankedEmails.length - 1]?.score.toFixed(3) || "N/A"})`
   );
 
-  // Phase 5: Non-participant email search (independent of the relevance filter;
-  // both paths need it, and its volume counts toward the direct-load gate below).
+  // Phase 5: Non-participant email search — DEEP only (skipped in SOFT for speed).
   const existingEmailIds = new Set(rankedEmails.map((r) => r.email.id));
-  const nonParticipantEmails = await searchNonParticipantEmails(
-    ds, query, event, existingEmailIds, participants, onProgress
-  );
+  const nonParticipantEmails = mode === "deep"
+    ? await searchNonParticipantEmails(ds, query, event, existingEmailIds, participants, onProgress)
+    : [];
 
   // ─── Always load directly into context (Kimi K2.6 = 262k tokens) ────────
   // The old Mistral relevance filter (Phase 4) and per-participant summaries
@@ -1170,7 +1224,7 @@ export async function prepareMeeting(
 
   const finalBriefing = await generateFinalBriefing(
     event, participants, participantBlocks, nonParticipantSection, meetingDocsSection,
-    "emails", onStream, onProgress
+    "emails", directives, onStream, onProgress
   );
 
   // Per-participant counts for the result/UI stats; no intermediate summary here.
@@ -1191,10 +1245,40 @@ export async function prepareMeeting(
   const traceLog = buildTraceLog(event, participants, emailsForTrace, nonParticipantEmails, totalCollected, rankedEmails.length);
   console.log(`[MeetingPrep] === TRACE LOG ===\n${traceLog}`);
 
+  // ─── Structured, source-linked report data (rendered to .docx by the caller) ──
+  const toSource = (r: RankedEmail): DecisionSource => {
+    const e = r.fullEmail || r.email;
+    return {
+      date: new Date(e.receivedDateTime).toLocaleDateString("fr-CH"),
+      subject: e.subject || "(sans objet)",
+      webLink: r.fullEmail?.webLink,
+    };
+  };
+  const reportParticipants: MeetingParticipantBlock[] = participants.map((p) => ({
+    name: p.name,
+    profile: [p.jobTitle, p.department].filter(Boolean).join(", ") || undefined,
+    sources: (byParticipant.get(p.email) || [])
+      .slice()
+      .sort((a, b) => new Date((b.fullEmail || b.email).receivedDateTime).getTime() - new Date((a.fullEmail || a.email).receivedDateTime).getTime())
+      .map(toSource),
+  }));
+  const report: MeetingReport = {
+    subject: event.subject,
+    date: new Date(event.start.dateTime).toLocaleDateString("fr-CH"),
+    generatedOn: new Date().toLocaleDateString("fr-CH"),
+    briefing: finalBriefing,
+    participants: reportParticipants,
+    externalSources: nonParticipantEmails.map(toSource),
+    meetingDocs: eventAttachmentsText.map((a) => a.name),
+    language: opts.language,
+    mode,
+  };
+
   return {
     event,
     participants,
     participantBriefings,
     finalBriefing,
+    report,
   };
 }
