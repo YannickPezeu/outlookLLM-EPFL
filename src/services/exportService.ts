@@ -6,6 +6,10 @@ import {
   HeadingLevel,
   AlignmentType,
   ExternalHyperlink,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
 } from "docx";
 import { marked } from "marked";
 
@@ -653,8 +657,8 @@ function sourceLink(s: DecisionSource, L: ReportLabels): Paragraph {
  *   3. a fully detailed paragraph
  * then the emails/meetings that mention it.
  */
-function majorDecisionBlock(m: MajorDecision, index: number, L: ReportLabels): Paragraph[] {
-  const out: Paragraph[] = [];
+function majorDecisionBlock(m: MajorDecision, index: number, L: ReportLabels): (Paragraph | Table)[] {
+  const out: (Paragraph | Table)[] = [];
   // Tier 1 — title: distinct via size + colour, NOT bold.
   out.push(
     new Paragraph({
@@ -697,8 +701,8 @@ function majorDecisionBlock(m: MajorDecision, index: number, L: ReportLabels): P
 }
 
 /** Render the major-decisions list with a separator between entries. */
-function majorList(items: MajorDecision[], L: ReportLabels): Paragraph[] {
-  const out: Paragraph[] = [];
+function majorList(items: MajorDecision[], L: ReportLabels): (Paragraph | Table)[] {
+  const out: (Paragraph | Table)[] = [];
   items.forEach((m, i) => {
     if (i > 0) out.push(separatorParagraph());
     out.push(...majorDecisionBlock(m, i + 1, L));
@@ -706,16 +710,82 @@ function majorList(items: MajorDecision[], L: ReportLabels): Paragraph[] {
   return out;
 }
 
+/** Split a markdown table row "| a | b |" into trimmed cells. */
+function splitTableCells(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((c) => c.trim());
+}
+
+/** A markdown table row is a line with at least one pipe between content. */
+function isTableRow(line: string): boolean {
+  const t = line.trim();
+  return t.startsWith("|") && t.indexOf("|", 1) !== -1;
+}
+
+/** A separator row is all cells like --- or :---: */
+function isTableSeparator(line: string): boolean {
+  const cells = splitTableCells(line);
+  return cells.length > 0 && cells.every((c) => /^:?-{2,}:?$/.test(c));
+}
+
+/** Render a markdown table block (header + rows) as a real Word table. */
+function markdownTableToDocx(rowLines: string[]): Table {
+  const dataRows = rowLines.filter((l) => !isTableSeparator(l)).map(splitTableCells);
+  const colCount = Math.max(...dataRows.map((r) => r.length), 1);
+  return new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    rows: dataRows.map((cells, rowIdx) => {
+      const padded = [...cells];
+      while (padded.length < colCount) padded.push("");
+      return new TableRow({
+        children: padded.map(
+          (c) =>
+            new TableCell({
+              margins: { top: 40, bottom: 40, left: 80, right: 80 },
+              children: [
+                new Paragraph({
+                  children:
+                    rowIdx === 0
+                      ? [new TextRun({ text: c, bold: true, size: 18, font: REPORT_FONT })]
+                      : parseInlineFormatting(c),
+                }),
+              ],
+            })
+        ),
+      });
+    }),
+  });
+}
+
 /**
- * Render light markdown (## headings, - bullets, **bold**) into paragraphs.
- * Used for the structured, self-contained conclusion.
+ * Render light markdown (## headings, - bullets, **bold**, | tables |) into a mix
+ * of Paragraphs and Tables. Used for the briefing / synthesis / major detail.
  */
-function richTextBlock(md: string): Paragraph[] {
+function richTextBlock(md: string): (Paragraph | Table)[] {
   let content = md.replace(/^```(?:markdown)?\s*\n?/i, "").replace(/\n?```\s*$/i, "");
-  const out: Paragraph[] = [];
-  for (const raw of content.split("\n")) {
-    const line = raw.trim();
+  const lines = content.split("\n");
+  const out: (Paragraph | Table)[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
     if (!line) continue;
+
+    // Markdown table: a row immediately followed by a separator row.
+    if (isTableRow(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      const block: string[] = [line];
+      let j = i + 1;
+      while (j < lines.length && isTableRow(lines[j])) {
+        block.push(lines[j].trim());
+        j++;
+      }
+      out.push(markdownTableToDocx(block));
+      out.push(new Paragraph({ spacing: { after: 80 }, children: [] }));
+      i = j - 1;
+      continue;
+    }
+
     const h = line.match(/^#{1,6}\s+(.*)/);
     if (h) {
       out.push(
@@ -777,7 +847,7 @@ function decisionList(entries: DecisionEntry[], L: ReportLabels): Paragraph[] {
  */
 export async function exportDecisionReport(report: DecisionReport): Promise<void> {
   const L = reportLabels(report.language);
-  const children: Paragraph[] = [];
+  const children: (Paragraph | Table)[] = [];
 
   children.push(
     new Paragraph({
@@ -848,7 +918,7 @@ export async function exportDecisionReport(report: DecisionReport): Promise<void
  */
 export async function exportMeetingReport(report: MeetingReport): Promise<void> {
   const L = reportLabels(report.language);
-  const children: Paragraph[] = [];
+  const children: (Paragraph | Table)[] = [];
 
   children.push(
     new Paragraph({

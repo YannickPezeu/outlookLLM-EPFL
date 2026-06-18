@@ -965,9 +965,8 @@ async function generateFinalBriefing(
         "3. **Sujets probables à aborder** : déduits des emails\n" +
         "4. **Actions en attente** : engagements non tenus, questions ouvertes\n" +
         "5. **Emails clés à relire** : les plus importants avec date et sujet\n\n" +
-        "Utilise le format Markdown (titres, listes à puces, gras). Sois concis, actionnable, et utile. " +
-        "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown). " +
-        "N'utilise PAS de TABLEAUX markdown (le rendu Word ne les gère pas) : utilise des listes à puces à la place." +
+        "Utilise le format Markdown (titres, listes à puces, gras, tableaux si pertinent). Sois concis, actionnable, et utile. " +
+        "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown)." +
         directives,
     },
     {
