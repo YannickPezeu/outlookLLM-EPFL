@@ -22,6 +22,43 @@ const msalConfig = {
 let msalInstance: IPublicClientApplication | null = null;
 let isNaa = false;
 
+// In NAA mode the broker holds the session and getAllAccounts() can stay empty
+// even though token acquisitions succeed. Track auth state ourselves: set to true
+// on any successful token acquisition, and notify subscribers so the UI updates.
+let tokenAuthenticated = false;
+// Under NAA, logoutPopup can fail (the Office broker owns the session) and the
+// MSAL account cache survives. This flag makes the sign-out stick in the UI
+// until the next successful token acquisition.
+let userSignedOut = false;
+const authListeners = new Set<() => void>();
+
+/**
+ * Subscribe to auth state changes (sign-in, sign-out). Returns an unsubscribe fn.
+ */
+export function onAuthStateChanged(listener: () => void): () => void {
+  authListeners.add(listener);
+  return () => authListeners.delete(listener);
+}
+
+function notifyAuthChanged(): void {
+  authListeners.forEach((l) => l());
+}
+
+/** Record a successful token acquisition and surface the account to MSAL's cache. */
+function markAuthenticated(result: AuthenticationResult): void {
+  const wasAuthenticated = tokenAuthenticated && !userSignedOut;
+  tokenAuthenticated = true;
+  userSignedOut = false;
+  if (result.account) {
+    try {
+      msalInstance?.setActiveAccount(result.account);
+    } catch {
+      // setActiveAccount unsupported in some NAA hosts — account display is best-effort
+    }
+  }
+  if (!wasAuthenticated) notifyAuthChanged();
+}
+
 /**
  * Initialize MSAL. Tries Nested App Auth (NAA) first for seamless SSO,
  * falls back to standard MSAL SPA if NAA is not supported.
@@ -49,6 +86,8 @@ export async function initAuth(): Promise<IPublicClientApplication> {
  */
 export function getAccount(): AccountInfo | null {
   if (!msalInstance) return null;
+  const active = msalInstance.getActiveAccount();
+  if (active) return active;
   const accounts = msalInstance.getAllAccounts();
   return accounts.length > 0 ? accounts[0] : null;
 }
@@ -99,7 +138,7 @@ export async function getGraphToken(forceRefresh = false): Promise<string> {
 
   try {
     const result: AuthenticationResult = await msalInstance!.acquireTokenSilent(tokenRequest);
-    // Decode exp from JWT to check if token is already expired
+    markAuthenticated(result);
     return result.accessToken;
   } catch (error) {
     console.error(`[Auth] acquireTokenSilent FAILED:`, error);
@@ -131,12 +170,40 @@ export async function acquireTokenInteractive(): Promise<string> {
       scopes: config.graph.scopes,
     };
 
+    // Under NAA the Office broker owns the session and survives a local sign-out,
+    // so a silent re-SSO usually succeeds without any popup. acquireTokenPopup is
+    // the fragile path (popups get blocked / never close in Outlook Mac desktop),
+    // so prefer ssoSilent first in NAA mode and keep it as a last-resort fallback.
+    if (isNaa) {
+      try {
+        console.log("[Auth] Attempting silent SSO (NAA)...");
+        const result = await msalInstance!.ssoSilent(tokenRequest);
+        markAuthenticated(result);
+        return result.accessToken;
+      } catch (ssoError) {
+        console.warn("[Auth] Silent SSO failed, falling back to popup:", ssoError);
+      }
+    }
+
     try {
       console.log("[Auth] Launching interactive login...");
       const result = await msalInstance!.acquireTokenPopup(tokenRequest);
+      markAuthenticated(result);
       return result.accessToken;
     } catch (error) {
-      console.error("[Auth] Interactive login failed:", error);
+      console.error("[Auth] Interactive login (popup) failed:", error);
+      // Last resort under NAA: the popup may be blocked while the broker session
+      // is still valid — try a silent SSO before giving up.
+      if (isNaa) {
+        try {
+          console.log("[Auth] Retrying silent SSO after popup failure (NAA)...");
+          const result = await msalInstance!.ssoSilent(tokenRequest);
+          markAuthenticated(result);
+          return result.accessToken;
+        } catch (ssoError) {
+          console.error("[Auth] Silent SSO fallback also failed:", ssoError);
+        }
+      }
       throw error;
     } finally {
       interactivePromise = null;
@@ -147,14 +214,43 @@ export async function acquireTokenInteractive(): Promise<string> {
 }
 
 /**
- * Sign out the current user.
+ * Attempt a silent sign-in (no popup). Used at startup to connect by default
+ * and to refresh the displayed auth status. Returns true on success.
+ */
+export async function trySilentSignIn(): Promise<boolean> {
+  try {
+    if (!msalInstance) await initAuth();
+    const result = await msalInstance!.acquireTokenSilent({
+      scopes: config.graph.scopes,
+      account: getAccount() || undefined,
+    });
+    markAuthenticated(result);
+    return true;
+  } catch (error) {
+    console.warn("[Auth] Silent sign-in failed:", error);
+    return false;
+  }
+}
+
+/**
+ * Sign out the current user. In NAA mode the broker owns the session and
+ * logout may be unsupported — we still clear our local state so the user
+ * can re-trigger an interactive sign-in.
  */
 export async function signOut(): Promise<void> {
-  if (!msalInstance) return;
+  tokenAuthenticated = false;
+  userSignedOut = true;
+  localStorage.removeItem("graph_popout_token");
 
-  const account = getAccount();
-  if (account) {
-    await msalInstance.logoutPopup({ account });
+  try {
+    const account = getAccount();
+    if (msalInstance && account) {
+      await msalInstance.logoutPopup({ account });
+    }
+  } catch (error) {
+    console.warn("[Auth] logoutPopup failed (expected under NAA):", error);
+  } finally {
+    notifyAuthChanged();
   }
 }
 
@@ -163,6 +259,8 @@ export async function signOut(): Promise<void> {
  * Returns true for MSAL accounts, dev tokens, or relayed popout tokens.
  */
 export function isAuthenticated(): boolean {
+  if (userSignedOut) return false;
+  if (tokenAuthenticated) return true;
   if (getAccount() !== null) return true;
   if (localStorage.getItem("graph_dev_token")) return true;
   const popoutToken = localStorage.getItem("graph_popout_token");

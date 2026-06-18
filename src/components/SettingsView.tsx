@@ -12,8 +12,17 @@ import {
   Switch,
 } from "@fluentui/react-components";
 import { Settings24Regular, Checkmark24Regular } from "@fluentui/react-icons";
+import { config } from "../config";
 import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
-import { isAuthenticated, isUsingNaa, getAccount, signOut, getGraphToken } from "../services/authService";
+import {
+  isAuthenticated,
+  isUsingNaa,
+  getAccount,
+  signOut,
+  getGraphToken,
+  acquireTokenInteractive,
+  onAuthStateChanged,
+} from "../services/authService";
 
 const AVAILABLE_MODELS = [
   "moonshotai/Kimi-K2.6",
@@ -65,9 +74,15 @@ export const SettingsView: React.FC = () => {
   const [customPrompt, setCustomPrompt] = useState("");
   // True when the user picked "Autre…" to type a model not in the preset list.
   const [customModelMode, setCustomModelMode] = useState(false);
-  const [graphToken, setGraphToken] = useState("");
+  // Auth status is module-level state in authService — re-render when it changes.
+  const [, setAuthTick] = useState(0);
+  const [connecting, setConnecting] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
   // OCR for scanned PDF attachments. On unless explicitly disabled (see attachmentService).
   const [ocrEnabled, setOcrEnabled] = useState(true);
+  // Default meeting participation, drives find_common_slots' include_self when the
+  // request gives no explicit "avec moi"/"sans moi" signal. "unset" → assistant asks.
+  const [meetingSelfDefault, setMeetingSelfDefault] = useState<"unset" | "include" | "exclude">("unset");
   const [saved, setSaved] = useState(false);
   // Don't persist during the initial load (when state is populated from storage),
   // otherwise the auto-save effect would fire and re-write the same values.
@@ -80,27 +95,46 @@ export const SettingsView: React.FC = () => {
     setRcpKey(settings.apiKey);
     setRcpModel(settings.model);
     setCustomPrompt(settings.customPrompt);
-    setGraphToken(localStorage.getItem("graph_dev_token") || "");
     setOcrEnabled(localStorage.getItem("ocr_enabled") !== "false");
+    const self = localStorage.getItem("meeting_self_default");
+    setMeetingSelfDefault(self === "include" || self === "exclude" ? self : "unset");
     loadedRef.current = true;
   }, []);
+
+  // Refresh the auth badge whenever a token is acquired or the user signs out.
+  useEffect(() => onAuthStateChanged(() => setAuthTick((t) => t + 1)), []);
 
   // Auto-save on every change once the initial values are loaded.
   useEffect(() => {
     if (!loadedRef.current) return;
     saveRcpSettings(rcpUrl, rcpKey, rcpModel, customPrompt);
-    if (graphToken.trim()) {
-      localStorage.setItem("graph_dev_token", graphToken.trim());
-    } else {
-      localStorage.removeItem("graph_dev_token");
-    }
     // Store only the "off" state — absence of the key means OCR is on (default).
     if (ocrEnabled) localStorage.removeItem("ocr_enabled");
     else localStorage.setItem("ocr_enabled", "false");
+    // Absence of the key means "unset" (the assistant asks before scheduling).
+    if (meetingSelfDefault === "unset") localStorage.removeItem("meeting_self_default");
+    else localStorage.setItem("meeting_self_default", meetingSelfDefault);
     setSaved(true);
     clearTimeout(savedTimer.current);
     savedTimer.current = setTimeout(() => setSaved(false), 1500);
-  }, [rcpUrl, rcpKey, rcpModel, customPrompt, graphToken, ocrEnabled]);
+  }, [rcpUrl, rcpKey, rcpModel, customPrompt, ocrEnabled, meetingSelfDefault]);
+
+  const handleSignIn = async () => {
+    setConnecting(true);
+    setAuthError(null);
+    try {
+      await acquireTokenInteractive();
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    setAuthError(null);
+    await signOut();
+  };
 
   const account = getAccount();
 
@@ -134,11 +168,32 @@ export const SettingsView: React.FC = () => {
             </Badge>
           )}
         </div>
+        {!isAuthenticated() && (
+          <Button
+            size="small"
+            appearance="primary"
+            disabled={connecting}
+            onClick={handleSignIn}
+          >
+            {connecting ? "Connexion en cours…" : "Se connecter"}
+          </Button>
+        )}
+        {authError && (
+          <Text size={100} style={{ color: tokens.colorPaletteRedForeground1 }}>
+            Échec de la connexion : {authError}
+          </Text>
+        )}
         {isAuthenticated() && (
           <>
-          <Button size="small" onClick={signOut}>
-            Se déconnecter
-          </Button>
+          {/* Under NAA the Office broker owns the session: logoutPopup is unsupported
+              and a local sign-out only strands the user in a "disconnected" state whose
+              sole exit is the fragile interactive popup. Hide it there — to switch
+              account the user reloads the add-in (silent SSO reconnects via the broker). */}
+          {!isUsingNaa() && (
+            <Button size="small" onClick={handleSignOut}>
+              Se déconnecter
+            </Button>
+          )}
           <Button size="small" onClick={async () => {
             try {
               const token = await getGraphToken();
@@ -163,29 +218,6 @@ export const SettingsView: React.FC = () => {
           </Button>
           </>
         )}
-      </div>
-
-      {/* Graph Dev Token */}
-      <div className={styles.section}>
-        <Text weight="semibold" size={200}>
-          Token Graph API (dev)
-        </Text>
-        <Text size={100}>
-          Collez un token depuis Graph Explorer pour tester sans Azure AD App Registration.
-          Laissez vide pour utiliser l'auth MSAL normale.
-        </Text>
-        <div className={styles.field}>
-          <Label htmlFor="graph-token" size="small">
-            Access Token
-          </Label>
-          <Input
-            id="graph-token"
-            type="password"
-            placeholder="eyJ0eXAiOiJKV1Qi..."
-            value={graphToken}
-            onChange={(_, data) => setGraphToken(data.value)}
-          />
-        </div>
       </div>
 
       {/* Personnalisation — prompt utilisateur */}
@@ -221,13 +253,61 @@ export const SettingsView: React.FC = () => {
             Il reste stocké localement sur votre poste.
           </Text>
         </div>
+
+        <div className={styles.field}>
+          <InfoLabel
+            htmlFor="meeting-self-default"
+            size="small"
+            info={
+              <>
+                Quand vous demandez à organiser une réunion sans préciser « avec moi » ou
+                « sans moi », l'assistant doit savoir si vous comptez parmi les participants.
+                Choisissez votre cas habituel : un dirigeant participe en général aux réunions
+                qu'il organise, un·e assistant·e planifie souvent pour d'autres. Tant que ce
+                réglage reste « Demander à chaque fois », l'assistant vous posera la question.
+                Une précision explicite dans la demande prime toujours sur ce réglage.
+              </>
+            }
+          >
+            Participation par défaut aux réunions
+          </InfoLabel>
+          <select
+            id="meeting-self-default"
+            className={styles.select}
+            value={meetingSelfDefault}
+            onChange={(e) =>
+              setMeetingSelfDefault(e.target.value as "unset" | "include" | "exclude")
+            }
+          >
+            <option value="unset">Demander à chaque fois</option>
+            <option value="include">Je participe à la réunion</option>
+            <option value="exclude">Je ne participe pas (je planifie pour d'autres)</option>
+          </select>
+        </div>
       </div>
 
       {/* RCP API settings */}
       <div className={styles.section}>
-        <Text weight="semibold" size={200}>
+        <InfoLabel
+          weight="semibold"
+          size="small"
+          info={
+            <>
+              Nécessite une clé API RCP <strong>premium</strong>. Créez-la sur le{" "}
+              <a
+                href="https://portal.rcp.epfl.ch/aiaas/keys"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                portail RCP (portal.rcp.epfl.ch/aiaas/keys)
+              </a>
+              . La clé premium doit être validée par votre chef d'unité avant de
+              pouvoir être utilisée.
+            </>
+          }
+        >
           API RCP (LLM)
-        </Text>
+        </InfoLabel>
 
         <div className={styles.field}>
           <Label htmlFor="rcp-url" size="small">
@@ -323,6 +403,16 @@ export const SettingsView: React.FC = () => {
           </Text>
         </div>
       </div>
+
+      {/* Version déployée — permet de vérifier que le cache est à jour */}
+      <Text size={100} style={{ color: tokens.colorNeutralForeground3, textAlign: "center" }}>
+        {config.buildTime
+          ? `Version déployée le ${new Date(config.buildTime).toLocaleString("fr-CH", {
+              dateStyle: "short",
+              timeStyle: "short",
+            })}`
+          : "Build de développement local"}
+      </Text>
     </div>
   );
 };
