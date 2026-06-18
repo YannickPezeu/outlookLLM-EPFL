@@ -21,6 +21,7 @@ import {
   signOut,
   getGraphToken,
   acquireTokenInteractive,
+  reconnect,
   onAuthStateChanged,
 } from "../services/authService";
 
@@ -136,6 +137,20 @@ export const SettingsView: React.FC = () => {
     await signOut();
   };
 
+  // NAA-safe recovery from a stale "connected but Graph fails" state: forces a
+  // fresh token without the broken logoutPopup that would strand the user.
+  const handleReconnect = async () => {
+    setConnecting(true);
+    setAuthError(null);
+    try {
+      await reconnect();
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConnecting(false);
+    }
+  };
+
   const account = getAccount();
 
   return (
@@ -186,10 +201,15 @@ export const SettingsView: React.FC = () => {
         {isAuthenticated() && (
           <>
           {/* Under NAA the Office broker owns the session: logoutPopup is unsupported
-              and a local sign-out only strands the user in a "disconnected" state whose
-              sole exit is the fragile interactive popup. Hide it there — to switch
-              account the user reloads the add-in (silent SSO reconnects via the broker). */}
-          {!isUsingNaa() && (
+              and a real sign-out only strands the user in a "disconnected" state. Offer
+              instead a "Reconnecter" that forces a fresh token (the NAA-safe equivalent
+              of the old deco/reco when the badge says connected but Graph calls fail).
+              Outside NAA, keep the standard sign-out. */}
+          {isUsingNaa() ? (
+            <Button size="small" disabled={connecting} onClick={handleReconnect}>
+              {connecting ? "Reconnexion en cours…" : "Reconnecter"}
+            </Button>
+          ) : (
             <Button size="small" onClick={handleSignOut}>
               Se déconnecter
             </Button>

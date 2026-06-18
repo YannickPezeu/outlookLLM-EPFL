@@ -255,6 +255,26 @@ export async function signOut(): Promise<void> {
 }
 
 /**
+ * Force a fresh Graph token, recovering from a stale "badge says connected but
+ * Graph calls fail" state. This is the NAA-safe replacement for sign-out/sign-in:
+ * it never calls the (NAA-unsupported) logoutPopup that would strand the user.
+ * It clears the local auth flags — so the badge honestly flips to "Non connecté"
+ * while reconnecting — then forces a token refresh, which goes through
+ * acquireTokenSilent(forceRefresh) and, on failure, the interactive path
+ * (ssoSilent first under NAA, then popup). Throws if reconnection ultimately fails.
+ */
+export async function reconnect(): Promise<void> {
+  userSignedOut = false;
+  tokenAuthenticated = false;
+  localStorage.removeItem("graph_popout_token");
+  // Reflect the "reconnecting" state immediately in the UI.
+  notifyAuthChanged();
+  // forceRefresh bypasses the cached (possibly broken) token; markAuthenticated
+  // inside getGraphToken restores tokenAuthenticated + notifies on success.
+  await getGraphToken(true);
+}
+
+/**
  * Check if the user is currently authenticated.
  * Returns true for MSAL accounts, dev tokens, or relayed popout tokens.
  */
