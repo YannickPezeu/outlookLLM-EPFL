@@ -29,6 +29,24 @@ function buildDirectives(focus?: string, language?: string): string {
   return focusLine(focus) + langLine(language);
 }
 
+/** The signed-in user — the person the briefing is prepared FOR. */
+function selfIdentity(): { name: string; email: string } {
+  const a = getAccount() as { name?: string; username?: string } | null;
+  const email = a?.username || "";
+  const name = a?.name || email || "l'utilisateur";
+  return { name, email };
+}
+
+/** Instruction telling the LLM whose perspective to write the briefing from. */
+function selfLine(self: { name: string; email: string }): string {
+  return (
+    `\nTU PRÉPARES CE BRIEFING POUR ${self.name}${self.email ? ` (${self.email})` : ""} — ` +
+    "l'utilisateur courant, qui PARTICIPE à la réunion. Écris de SON point de vue : " +
+    `parle à ${self.name} à la 2e personne (« vous »), et ne parle JAMAIS de ${self.name} à la 3e personne. ` +
+    "Les autres personnes citées sont SES interlocuteurs."
+  );
+}
+
 export type MeetingMode = "deep" | "soft";
 
 export interface MeetingPrepOptions {
@@ -929,6 +947,7 @@ async function generateFinalBriefing(
   meetingDocsSection: string,
   contentKind: "résumés" | "emails",
   directives: string,
+  self: { name: string; email: string },
   onStream: StreamCallback,
   onProgress: ProgressCallback
 ): Promise<string> {
@@ -967,6 +986,7 @@ async function generateFinalBriefing(
         "5. **Emails clés à relire** : les plus importants avec date et sujet\n\n" +
         "Utilise le format Markdown (titres, listes à puces, gras, tableaux si pertinent). Sois concis, actionnable, et utile. " +
         "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown)." +
+        selfLine(self) +
         directives,
     },
     {
@@ -1255,7 +1275,7 @@ export async function prepareMeeting(
 
   const finalBriefing = await generateFinalBriefing(
     event, participants, participantBlocks, nonParticipantSection, meetingDocsSection,
-    "emails", directives, onStream, onProgress
+    "emails", directives, selfIdentity(), onStream, onProgress
   );
 
   // Per-participant counts for the result/UI stats; no intermediate summary here.
@@ -1353,12 +1373,13 @@ async function prepareMeetingDeep(
     };
   });
 
+  const self = selfIdentity();
   const meetingDesc = `la réunion « ${event.subject} »${eventBody ? ` (${eventBody})` : ""}`;
   onProgress({ phase: "summarizing_participants", message: `Analyse 20-par-20 de ${records.length} emails (filtrés sur le sujet de la réunion)…`, percent: 40 });
 
   const { major, intro, conclusion } = await analyzeRecordsToReport(records, {
     topic: event.subject,
-    focus: `Préparer la réunion « ${event.subject} ». ${eventBody}`,
+    focus: `Préparer la réunion « ${event.subject} » POUR ${self.name}${self.email ? ` (${self.email})` : ""}, l'utilisateur qui y participe (écris de son point de vue, ne le cite pas à la 3e personne). ${eventBody}`,
     language: opts.language,
     ignoreMinor: false,
     withDetailParagraph: true,
