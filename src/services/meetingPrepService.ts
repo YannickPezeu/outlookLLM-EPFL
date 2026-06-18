@@ -8,6 +8,7 @@ import { getAccount } from "./authService";
 import { getUserByEmail } from "./graphMailService";
 // Dynamic import to avoid pulling pdfjs-dist in Node.js eval environment
 const loadAttachmentService = () => import("./attachmentService");
+import type { AttachmentText } from "./attachmentService";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -59,11 +60,21 @@ type StreamCallback = (chunk: string) => void;
 
 // ─── Phase 1: Extract Context ───────────────────────────────────────
 
+// Max chars of attachment text folded into the semantic query. The embedding
+// signal degrades if the query is dominated by one long document, so we cap the
+// contribution; the full text is still passed to the final briefing prompt.
+const QUERY_ATTACHMENT_BUDGET = 6000;
+
 async function extractContext(
   ds: MailDataSource,
   eventId: string,
   onProgress: ProgressCallback
-): Promise<{ event: CalendarEvent; participants: Participant[]; query: string }> {
+): Promise<{
+  event: CalendarEvent;
+  participants: Participant[];
+  query: string;
+  eventAttachmentsText: AttachmentText[];
+}> {
   onProgress({
     phase: "extracting_context",
     message: "Extraction du contexte de la réunion...",
@@ -71,6 +82,30 @@ async function extractContext(
   });
 
   const event = await ds.getCalendarEvent(eventId);
+
+  // The meeting's own attachments often hold the real agenda/context (an agenda
+  // PDF, a slide deck) rather than the event body. Extract their text so it feeds
+  // both the semantic query and the final briefing.
+  let eventAttachmentsText: AttachmentText[] = [];
+  if (event.hasAttachments) {
+    try {
+      const attachments = await ds.getEventAttachments(eventId);
+      if (attachments.length > 0) {
+        onProgress({
+          phase: "extracting_context",
+          message: `Lecture des pièces jointes de la réunion (${attachments.length})...`,
+          percent: 7,
+        });
+        const { extractTextFromAttachments } = await loadAttachmentService();
+        eventAttachmentsText = await extractTextFromAttachments(attachments, undefined, {
+          onProgress: (m) =>
+            onProgress({ phase: "extracting_context", message: m, percent: 7 }),
+        });
+      }
+    } catch (err) {
+      console.warn("[MeetingPrep] Failed to read event attachments:", err);
+    }
+  }
 
   // Exclude the current signed-in user from the participant list. Their bucket
   // would contain mostly threads with non-meeting people (their wife, dentist,
@@ -113,20 +148,27 @@ async function extractContext(
   });
   const enrichedCount = participants.filter((p) => p.jobTitle || p.department).length;
 
-  // Build the semantic query from subject + cleaned body
+  // Build the semantic query from subject + cleaned body + (capped) attachment text
   const eventBody = event.body?.content ? cleanEmailBody(event.body.content) : event.bodyPreview;
-  const query = [event.subject, eventBody].filter(Boolean).join(" ");
+  const attachmentQueryText = eventAttachmentsText
+    .map((a) => a.text)
+    .join("\n")
+    .slice(0, QUERY_ATTACHMENT_BUDGET);
+  const query = [event.subject, eventBody, attachmentQueryText].filter(Boolean).join(" ");
 
   onProgress({
     phase: "extracting_context",
     message: `Réunion : ${event.subject}`,
     detail:
       `${participants.length} participant(s), ${enrichedCount} enrichi(s) via annuaire` +
+      (eventAttachmentsText.length > 0
+        ? `, ${eventAttachmentsText.length} pièce(s) jointe(s) de réunion lue(s)`
+        : "") +
       (excludedSelf ? " (utilisateur courant exclu)" : ""),
     percent: 10,
   });
 
-  return { event, participants, query };
+  return { event, participants, query, eventAttachmentsText };
 }
 
 /** Format a participant's directory info as a one-line tag for prompts. */
@@ -847,6 +889,7 @@ async function generateFinalBriefing(
   participants: Participant[],
   participantBlocks: string,
   nonParticipantSection: string,
+  meetingDocsSection: string,
   contentKind: "résumés" | "emails",
   onStream: StreamCallback,
   onProgress: ProgressCallback
@@ -894,8 +937,9 @@ async function generateFinalBriefing(
         `**Date :** ${startDate}\n` +
         `**Participants :**\n` +
         participants.map((p) => `- ${p.name}${formatParticipantProfile(p)}`).join("\n") + "\n" +
-        `**Description :** ${event.bodyPreview || "(aucune)"}\n\n` +
-        `## ${sectionHeader}\n\n${participantBlocks}${nonParticipantSection}\n\n` +
+        `**Description :** ${event.bodyPreview || "(aucune)"}\n` +
+        meetingDocsSection +
+        `\n## ${sectionHeader}\n\n${participantBlocks}${nonParticipantSection}\n\n` +
         `Génère le briefing final pour préparer cette réunion.`,
     },
   ];
@@ -987,7 +1031,9 @@ export async function prepareMeeting(
   onStream: StreamCallback
 ): Promise<MeetingBriefing> {
   // Phase 1: Extract context
-  const { event, participants, query } = await extractContext(ds, eventId, onProgress);
+  const { event, participants, query, eventAttachmentsText } = await extractContext(
+    ds, eventId, onProgress
+  );
 
   if (participants.length === 0) {
     const onlySelf = (event.attendees || []).some((a) => a.type !== "resource");
@@ -1115,8 +1161,16 @@ export async function prepareMeeting(
     ? `\n\n## Contexte externe (hors participants)\n\n${nonParticipantEmails.map(formatEmailBlock).join("\n---\n")}`
     : "";
 
+  // Meeting's own attached documents (agenda PDF, slide deck, …) — full text,
+  // placed up front so the LLM treats it as primary context for the meeting.
+  const meetingDocsSection = eventAttachmentsText.length > 0
+    ? `\n## Documents joints à la réunion\n\n` +
+      eventAttachmentsText.map((a) => `### ${a.name}\n${a.text}`).join("\n\n") + "\n"
+    : "";
+
   const finalBriefing = await generateFinalBriefing(
-    event, participants, participantBlocks, nonParticipantSection, "emails", onStream, onProgress
+    event, participants, participantBlocks, nonParticipantSection, meetingDocsSection,
+    "emails", onStream, onProgress
   );
 
   // Per-participant counts for the result/UI stats; no intermediate summary here.

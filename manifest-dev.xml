@@ -8,7 +8,7 @@
 
   <!-- BEGIN: Add-in metadata -->
   <Id>e4e7f5a0-1234-4abc-9def-000000000002</Id>
-  <Version>1.0.0.2</Version>
+  <Version>1.0.0.3</Version>
   <ProviderName>EPFL</ProviderName>
   <DefaultLocale>fr-FR</DefaultLocale>
   <DisplayName DefaultValue="EPFL Mail AI (Dev)" />

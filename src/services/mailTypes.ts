@@ -21,6 +21,9 @@ export interface EmailMessage {
   isRead: boolean;
   hasAttachments?: boolean;
   attachmentTexts?: Array<{ name: string; text: string }>;
+  // Deep link (OWA) to open this message in the browser — used to cite emails as
+  // clickable sources in generated Word reports (extract_topic_decisions).
+  webLink?: string;
 }
 
 export interface LightEmail {
@@ -49,6 +52,9 @@ export interface CalendarEvent {
   isOrganizer: boolean;
   organizer?: { emailAddress: EmailAddress };
   seriesMasterId?: string;
+  hasAttachments?: boolean;
+  // OWA deep link to open the event in the calendar (clickable source in reports).
+  webLink?: string;
 }
 
 export interface GraphAttachment {
@@ -78,4 +84,5 @@ export interface MailDataSource {
   searchServiceDeskEmailsForPerson(personName: string, maxResults?: number): Promise<LightEmail[]>;
   getEmailsBatch(messageIds: string[]): Promise<EmailMessage[]>;
   getMessageAttachments(messageId: string): Promise<GraphAttachment[]>;
+  getEventAttachments(eventId: string): Promise<GraphAttachment[]>;
 }

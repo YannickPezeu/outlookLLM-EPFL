@@ -11,10 +11,16 @@ $DEPLOYMENT = "outlook-plugin"
 $env:ENTRA_CLIENT_ID = "7ecc1fc6-2d9b-4bf6-aed9-12a396c9039c"
 $env:ENTRA_TENANT_ID = "f6c2556a-c4fb-4ab1-a2c7-9e220df11c43"
 
+# Deploy timestamp (ISO 8601 with local offset) — baked into the bundle via
+# webpack DefinePlugin so the running build date is visible in the add-in.
+$BUILD_TIME = Get-Date -Format "o"
+Write-Host "Build time: $BUILD_TIME" -ForegroundColor DarkGray
+
 Write-Host "=== 1/4 Building Docker image ===" -ForegroundColor Cyan
 docker build `
   --build-arg ENTRA_CLIENT_ID=$env:ENTRA_CLIENT_ID `
   --build-arg ENTRA_TENANT_ID=$env:ENTRA_TENANT_ID `
+  --build-arg BUILD_TIME=$BUILD_TIME `
   -t $IMAGE .
 
 Write-Host "=== 2/4 Pushing image ===" -ForegroundColor Cyan

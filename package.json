@@ -22,11 +22,13 @@
     "dompurify": "^3.3.3",
     "dotenv": "^17.3.1",
     "fastest-levenshtein": "^1.0.16",
+    "jszip": "^3.10.1",
     "mammoth": "^1.12.0",
     "marked": "^17.0.5",
     "pdfjs-dist": "^5.5.207",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

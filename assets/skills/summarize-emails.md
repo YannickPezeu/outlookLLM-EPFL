@@ -1,7 +1,15 @@
 # Skill : Resumer les echanges avec un contact
 
 ## Objectif
-L'utilisateur veut un RESUME ou une SYNTHESE de ses echanges email avec quelqu'un.
+L'utilisateur veut un RESUME ou une SYNTHESE de ses echanges email avec quelqu'un, OU faire
+LE POINT / resumer LA SITUATION vis-a-vis d'une PERSONNE (ou de plusieurs personnes nommees).
+La cle : la demande nomme une PERSONNE, pas un projet. (Pour un sujet/dossier sans personne
+nommee, c'est le skill sujet_dossier.)
+
+## Plusieurs personnes
+Si l'utilisateur nomme PLUSIEURS personnes (« la situation avec X et Y »), traite-les
+une par une : `search_contacts` puis `summarize_email_interactions` pour CHACUNE, puis
+presente les resumes par personne.
 
 ## Workflow obligatoire
 
@@ -18,6 +26,10 @@ L'utilisateur veut un RESUME ou une SYNTHESE de ses echanges email avec quelqu'u
 
 3. **Afficher le resume** : Affiche le resume retourne par l'outil VERBATIM, tel quel, sans le reformuler.
    - Si le nombre d'emails analyses est faible, mentionne-le et propose d'elargir la periode
+   - **Indique le decompte de provenance** que l'outil retourne : `direct_count` (emails directs
+     avec la personne, dont `received_count` recus + `sent_count` envoyes) et `servicedesk_count`
+     (tickets ServiceDesk la mentionnant). Ex : « Base : 12 emails directs avec Sandrine
+     (8 recus, 4 envoyes) + 5 tickets ServiceDesk la mentionnant. »
 
 4. **Pieces jointes importantes (optionnel, avec parcimonie)** : Le resultat peut contenir un champ `attachments_available` (liste de refs d'emails ayant des pieces jointes, avec sujet et date).
    - Regarde ces sujets : si une piece jointe semble CENTRALE pour la demande (ex: un document, un rapport, un compte-rendu, un budget, une presentation que le resume mentionne ou dont l'utilisateur a besoin), lis-la avec `read_email_attachments(email_id=<ref>)` puis complete le resume en 2-3 lignes avec ce qu'elle apporte.

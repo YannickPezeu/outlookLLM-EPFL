@@ -15,6 +15,7 @@ import {
   getServiceDeskEmailsForPerson,
   getEmailsBatch,
   getMessageAttachments,
+  getEventAttachments,
 } from "./graphMailService";
 
 export class GraphMailDataSource implements MailDataSource {
@@ -53,5 +54,9 @@ export class GraphMailDataSource implements MailDataSource {
 
   getMessageAttachments(messageId: string): Promise<GraphAttachment[]> {
     return getMessageAttachments(messageId);
+  }
+
+  getEventAttachments(eventId: string): Promise<GraphAttachment[]> {
+    return getEventAttachments(eventId);
   }
 }

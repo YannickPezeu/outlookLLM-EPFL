@@ -24,6 +24,7 @@ import { prepareMeeting } from "./meetingPrepService";
 import { GraphMailDataSource } from "./graphMailDataSource";
 import { resolveEmailRef, resolveEmailRefMetadata } from "./emailRefs";
 import { extractTextFromAttachments } from "./attachmentService";
+import { extractTopicDecisions, countTopicEmails } from "./topicDecisionService";
 
 // ─── Tool Definitions (OpenAI function-calling format) ──────────────
 
@@ -46,6 +47,7 @@ export const PRESERVED_TOOLS = new Set<string>([
   // "creuse le 2e point") can read the summary the user just saw.
   "summarize_email_interactions",
   "prepare_meeting",
+  "extract_topic_decisions",
   // Keep load_skill calls in history so the agent loop can re-derive which skills
   // (and thus which tools) are active on subsequent turns, and so the loaded
   // playbook stays resident in context.
@@ -225,6 +227,10 @@ export const AGENT_TOOLS: ToolDefinition[] = [
         "Génère un RÉSUMÉ / SYNTHÈSE structuré(e) des échanges email avec un contact. " +
         "À utiliser UNIQUEMENT quand l'utilisateur demande explicitement un résumé, une synthèse, " +
         "un point, un bilan des échanges (mots-clés : RÉSUME, SYNTHÉTISE, FAIS-MOI UN POINT, BILAN). " +
+        "C'EST AUSSI le bon outil pour « fais le point / résume la situation VIS-À-VIS D'UNE PERSONNE » " +
+        "(la demande nomme quelqu'un, pas un projet) : il cible les emails avec ce contact + les tickets " +
+        "ServiceDesk le mentionnant, et NON toute la boîte. Pour plusieurs personnes nommées, appelle-le " +
+        "une fois par personne. (Pour un SUJET/projet sans personne nommée → summarize_topic_status.) " +
         "Déduplique par conversation (garde le dernier Re: de chaque thread), " +
         "nettoie le HTML, et produit un résumé IA incluant les sujets abordés, " +
         "les décisions prises, les points en suspens, et une liste de to-dos pour la suite. " +
@@ -296,7 +302,7 @@ export const AGENT_TOOLS: ToolDefinition[] = [
       name: "read_email_attachments",
       description:
         "Lit et extrait le CONTENU TEXTE des pièces jointes d'UN email précis " +
-        "(formats supportés : PDF, DOCX, TXT, CSV, HTML ; max 5 Mo/fichier ; ~10 000 caractères extraits par fichier ; " +
+        "(formats supportés : PDF, DOCX, XLSX, PPTX, TXT, CSV, HTML ; max 20 Mo/fichier ; ~10 000 caractères extraits par fichier ; " +
         "les images et éléments inline sont ignorés). " +
         "À utiliser UNIQUEMENT quand la pièce jointe est jugée IMPORTANTE pour répondre " +
         "(ex: l'utilisateur demande ce que contient un document, ou un fichier est central dans la conversation). " +
@@ -321,7 +327,7 @@ export const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "summarize_current_email",
       description:
-        "Lit l'email ACTUELLEMENT OUVERT dans Outlook (corps + pièces jointes : PDF, DOCX, TXT, CSV, HTML) et retourne son contenu complet pour que TU le résumes. " +
+        "Lit l'email ACTUELLEMENT OUVERT dans Outlook (corps + pièces jointes : PDF, DOCX, XLSX, PPTX, TXT, CSV, HTML) et retourne son contenu complet pour que TU le résumes. " +
         "À utiliser dès que l'utilisateur demande de résumer / analyser / expliquer « cet email », « ce mail », « le message ouvert », « ce qui est demandé dans ce mail » et ses pièces jointes — sans qu'il ait besoin de préciser un contact ni un ref. " +
         "Ne prend AUCUN paramètre. Après l'appel, rédige le résumé structuré en suivant le champ \"instructions\" du résultat.",
       parameters: { type: "object", properties: {}, required: [] },
@@ -472,7 +478,12 @@ export const AGENT_TOOLS: ToolDefinition[] = [
         "Couvre à la fois les emails reçus et envoyés par l'utilisateur. " +
         "Utiliser quand l'utilisateur demande 'où on en est de X ?', 'état d'avancement de Y ?', " +
         "'fais-moi un point sur le projet Z', 'résume l'avancée du dossier W'. " +
-        "NE PAS confondre avec identify_topic_participants qui cartographie les PERSONNES impliquées.",
+        "NE PAS confondre avec identify_topic_participants qui cartographie les PERSONNES impliquées. " +
+        "ATTENTION — RÉSERVÉ AUX SUJETS/DOSSIERS, PAS AUX PERSONNES : si la demande porte sur " +
+        "une PERSONNE ou une LISTE DE PERSONNES nommées (« la situation avec Sandrine », " +
+        "« fais le point sur mes échanges avec X et Y »), NE PAS utiliser cet outil " +
+        "(il ratisse toute la boîte sans cibler la personne) — utiliser summarize_email_interactions " +
+        "pour chaque personne (skill summarize_emails).",
       parameters: {
         type: "object",
         properties: {
@@ -492,6 +503,110 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           },
         },
         required: ["topic"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "count_topic_emails",
+      description:
+        "Compte (sans les analyser) les emails contenant AU MOINS UN des mots-clés sur une période. " +
+        "À appeler AVANT extract_topic_decisions pour faire valider le périmètre à l'utilisateur " +
+        "(« j'ai trouvé X emails, on lance ? »). Rapide. Retourne le nombre + un échantillon de sujets.",
+      parameters: {
+        type: "object",
+        properties: {
+          keywords: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Mots-clés de recherche (ex: ['Apertus']). Un email est compté s'il contient AU MOINS UN mot-clé. " +
+              "Sois TRÈS précis : des mots-clés trop génériques ramènent des emails sans rapport.",
+          },
+          start_date: {
+            type: "string",
+            description: "Début de période (ISO 8601, ex: 2025-01-01T00:00:00Z). Demande-la à l'utilisateur.",
+          },
+          end_date: {
+            type: "string",
+            description: "Fin de période (ISO 8601). Demande-la à l'utilisateur. Défaut: aujourd'hui.",
+          },
+        },
+        required: ["keywords", "start_date"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "extract_topic_decisions",
+      description:
+        "Outil principal pour FAIRE LE POINT sur un SUJET/DOSSIER : « où en est X ? », « fais le point sur X », " +
+        "« relevé/registre des décisions prises sur X ». Génère un RAPPORT WORD (chronologie détaillée mail par mail, " +
+        "chronologie épurée, décisions majeures regroupées, et une synthèse autoportante), chaque décision liée à son " +
+        "email source (lien cliquable), + un résumé streamé dans le chat. " +
+        "Pipeline : (emails mot-clé sur la période) ∪ (emails trouvés sémantiquement) ∪ (réunions passées de l'agenda) " +
+        "→ lecture élément par élément, Y COMPRIS les pièces jointes (emails et réunions) → " +
+        "extraction (JSON) → épurée → décisions majeures → synthèse → document .docx téléchargé. " +
+        "À n'appeler QU'APRÈS validation du périmètre via count_topic_emails. " +
+        "Processus long (1-2 min). Le contenu principal est streamé (already_displayed) et le Word est téléchargé automatiquement.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            description: "Le sujet/dossier, en clair (ex: 'Apertus, le LLM suisse'). Sert de titre et de contexte.",
+          },
+          mode: {
+            type: "string",
+            enum: ["deep", "soft"],
+            description:
+              "Profondeur du rapport, à DEMANDER à l'utilisateur au départ. " +
+              "'deep' = résumé approfondi (~5 min) : chronologie détaillée mail par mail + descriptions détaillées, " +
+              "permet de remonter à chaque échange (audit/DPO). " +
+              "'soft' = résumé global rapide pour se rafraîchir les idées : pas de chronologie mail par mail ni de " +
+              "descriptions détaillées, mais reste précis (mêmes mails). Défaut: 'deep'.",
+          },
+          keywords: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "LES MÊMES mots-clés précis validés à l'étape count_topic_emails. Un email est retenu s'il contient au moins un mot-clé.",
+          },
+          question: {
+            type: "string",
+            description:
+              "Requête SÉMANTIQUE en langage naturel — une QUESTION ou une PHRASE complète, PAS une liste de mots-clés. " +
+              "Sert à repêcher 50 emails pertinents qui ne contiennent pas les mots-clés. " +
+              "Ex: 'Quelles décisions ont été prises concernant le déploiement et l'usage du LLM suisse Apertus à l'EPFL ?'",
+          },
+          focus: {
+            type: "string",
+            description:
+              "Optionnel : ANGLE/PERSPECTIVE de l'utilisateur, injecté dans TOUTES les passes d'analyse " +
+              "(extraction, épurée, majeures, synthèse) pour orienter le rapport. " +
+              "Déduis-le de la demande, ou demande-le si l'utilisateur évoque un point de vue précis. " +
+              "Ex: 'conformité et protection des données personnelles (perspective DPO)', " +
+              "'impacts budgétaires et coûts', 'risques sécurité'. Laisse vide si la demande est neutre.",
+          },
+          language: {
+            type: "string",
+            description:
+              "Langue de rédaction du rapport, propagée à toutes les passes LLM. " +
+              "Décide-la d'après la langue de l'utilisateur dans la conversation (ex: 'français', 'english', " +
+              "'italiano', 'deutsch'). Défaut: français si non précisé.",
+          },
+          start_date: {
+            type: "string",
+            description: "Début de période (ISO 8601). La même qu'à l'étape de comptage.",
+          },
+          end_date: {
+            type: "string",
+            description: "Fin de période (ISO 8601). Défaut: aujourd'hui.",
+          },
+        },
+        required: ["topic", "keywords", "question", "start_date"],
       },
     },
   },
@@ -942,6 +1057,13 @@ const executors: Record<string, ToolExecutor> = {
       email,
       emails_analyzed: emailsToSummarize.length,
       emails_total: allEmails.length,
+      // Breakdown so the agent can tell the user how many emails come from the
+      // contact directly vs ServiceDesk tickets merely mentioning them.
+      // (counts before conversation dedup — they reflect what was collected.)
+      direct_count: received.length + sent.length,
+      received_count: received.length,
+      sent_count: sent.length,
+      servicedesk_count: serviceDeskEmails.length,
       query: query || null,
       already_displayed: !!onStream,
       attachments_available: attachmentsAvailable.length > 0 ? attachmentsAvailable : undefined,
@@ -1014,7 +1136,7 @@ const executors: Record<string, ToolExecutor> = {
       return JSON.stringify({
         ref,
         attachments: [],
-        note: "Aucune pièce jointe exploitable (formats supportés : PDF, DOCX, TXT, CSV, HTML ; max 5 Mo ; images/inline ignorées).",
+        note: "Aucune pièce jointe exploitable (formats supportés : PDF, DOCX, XLSX, PPTX, TXT, CSV, HTML ; max 20 Mo ; images/inline ignorées).",
       });
     }
 
@@ -1068,7 +1190,9 @@ const executors: Record<string, ToolExecutor> = {
     if (email.hasAttachments) {
       log("Lecture des pièces jointes...");
       const raw = await getMessageAttachments(restId);
+      log(`  ${raw.length} pièce(s) jointe(s) reçue(s) de Graph`);
       // Per-attachment budget scaled to the ACTIVE model's context window.
+      // extractTextFromAttachments logs each kept/skipped attachment with a reason.
       attachments = await extractTextFromAttachments(raw as any, getContextBudgetChars(), {
         onProgress: log,
       });
@@ -1601,6 +1725,73 @@ const executors: Record<string, ToolExecutor> = {
         subject: e.subject,
       })),
       analysis,
+    });
+  },
+
+  async count_topic_emails(args, log, _onProgress, _onStream, signal) {
+    const keywords = ((args.keywords as string[]) || [])
+      .map((k) => (k || "").trim())
+      .filter(Boolean);
+    if (keywords.length === 0) {
+      return JSON.stringify({ error: "Paramètre requis : keywords (liste non vide)." });
+    }
+    const startDate = args.start_date as string | undefined;
+    const endDate = args.end_date as string | undefined;
+
+    const { count, capped, sampleSubjects } = await countTopicEmails(keywords, startDate, endDate, { log, signal });
+
+    return JSON.stringify({
+      count,
+      capped: capped || undefined,
+      keywords,
+      start_date: startDate || null,
+      end_date: endDate || null,
+      sample_subjects: sampleSubjects,
+      note: capped
+        ? "Plafond de recherche atteint sur au moins un mot-clé : le nombre réel peut être plus élevé. Affine les mots-clés."
+        : "Demande à l'utilisateur de valider ce périmètre avant de lancer extract_topic_decisions.",
+    });
+  },
+
+  async extract_topic_decisions(args, log, onProgress, onStream, signal) {
+    const topic = (args.topic as string)?.trim();
+    const keywords = ((args.keywords as string[]) || [])
+      .map((k) => (k || "").trim())
+      .filter(Boolean);
+    const question = (args.question as string)?.trim() || "";
+    const focus = (args.focus as string)?.trim() || undefined;
+    const language = (args.language as string)?.trim() || undefined;
+    const mode = (args.mode as string)?.trim() === "soft" ? "soft" : "deep";
+    const startDate = args.start_date as string | undefined;
+    const endDate = args.end_date as string | undefined;
+    if (!topic || keywords.length === 0) {
+      return JSON.stringify({ error: "Paramètres requis : topic (string) et keywords (liste non vide)." });
+    }
+
+    const result = await extractTopicDecisions(topic, keywords, question, focus, language, mode, startDate, endDate, {
+      log,
+      onProgress: (p) => {
+        log(`[${p.phase}] ${p.message}`);
+        onProgress?.(`${p.message} (${p.percent}%)`);
+      },
+      signal,
+    });
+
+    // Stream the chat-facing summary so the user sees the report immediately,
+    // then flag already_displayed so the agent doesn't re-emit it.
+    if (onStream) onStream(result.chatMarkdown);
+
+    return JSON.stringify({
+      topic: result.topic,
+      emails_scanned: result.emailsScanned,
+      decisions_extracted: result.decisionsExtracted,
+      major_count: result.majorCount,
+      already_displayed: !!onStream,
+      // Keep the report in the result (PRESERVED_TOOLS) so follow-ups can read it.
+      report: result.chatMarkdown,
+      note: result.emailsScanned > 0
+        ? "Rapport Word téléchargé (décisions détaillées + liens cliquables vers les emails sources)."
+        : "Aucun email trouvé — pas de rapport généré.",
     });
   },
 

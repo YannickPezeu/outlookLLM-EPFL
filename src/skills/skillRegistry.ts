@@ -9,6 +9,10 @@ export interface SkillMeta {
   file: string; // filename in assets/skills/
   // Tools unlocked when this skill is loaded (progressive tool disclosure).
   tools: string[];
+  // Hidden skills are NOT advertised in the catalog the agent uses for automatic
+  // routing — it will never pick them on its own. They remain loadable only when
+  // the user explicitly names the skill (the id stays in load_skill's enum).
+  hidden?: boolean;
 }
 
 export const SKILL_CATALOG: SkillMeta[] = [
@@ -29,7 +33,10 @@ export const SKILL_CATALOG: SkillMeta[] = [
     id: "summarize_emails",
     name: "Résumer les échanges avec un contact",
     description:
-      "Quand l'utilisateur veut un RÉSUMÉ de ses échanges email avec quelqu'un",
+      "Quand l'utilisateur veut un RÉSUMÉ de ses échanges email avec quelqu'un, ou FAIRE LE POINT / " +
+      "résumer LA SITUATION vis-à-vis d'une PERSONNE (ou de plusieurs personnes nommées) — ex: " +
+      "'résume la situation avec Sandrine', 'fais le point sur mes échanges avec X et Y'. " +
+      "Pour un SUJET/dossier/projet (pas une personne nommée) → sujet_dossier.",
     file: "summarize-emails.md",
     tools: [
       "summarize_email_interactions",
@@ -71,23 +78,45 @@ export const SKILL_CATALOG: SkillMeta[] = [
   },
   {
     id: "sujet_dossier",
-    name: "Cartographier / faire le point sur un sujet",
+    name: "Cartographier / faire le point / relevé des décisions sur un sujet",
     description:
-      "Quand l'utilisateur veut savoir QUI est impliqué sur un sujet, ou OÙ EN EST un dossier/projet",
+      "Quand l'utilisateur veut, à propos d'un SUJET/DOSSIER/PROJET (thème, pas une personne) : " +
+      "le RELEVÉ DES DÉCISIONS prises et/ou OÙ EN EST le dossier (rapport Word vérifiable + synthèse), " +
+      "OU savoir QUI est impliqué. Si la demande nomme une PERSONNE (« la situation avec Sandrine ») → " +
+      "summarize_emails à la place.",
     file: "sujet-dossier.md",
     tools: [
+      "count_topic_emails",
+      "extract_topic_decisions",
       "identify_topic_participants",
-      "summarize_topic_status",
       "search_contacts_in_servicedesk",
     ],
+  },
+  {
+    id: "secret_skill_for_dev",
+    name: "[DEV] Rapport Word des décisions sur un sujet",
+    description:
+      "[DEV/TEST] Quand l'utilisateur veut un RELEVÉ EXHAUSTIF ET VÉRIFIABLE des DÉCISIONS prises sur un " +
+      "sujet/dossier, sous forme de RAPPORT WORD avec un lien cliquable vers chaque email source " +
+      "(ex: « toutes les décisions prises sur Apertus », demande DPO/audit). Couvre potentiellement des centaines d'emails.",
+    file: "secret_skill_for_dev.md",
+    tools: ["count_topic_emails", "extract_topic_decisions"],
+    // Caché du routage automatique : ne se charge que si l'utilisateur demande
+    // explicitement « le skill secret dev » (id présent dans l'enum de load_skill).
+    hidden: true,
   },
 ];
 
 export function getSkillCatalogForPrompt(): string {
-  return SKILL_CATALOG.map((s) => `- ${s.id}: ${s.description}`).join("\n");
+  // Hidden skills are excluded so the agent never routes to them automatically.
+  return SKILL_CATALOG.filter((s) => !s.hidden)
+    .map((s) => `- ${s.id}: ${s.description}`)
+    .join("\n");
 }
 
 export function getSkillIds(): string[] {
+  // All ids stay in load_skill's enum (incl. hidden) so a user can load a hidden
+  // skill by naming it explicitly — it just isn't advertised in the catalog.
   return SKILL_CATALOG.map((s) => s.id);
 }
 
@@ -110,5 +139,39 @@ export async function loadSkillContent(skillId: string): Promise<string> {
   if (!resp.ok) {
     throw new Error(`Impossible de charger le skill ${skillId}: HTTP ${resp.status}`);
   }
-  return resp.text();
+  let content = await resp.text();
+
+  // Inject the user's runtime scheduling preference (the .md is a static asset and
+  // can't read it). Resolves include_self when the request has no explicit signal.
+  if (skillId === "schedule_meeting") {
+    const { getMeetingSelfDefault } = await import("../services/rcpApiService");
+    const pref = getMeetingSelfDefault();
+    let prefSection: string;
+    if (pref === "include") {
+      prefSection =
+        "L'utilisateur a configuré qu'il **participe PAR DÉFAUT** aux réunions qu'il organise. " +
+        "En l'absence de signal explicite (« avec moi » / « sans moi ») dans la demande, utilise " +
+        "`include_self=true` **sans poser de question**, et mentionne brièvement l'hypothèse dans ta " +
+        "réponse (ex: « en te comptant dans la réunion… »).";
+    } else if (pref === "exclude") {
+      prefSection =
+        "L'utilisateur a configuré qu'il **ne participe PAS par défaut** aux réunions qu'il organise " +
+        "(il planifie généralement pour d'autres). En l'absence de signal explicite (« avec moi » / " +
+        "« sans moi ») dans la demande, utilise `include_self=false` **sans poser de question**, et " +
+        "mentionne brièvement l'hypothèse dans ta réponse (ex: « sans te compter dans la réunion… »).";
+    } else {
+      prefSection =
+        "L'utilisateur **n'a PAS configuré** sa participation par défaut. En l'absence de signal " +
+        "explicite (« avec moi » / « sans moi ») dans la demande, tu DOIS lui **demander s'il fait " +
+        "partie de la réunion** avant d'appeler `find_common_slots`. Indique-lui aussi qu'il peut " +
+        "régler ce défaut dans l'onglet **Config** pour ne plus avoir à répondre à chaque fois.";
+    }
+    content +=
+      "\n\n## Préférence de participation (réglages utilisateur)\n" +
+      "RAPPEL DE PRIORITÉ : un signal explicite dans la demande (« avec moi », « sans moi », " +
+      "« quand est libre X ? ») l'emporte TOUJOURS sur le défaut ci-dessous.\n" +
+      prefSection;
+  }
+
+  return content;
 }

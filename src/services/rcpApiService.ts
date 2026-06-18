@@ -91,6 +91,62 @@ export function getContextBudgetChars(model?: string): number {
   return Math.floor(getModelMaxContextTokens(model) * 2.3);
 }
 
+/**
+ * Middle-out truncate a string to at most maxChars: keep the head and tail
+ * (where the salient context usually sits) and replace the middle with a marker
+ * so the model knows content was dropped (and doesn't treat the join as seamless).
+ */
+export function truncateMiddle(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const omitted = text.length - maxChars;
+  const marker = `\n\n[⚠️ CONTENU TRONQUÉ : ~${omitted} caractères omis au milieu pour tenir dans la fenêtre de contexte du modèle]\n\n`;
+  const keep = Math.max(0, maxChars - marker.length);
+  const head = Math.ceil(keep / 2);
+  const tail = keep - head;
+  return text.slice(0, head) + marker + (tail > 0 ? text.slice(text.length - tail) : "");
+}
+
+/**
+ * Single backstop that enforces the active model's input-character budget across
+ * the WHOLE message array — every email body, attachment, tool result and agent
+ * turn we ever stuff into a prompt passes through here (via buildChatBody).
+ *
+ * Water-filling: small messages (system prompt, instructions) are kept intact;
+ * only the largest messages are middle-out truncated, down to a uniform cap,
+ * until the total fits the budget. Returns NEW message objects and never mutates
+ * the caller's array (the agent loop reuses it across turns).
+ */
+function truncateMessagesToBudget<T extends { content: string | null }>(
+  messages: T[],
+  model: string
+): T[] {
+  const budget = getContextBudgetChars(model);
+  const sizes = messages.map((m) => m.content?.length ?? 0);
+  const total = sizes.reduce((a, b) => a + b, 0);
+  if (total <= budget) return messages;
+
+  // Find the uniform per-message cap C such that Σ min(size_i, C) ≤ budget.
+  const sorted = [...sizes].sort((a, b) => a - b);
+  let remaining = budget;
+  let cap = Infinity;
+  for (let i = 0; i < sorted.length; i++) {
+    const fairShare = remaining / (sorted.length - i);
+    if (sorted[i] <= fairShare) {
+      remaining -= sorted[i];
+    } else {
+      cap = Math.floor(fairShare);
+      break;
+    }
+  }
+  if (!isFinite(cap)) return messages;
+
+  return messages.map((m) =>
+    m.content && m.content.length > cap
+      ? { ...m, content: truncateMiddle(m.content, cap) }
+      : m
+  );
+}
+
 // Reasoning models served by RCP (self-hosted vLLM) emit a chain-of-thought
 // before the answer/tool call. We don't need it for tool orchestration or
 // summaries and it adds large latency (minutes on long context → timeouts), and
@@ -128,9 +184,17 @@ function buildChatBody(opts: {
   tools?: ToolDefinition[];
   maxTokens?: number;
 }): Record<string, unknown> {
+  // Single enforcement point for the model's input budget: middle-out truncate
+  // anything that would overflow the context window, regardless of which feature
+  // built the prompt.
+  const messages = truncateMessagesToBudget(
+    opts.messages as Array<ChatMessage | AgentMessage>,
+    opts.model
+  );
+
   const body: Record<string, unknown> = {
     model: opts.model,
-    messages: opts.messages,
+    messages,
     temperature: 0.3,
     max_tokens: opts.maxTokens ?? 8192,
     stream: opts.stream,
@@ -644,4 +708,17 @@ export function loadRcpSettings(): {
  */
 export function getUserCustomPrompt(): string {
   return localStorage.getItem("user_custom_prompt") || "";
+}
+
+/**
+ * Whether the user is, by default, a participant in the meetings they schedule.
+ * Drives the `include_self` parameter of find_common_slots when the request has no
+ * explicit "avec moi" / "sans moi" signal:
+ *   - "include" → assume include_self=true   (typical for a manager/organizer)
+ *   - "exclude" → assume include_self=false  (typical for an assistant booking for others)
+ *   - null      → unset: the assistant must ASK before scheduling.
+ */
+export function getMeetingSelfDefault(): "include" | "exclude" | null {
+  const v = localStorage.getItem("meeting_self_default");
+  return v === "include" || v === "exclude" ? v : null;
 }

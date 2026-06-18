@@ -3,6 +3,10 @@
  * Replace placeholder values with your actual Azure AD and RCP API settings.
  */
 export const config = {
+  // Build/deploy timestamp (ISO 8601), baked in by update.ps1 at deploy time.
+  // Empty string for local dev builds. Used to verify which version is running.
+  buildTime: process.env.BUILD_TIME || "",
+
   // Azure AD / Entra ID
   auth: {
     clientId: process.env.ENTRA_CLIENT_ID || "YOUR_CLIENT_ID",

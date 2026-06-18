@@ -223,6 +223,12 @@ export class SqliteMailDataSource implements MailDataSource {
     return [];
   }
 
+  // ── getEventAttachments ───────────────────────────────────────────
+  async getEventAttachments(_eventId: string): Promise<GraphAttachment[]> {
+    // Mock DB has no event attachments
+    return [];
+  }
+
   // ── Helpers for eval ──────────────────────────────────────────────
 
   /** List all calendar events (for eval script to iterate). */

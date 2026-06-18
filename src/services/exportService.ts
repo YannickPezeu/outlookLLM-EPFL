@@ -5,6 +5,7 @@ import {
   TextRun,
   HeadingLevel,
   AlignmentType,
+  ExternalHyperlink,
 } from "docx";
 import { marked } from "marked";
 
@@ -282,6 +283,500 @@ function parseInlineFormatting(text: string): TextRun[] {
   }
 
   return runs;
+}
+
+// ─── Decision report (extract_topic_decisions) ─────────────────────────
+
+/** One extracted decision, with its source email for citation. */
+export interface DecisionEntry {
+  date: string; // display string, e.g. "04/03/2026"
+  sortKey: number; // epoch ms for chronological ordering
+  participants: string;
+  subject: string;
+  decision: string;
+  citation?: string;
+  webLink?: string; // OWA deep link to the source email
+  marker?: string; // internal: source record marker (to trace back to full text)
+  attachmentsTruncated?: boolean; // source mail had a partially-analysed attachment
+}
+
+/** A source email backing a major decision (one of several that mention it). */
+export interface DecisionSource {
+  date: string;
+  subject: string;
+  webLink?: string;
+}
+
+/** A major decision in 3 readable tiers + every email/meeting that mentions it. */
+export interface MajorDecision {
+  title: string; // readable in 2 seconds
+  summary: string; // one short paragraph
+  detail: string; // fully detailed paragraph (dedicated LLM pass over the sources)
+  sources: DecisionSource[];
+}
+
+export interface DecisionReport {
+  topic: string;
+  generatedOn: string; // display date
+  emailsScanned: number;
+  intro: string; // plain text / light markdown
+  detailed: DecisionEntry[]; // §1 — exhaustive, mail by mail
+  curated: DecisionEntry[]; // §2 — chronologie épurée (décisions clés, 1 lien chacune)
+  major: MajorDecision[]; // §3 — décisions majeures (regroupées, multi-sources)
+  conclusion: string; // §4 — structured self-contained synthesis (markdown, no links)
+  language?: string; // report language (localises the static labels below)
+  mode?: "deep" | "soft"; // "soft" omits the §1 detailed mail-by-mail timeline
+}
+
+// ─── Static-label localisation ─────────────────────────────────────────
+// The LLM-generated content follows the run's `language`; these structural
+// labels do too, via a small map. Unknown languages fall back to English,
+// empty/French to French.
+type Locale = "fr" | "en" | "de" | "it" | "es";
+
+interface ReportLabels {
+  fileWord: string;
+  titlePrefix: string;
+  meta: (date: string, emails: number, decisions: number) => string;
+  secIntro: string;
+  secDetailed: string;
+  secCurated: string;
+  secMajor: string;
+  secSynthesis: string;
+  lblGeneral: string;
+  lblDetail: string;
+  lblMentioned: string;
+  lblSource: string;
+  openEmail: (subject: string) => string;
+  openGeneric: string;
+  linkUnavailable: string;
+  none: string;
+  dash: string;
+  meetingTag: string;
+  attachmentTruncated: string;
+}
+
+const LABELS: Record<Locale, ReportLabels> = {
+  fr: {
+    fileWord: "Décisions",
+    titlePrefix: "Décisions — ",
+    meta: (d, e, dec) => `Généré le ${d} · ${e} emails analysés · ${dec} décisions relevées`,
+    secIntro: "Introduction",
+    secDetailed: "Chronologie détaillée",
+    secCurated: "Chronologie épurée — décisions clés",
+    secMajor: "Décisions majeures",
+    secSynthesis: "Synthèse",
+    lblGeneral: "Description générale — ",
+    lblDetail: "Description détaillée",
+    lblMentioned: "Mentionnée dans :",
+    lblSource: "Source — ",
+    openEmail: (s) => `Ouvrir l'email : ${s}`,
+    openGeneric: "Ouvrir l'email source",
+    linkUnavailable: "(lien indisponible)",
+    none: "Aucune décision relevée.",
+    dash: "—",
+    meetingTag: "[Réunion]",
+    attachmentTruncated: "⚠ Pièce jointe partiellement analysée (tronquée) — voir l'email source pour le contenu complet.",
+  },
+  en: {
+    fileWord: "Decisions",
+    titlePrefix: "Decisions — ",
+    meta: (d, e, dec) => `Generated on ${d} · ${e} emails analysed · ${dec} decisions found`,
+    secIntro: "Introduction",
+    secDetailed: "Detailed timeline",
+    secCurated: "Condensed timeline — key decisions",
+    secMajor: "Major decisions",
+    secSynthesis: "Summary",
+    lblGeneral: "Overview — ",
+    lblDetail: "Detailed description",
+    lblMentioned: "Mentioned in:",
+    lblSource: "Source — ",
+    openEmail: (s) => `Open the email: ${s}`,
+    openGeneric: "Open the source email",
+    linkUnavailable: "(link unavailable)",
+    none: "No decision found.",
+    dash: "—",
+    meetingTag: "[Meeting]",
+    attachmentTruncated: "⚠ Attachment partially analysed (truncated) — see the source email for the full content.",
+  },
+  de: {
+    fileWord: "Entscheidungen",
+    titlePrefix: "Entscheidungen — ",
+    meta: (d, e, dec) => `Erstellt am ${d} · ${e} E-Mails analysiert · ${dec} Entscheidungen erfasst`,
+    secIntro: "Einleitung",
+    secDetailed: "Detaillierte Chronologie",
+    secCurated: "Verdichtete Chronologie — Schlüsselentscheidungen",
+    secMajor: "Wesentliche Entscheidungen",
+    secSynthesis: "Zusammenfassung",
+    lblGeneral: "Überblick — ",
+    lblDetail: "Detaillierte Beschreibung",
+    lblMentioned: "Erwähnt in:",
+    lblSource: "Quelle — ",
+    openEmail: (s) => `E-Mail öffnen: ${s}`,
+    openGeneric: "Quell-E-Mail öffnen",
+    linkUnavailable: "(Link nicht verfügbar)",
+    none: "Keine Entscheidung gefunden.",
+    dash: "—",
+    meetingTag: "[Besprechung]",
+    attachmentTruncated: "⚠ Anhang teilweise analysiert (gekürzt) — vollständiger Inhalt in der Quell-E-Mail.",
+  },
+  it: {
+    fileWord: "Decisioni",
+    titlePrefix: "Decisioni — ",
+    meta: (d, e, dec) => `Generato il ${d} · ${e} email analizzate · ${dec} decisioni rilevate`,
+    secIntro: "Introduzione",
+    secDetailed: "Cronologia dettagliata",
+    secCurated: "Cronologia sintetica — decisioni chiave",
+    secMajor: "Decisioni principali",
+    secSynthesis: "Sintesi",
+    lblGeneral: "Descrizione generale — ",
+    lblDetail: "Descrizione dettagliata",
+    lblMentioned: "Menzionata in:",
+    lblSource: "Fonte — ",
+    openEmail: (s) => `Apri l'email: ${s}`,
+    openGeneric: "Apri l'email di origine",
+    linkUnavailable: "(link non disponibile)",
+    none: "Nessuna decisione rilevata.",
+    dash: "—",
+    meetingTag: "[Riunione]",
+    attachmentTruncated: "⚠ Allegato analizzato solo in parte (troncato) — vedere l'email di origine per il contenuto completo.",
+  },
+  es: {
+    fileWord: "Decisiones",
+    titlePrefix: "Decisiones — ",
+    meta: (d, e, dec) => `Generado el ${d} · ${e} correos analizados · ${dec} decisiones detectadas`,
+    secIntro: "Introducción",
+    secDetailed: "Cronología detallada",
+    secCurated: "Cronología resumida — decisiones clave",
+    secMajor: "Decisiones principales",
+    secSynthesis: "Síntesis",
+    lblGeneral: "Descripción general — ",
+    lblDetail: "Descripción detallada",
+    lblMentioned: "Mencionada en:",
+    lblSource: "Fuente — ",
+    openEmail: (s) => `Abrir el correo: ${s}`,
+    openGeneric: "Abrir el correo de origen",
+    linkUnavailable: "(enlace no disponible)",
+    none: "Ninguna decisión detectada.",
+    dash: "—",
+    meetingTag: "[Reunión]",
+    attachmentTruncated: "⚠ Adjunto analizado parcialmente (truncado) — consulte el correo de origen para el contenido completo.",
+  },
+};
+
+function resolveLocale(language?: string): Locale {
+  const l = (language || "").toLowerCase();
+  if (!l || /fran|french/.test(l) || /^fr\b/.test(l)) return "fr";
+  if (/deutsch|german|allemand/.test(l) || /^de\b/.test(l)) return "de";
+  if (/ital/.test(l) || /^it\b/.test(l)) return "it";
+  if (/espa|spanish|castell/.test(l) || /^es\b/.test(l)) return "es";
+  if (/angl|english/.test(l) || /^en\b/.test(l)) return "en";
+  return "en"; // unknown non-French → English labels
+}
+
+/** Localised static labels for a given report language. */
+export function reportLabels(language?: string): ReportLabels {
+  return LABELS[resolveLocale(language)];
+}
+
+// Clean sans-serif available everywhere on Windows/Office (same as the add-in UI).
+// Avoids Word's Times New Roman default. Söhne/Tiempos (Claude's UI fonts) are
+// proprietary and not installed locally, so Word would substitute them anyway.
+const REPORT_FONT = "Segoe UI";
+
+/** A light dashed rule used to separate consecutive decision entries. */
+function separatorParagraph(): Paragraph {
+  return new Paragraph({
+    spacing: { before: 60, after: 60 },
+    children: [new TextRun({ text: "-".repeat(70), color: "BBBBBB" })],
+  });
+}
+
+/** A clickable "open email" hyperlink run, or a plain note if no link. */
+function sourceParagraph(entry: DecisionEntry, L: ReportLabels): Paragraph {
+  const label = entry.subject ? L.openEmail(entry.subject) : L.openGeneric;
+  if (entry.webLink) {
+    return new Paragraph({
+      spacing: { after: 120 },
+      children: [
+        new TextRun({ text: L.lblSource, size: 18, color: "666666", font: REPORT_FONT }),
+        new ExternalHyperlink({
+          link: entry.webLink,
+          children: [
+            new TextRun({ text: label, size: 18, color: "0563C1", underline: {}, font: REPORT_FONT }),
+          ],
+        }),
+      ],
+    });
+  }
+  return new Paragraph({
+    spacing: { after: 120 },
+    children: [
+      new TextRun({ text: `${L.lblSource}${entry.subject || ""} ${L.linkUnavailable}`, size: 18, italics: true, color: "999999", font: REPORT_FONT }),
+    ],
+  });
+}
+
+/** Render a decision entry as a small block of paragraphs (header / decision / quote / source). */
+function decisionBlock(entry: DecisionEntry, L: ReportLabels): Paragraph[] {
+  const blocks: Paragraph[] = [];
+  blocks.push(
+    new Paragraph({
+      spacing: { before: 120, after: 20 },
+      children: [
+        new TextRun({ text: `${entry.date}`, bold: true, font: REPORT_FONT }),
+        new TextRun({ text: `  ·  ${entry.participants}`, color: "666666", font: REPORT_FONT }),
+      ],
+    })
+  );
+  blocks.push(
+    new Paragraph({
+      spacing: { after: 20 },
+      children: [new TextRun({ text: entry.decision, font: REPORT_FONT })],
+    })
+  );
+  if (entry.citation && entry.citation.trim()) {
+    blocks.push(
+      new Paragraph({
+        spacing: { after: 20 },
+        indent: { left: 360 },
+        children: [new TextRun({ text: `« ${entry.citation.trim()} »`, italics: true, color: "555555", font: REPORT_FONT })],
+      })
+    );
+  }
+  blocks.push(sourceParagraph(entry, L));
+  if (entry.attachmentsTruncated) {
+    blocks.push(
+      new Paragraph({
+        spacing: { after: 120 },
+        children: [new TextRun({ text: L.attachmentTruncated, size: 18, italics: true, color: "B25E00", font: REPORT_FONT })],
+      })
+    );
+  }
+  return blocks;
+}
+
+/** A single source email as a clickable bullet line ("date — subject"). */
+function sourceLink(s: DecisionSource, L: ReportLabels): Paragraph {
+  const label = `${s.date} — ${s.subject || ""}`.trim();
+  if (s.webLink) {
+    return new Paragraph({
+      bullet: { level: 0 },
+      spacing: { after: 20 },
+      children: [
+        new ExternalHyperlink({
+          link: s.webLink,
+          children: [new TextRun({ text: label, size: 18, color: "0563C1", underline: {}, font: REPORT_FONT })],
+        }),
+      ],
+    });
+  }
+  return new Paragraph({
+    bullet: { level: 0 },
+    spacing: { after: 20 },
+    children: [new TextRun({ text: `${label} ${L.linkUnavailable}`, size: 18, italics: true, color: "999999", font: REPORT_FONT })],
+  });
+}
+
+/**
+ * Render one major decision in 3 readable tiers (no heavy bold):
+ *   1. a colored title — scannable in 2 seconds
+ *   2. a short summary paragraph
+ *   3. a fully detailed paragraph
+ * then the emails/meetings that mention it.
+ */
+function majorDecisionBlock(m: MajorDecision, index: number, L: ReportLabels): Paragraph[] {
+  const out: Paragraph[] = [];
+  // Tier 1 — title: distinct via size + colour, NOT bold.
+  out.push(
+    new Paragraph({
+      spacing: { before: 200, after: 60 },
+      children: [new TextRun({ text: `${index}. ${m.title}`, size: 26, color: "1F4E79", font: REPORT_FONT })],
+    })
+  );
+  // Tier 2 — short summary, labelled.
+  if (m.summary?.trim()) {
+    out.push(
+      new Paragraph({
+        spacing: { after: 60 },
+        children: [
+          new TextRun({ text: L.lblGeneral, bold: true, font: REPORT_FONT }),
+          ...parseInlineFormatting(m.summary.trim()),
+        ],
+      })
+    );
+  }
+  // Tier 3 — detailed paragraph(s), labelled and allowed light structure (bullets).
+  if (m.detail?.trim()) {
+    out.push(
+      new Paragraph({
+        spacing: { before: 40, after: 40 },
+        children: [new TextRun({ text: L.lblDetail, bold: true, font: REPORT_FONT })],
+      })
+    );
+    out.push(...richTextBlock(m.detail));
+  }
+  if (m.sources.length > 0) {
+    out.push(
+      new Paragraph({
+        spacing: { after: 20 },
+        children: [new TextRun({ text: L.lblMentioned, italics: true, size: 18, color: "666666", font: REPORT_FONT })],
+      })
+    );
+    for (const s of m.sources) out.push(sourceLink(s, L));
+  }
+  return out;
+}
+
+/** Render the major-decisions list with a separator between entries. */
+function majorList(items: MajorDecision[], L: ReportLabels): Paragraph[] {
+  const out: Paragraph[] = [];
+  items.forEach((m, i) => {
+    if (i > 0) out.push(separatorParagraph());
+    out.push(...majorDecisionBlock(m, i + 1, L));
+  });
+  return out;
+}
+
+/**
+ * Render light markdown (## headings, - bullets, **bold**) into paragraphs.
+ * Used for the structured, self-contained conclusion.
+ */
+function richTextBlock(md: string): Paragraph[] {
+  let content = md.replace(/^```(?:markdown)?\s*\n?/i, "").replace(/\n?```\s*$/i, "");
+  const out: Paragraph[] = [];
+  for (const raw of content.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const h = line.match(/^#{1,6}\s+(.*)/);
+    if (h) {
+      out.push(
+        new Paragraph({
+          spacing: { before: 180, after: 60 },
+          children: [new TextRun({ text: h[1], bold: true, size: 22, font: REPORT_FONT })],
+        })
+      );
+      continue;
+    }
+    const b = line.match(/^[-*]\s+(.*)/);
+    if (b) {
+      out.push(new Paragraph({ bullet: { level: 0 }, spacing: { after: 40 }, children: parseInlineFormatting(b[1]) }));
+      continue;
+    }
+    out.push(new Paragraph({ spacing: { after: 100 }, children: parseInlineFormatting(line) }));
+  }
+  if (out.length === 0) out.push(new Paragraph({ children: [new TextRun({ text: "—" })] }));
+  return out;
+}
+
+/** Push a free-text block (split on blank lines → paragraphs). */
+function textBlock(text: string): Paragraph[] {
+  return text
+    .split(/\n{2,}/)
+    .map((p) => p.replace(/\s*\n\s*/g, " ").trim())
+    .filter(Boolean)
+    .map(
+      (p) =>
+        new Paragraph({
+          spacing: { after: 120 },
+          children: parseInlineFormatting(p),
+        })
+    );
+}
+
+function sectionHeading(text: string): Paragraph {
+  return new Paragraph({
+    children: [new TextRun({ text, bold: true, size: 26, font: REPORT_FONT })],
+    heading: HeadingLevel.HEADING_1,
+    spacing: { before: 360, after: 140 },
+  });
+}
+
+/** Render the §1/§2 decision list with a dashed separator between entries. */
+function decisionList(entries: DecisionEntry[], L: ReportLabels): Paragraph[] {
+  const out: Paragraph[] = [];
+  entries.forEach((e, i) => {
+    if (i > 0) out.push(separatorParagraph());
+    out.push(...decisionBlock(e, L));
+  });
+  return out;
+}
+
+/**
+ * Build and download the structured decision report as a .docx with clickable
+ * email source links. Sections: Introduction, detailed timeline, condensed
+ * timeline, major decisions, summary. Static labels follow report.language.
+ */
+export async function exportDecisionReport(report: DecisionReport): Promise<void> {
+  const L = reportLabels(report.language);
+  const children: Paragraph[] = [];
+
+  children.push(
+    new Paragraph({
+      children: [new TextRun({ text: `${L.titlePrefix}${report.topic}`, bold: true, size: 34, font: REPORT_FONT })],
+      heading: HeadingLevel.TITLE,
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 120 },
+    })
+  );
+  children.push(
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 60 },
+      children: [
+        new TextRun({
+          text: L.meta(report.generatedOn, report.emailsScanned, report.detailed.length),
+          italics: true,
+          color: "666666",
+          size: 18,
+          font: REPORT_FONT,
+        }),
+      ],
+    })
+  );
+
+  // §0 Introduction
+  children.push(sectionHeading(L.secIntro));
+  children.push(...textBlock(report.intro || L.dash));
+
+  // §1 Detailed timeline (mail by mail) — DEEP only.
+  if (report.mode !== "soft") {
+    children.push(sectionHeading(L.secDetailed));
+    if (report.detailed.length === 0) {
+      children.push(new Paragraph({ children: [new TextRun({ text: L.none, font: REPORT_FONT })] }));
+    } else {
+      children.push(...decisionList(report.detailed, L));
+    }
+  }
+
+  // §2 Condensed timeline (key decisions)
+  children.push(sectionHeading(L.secCurated));
+  if (report.curated.length === 0) {
+    children.push(new Paragraph({ children: [new TextRun({ text: L.dash, font: REPORT_FONT })] }));
+  } else {
+    children.push(...decisionList(report.curated, L));
+  }
+
+  // §3 Major decisions (grouped, multi-source)
+  children.push(sectionHeading(L.secMajor));
+  if (report.major.length === 0) {
+    children.push(new Paragraph({ children: [new TextRun({ text: L.dash, font: REPORT_FONT })] }));
+  } else {
+    children.push(...majorList(report.major, L));
+  }
+
+  // §4 Summary (self-contained, structured, no links)
+  children.push(sectionHeading(L.secSynthesis));
+  children.push(...richTextBlock(report.conclusion || L.dash));
+
+  const doc = new Document({
+    // Document-wide default font so body text isn't Word's Times New Roman.
+    styles: { default: { document: { run: { font: REPORT_FONT } } } },
+    sections: [{ children }],
+  });
+  const blob = await Packer.toBlob(doc);
+  const safeTopic = report.topic.replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 60) || "topic";
+  downloadBlob(blob, `${L.fileWord}_${safeTopic}.docx`);
 }
 
 /** Trigger a file download from a Blob. */

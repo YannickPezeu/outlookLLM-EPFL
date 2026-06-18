@@ -22,6 +22,9 @@ export interface EmailMessage {
   isRead: boolean;
   hasAttachments?: boolean;
   attachmentTexts?: Array<{ name: string; text: string }>;
+  // OWA deep link to open the message in the browser (used for clickable
+  // email sources in generated Word reports).
+  webLink?: string;
 }
 
 export interface GraphAttachment {
@@ -62,6 +65,9 @@ export interface CalendarEvent {
   isOrganizer: boolean;
   organizer?: { emailAddress: { name: string; address: string } };
   seriesMasterId?: string;
+  hasAttachments?: boolean;
+  // OWA deep link to open the event in the calendar (clickable source in reports).
+  webLink?: string;
 }
 
 export interface DateRange {
@@ -303,7 +309,7 @@ export async function getAllInteractions(
  * Get a single email by ID with full body.
  */
 export async function getEmail(messageId: string): Promise<EmailMessage> {
-  const url = `${GRAPH}/me/messages/${messageId}?$select=id,subject,body,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,parentFolderId,isRead,hasAttachments`;
+  const url = `${GRAPH}/me/messages/${messageId}?$select=id,subject,body,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,parentFolderId,isRead,hasAttachments,webLink`;
   return graphFetch<EmailMessage>(url);
 }
 
@@ -322,10 +328,21 @@ export async function getMessageAttachments(messageId: string): Promise<GraphAtt
  * Get a single calendar event by ID.
  */
 export async function getCalendarEvent(eventId: string): Promise<CalendarEvent> {
-  const url = `${GRAPH}/me/events/${eventId}?$select=id,subject,body,bodyPreview,start,end,location,attendees,isOrganizer,organizer,seriesMasterId`;
+  const url = `${GRAPH}/me/events/${eventId}?$select=id,subject,body,bodyPreview,start,end,location,attendees,isOrganizer,organizer,seriesMasterId,hasAttachments,webLink`;
   return graphFetch<CalendarEvent>(url, {
     headers: { Prefer: `outlook.timezone="${USER_TIMEZONE}"` },
   });
+}
+
+/**
+ * Get file attachments for a calendar event. Meetings sometimes carry their real
+ * agenda/context as an attached document rather than in the body. Same shape as
+ * getMessageAttachments — reuses the attachmentService extractors downstream.
+ */
+export async function getEventAttachments(eventId: string): Promise<GraphAttachment[]> {
+  const url = `${GRAPH}/me/events/${eventId}/attachments`;
+  const response = await graphFetch<{ value: GraphAttachment[] }>(url);
+  return response.value;
 }
 
 /**
@@ -543,6 +560,35 @@ export async function getRecentSentEmails(
   const startDate = new Date(Date.now() - months * 30 * 24 * 60 * 60 * 1000);
   const dateFilter = `sentDateTime ge ${startDate.toISOString().slice(0, 10)}T00:00:00Z`;
   const url = `${GRAPH}/me/mailFolders/sentitems/messages?$filter=${encodeURI(dateFilter)}&$orderby=sentDateTime desc&$select=${select}&$top=50`;
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+/**
+ * Get received emails (inbox + all folders) within an EXPLICIT date range.
+ * Used by extract_topic_decisions for the period-bounded semantic recall pool.
+ */
+export async function getReceivedInRange(
+  startISO: string,
+  endISO: string,
+  maxResults = 1500
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+  const filter = `receivedDateTime ge ${startISO} and receivedDateTime le ${endISO}`;
+  const url = `${GRAPH}/me/messages?$filter=${encodeURI(filter)}&$orderby=receivedDateTime desc&$select=${select}&$top=50`;
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+/**
+ * Get sent emails within an EXPLICIT date range. Counterpart to getReceivedInRange.
+ */
+export async function getSentInRange(
+  startISO: string,
+  endISO: string,
+  maxResults = 1500
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,conversationId";
+  const filter = `sentDateTime ge ${startISO} and sentDateTime le ${endISO}`;
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$filter=${encodeURI(filter)}&$orderby=sentDateTime desc&$select=${select}&$top=50`;
   return fetchAllPages<LightEmail>(url, maxResults);
 }
 

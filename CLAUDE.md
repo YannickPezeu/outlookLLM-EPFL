@@ -54,7 +54,7 @@ src/services/embeddingService.ts   # Embeddings + cosine similarity + reranking
 src/services/meetingPrepService.ts # Pipeline complet de préparation de réunion
 src/services/agentService.ts       # Boucle agent multi-tour avec tool calling
 src/services/agentTools.ts         # Définitions et exécuteurs des outils agent
-src/services/attachmentService.ts  # Extraction texte pièces jointes (PDF, DOCX, TXT, CSV, HTML)
+src/services/attachmentService.ts  # Extraction texte pièces jointes (PDF, DOCX, XLSX, PPTX, TXT, CSV, HTML)
 
 src/components/AssistantView.tsx   # Interface chat assistant IA conversationnel
 src/components/MeetingPrepView.tsx # UI préparation de réunion

@@ -16,7 +16,7 @@ import {
   Settings24Regular,
   OpenRegular,
 } from "@fluentui/react-icons";
-import { initAuth, isAuthenticated, getAccount, getGraphToken } from "../services/authService";
+import { initAuth, getGraphToken, trySilentSignIn } from "../services/authService";
 import { AssistantView } from "../components/AssistantView";
 import { MeetingPrepView } from "../components/MeetingPrepView";
 import { SettingsView } from "../components/SettingsView";
@@ -207,6 +207,9 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
       .then(() => {
         setAuthReady(true);
         setLoading(false);
+        // Connect by default: silent token acquisition (no popup). If it fails,
+        // the Config tab shows "Non connecté" with a "Se connecter" button.
+        if (!inDialog) void trySilentSignIn();
       })
       .catch((err) => {
         console.warn("[App] Auth init failed:", err.message);
