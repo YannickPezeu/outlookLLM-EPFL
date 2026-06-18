@@ -30,7 +30,9 @@ import {
 } from "./graphMailService";
 import { batchEmbed, rankBySimilarity } from "./embeddingService";
 import { cleanEmailBodyFull } from "./cleanEmailBody";
-import { extractTextFromAttachments } from "./attachmentService";
+// Lazy-load attachmentService (pdfjs) so importers of this module (e.g.
+// meetingPrepService, used in a Node eval environment) don't pull pdfjs statically.
+const loadAttachmentService = () => import("./attachmentService");
 import { exportDecisionReport, reportLabels, DecisionEntry, DecisionReport, MajorDecision, DecisionSource } from "./exportService";
 import { LightEmail, CalendarEvent } from "./mailTypes";
 
@@ -74,8 +76,9 @@ interface PipelineOpts {
   signal?: AbortSignal;
 }
 
-// Internal per-email record (authoritative metadata from Graph).
-interface MailRecord {
+// Per-item record (email or meeting) fed to the map-reduce. Exported so other
+// pipelines (meeting prep deep mode) can build records and reuse analyzeRecordsToReport.
+export interface MailRecord {
   marker: string; // stable "E0", "E1"… used to map decisions back to the email
   id: string;
   kind: "email" | "meeting";
@@ -348,6 +351,7 @@ async function retrieveRecords(
         if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
         try {
           const atts = await getMessageAttachments(e.id);
+          const { extractTextFromAttachments } = await loadAttachmentService();
           const texts = await extractTextFromAttachments(atts as any, attachBudget, { onProgress: () => {} });
           const rec = recById.get(e.id);
           if (rec && texts.length > 0) {
@@ -435,6 +439,7 @@ async function collectMeetings(
     if (base.hasAttachments) {
       try {
         const atts = await getEventAttachments(ev.id);
+        const { extractTextFromAttachments } = await loadAttachmentService();
         const texts = await extractTextFromAttachments(atts as any, attachBudget, { onProgress: () => {} });
         if (texts.length > 0) {
           body += "\n\nPIÈCES JOINTES DE LA RÉUNION :\n" + texts.map((t) => `# ${t.name}\n${t.text}`).join("\n\n");
@@ -473,7 +478,7 @@ interface RawDecision {
   citation?: string;
 }
 
-async function mapExtract(records: MailRecord[], topic: string, directives: string, ignoreMinor: boolean, opts: PipelineOpts): Promise<DecisionEntry[]> {
+async function mapExtract(records: MailRecord[], topic: string, directives: string, ignoreMinor: boolean, relevanceHint: string | undefined, opts: PipelineOpts): Promise<DecisionEntry[]> {
   const log = opts.log ?? (() => {});
   const batches = batchByBudget(records);
   log(`Extraction en ${batches.length} lots (max ${BATCH_MAX_MAILS} mails / ${BATCH_CHAR_BUDGET} car. par lot)`);
@@ -503,6 +508,9 @@ async function mapExtract(records: MailRecord[], topic: string, directives: stri
           "- Reformule la décision en une phrase claire et factuelle.\n" +
           (ignoreMinor
             ? "- Ne retiens QUE les décisions IMPORTANTES / structurantes ; IGNORE les décisions mineures, de routine ou de détail.\n"
+            : "") +
+          (relevanceHint
+            ? `- FILTRE DE PERTINENCE : ne retiens QUE ce qui concerne ${relevanceHint}. La plupart des emails ne concernent PAS ce sujet — pour ceux-là ne renvoie rien.\n`
             : "") +
           'Réponds UNIQUEMENT en JSON valide : {"decisions":[{"mail":"E12","decision":"…","citation":"…"}]}. ' +
           "Aucun texte hors du JSON." +
@@ -827,6 +835,52 @@ function buildChatMarkdown(report: DecisionReport): string {
   return lines.join("\n");
 }
 
+// ── Reusable map-reduce core ────────────────────────────────────────────────
+
+export interface AnalyzeOptions extends PipelineOpts {
+  topic: string;
+  focus?: string;
+  language?: string;
+  ignoreMinor?: boolean; // soft: keep only important decisions
+  withDetailParagraph?: boolean; // major decisions get the dedicated detailed pass
+  withCurated?: boolean; // also compute the épurée list
+  relevanceHint?: string; // extraction relevance filter (meeting: meeting-relevant only)
+}
+
+export interface AnalyzeResult {
+  detailed: DecisionEntry[];
+  curated: DecisionEntry[];
+  major: MajorDecision[];
+  intro: string;
+  conclusion: string;
+}
+
+/**
+ * Run the map-reduce over a set of records (already built with bodies +
+ * attachments): extract → (curate) → major decisions → intro/synthesis.
+ * Shared by the topic pipeline and meeting-prep deep mode.
+ */
+export async function analyzeRecordsToReport(records: MailRecord[], o: AnalyzeOptions): Promise<AnalyzeResult> {
+  const directives = buildDirectives(o.focus, o.language);
+  const pOpts: PipelineOpts = { log: o.log, onProgress: o.onProgress, signal: o.signal };
+
+  const detailed = await mapExtract(records, o.topic, directives, !!o.ignoreMinor, o.relevanceHint, pOpts);
+
+  let curated: DecisionEntry[] = [];
+  if (o.withCurated) {
+    o.onProgress?.({ phase: "curate", message: "Chronologie épurée — décisions clés…", percent: 68 });
+    curated = await curate(detailed, o.topic, directives, pOpts);
+  }
+
+  o.onProgress?.({ phase: "major", message: "Regroupement des décisions majeures…", percent: 76 });
+  const major = await selectMajorDecisions(detailed, records, o.topic, directives, !!o.withDetailParagraph, pOpts);
+
+  o.onProgress?.({ phase: "synthesize", message: "Rédaction de l'intro et de la synthèse…", percent: 85 });
+  const { intro, conclusion } = await writeIntroConclusion(major, o.topic, directives, records.length, detailed.length);
+
+  return { detailed, curated, major, intro, conclusion };
+}
+
 // ── Orchestrator ──────────────────────────────────────────────────────────
 
 export async function extractTopicDecisions(
@@ -842,8 +896,6 @@ export async function extractTopicDecisions(
 ): Promise<TopicDecisionResult> {
   const log = opts.log ?? (() => {});
   const range = resolveRange(startISO, endISO);
-  // Angle + language are decided once and threaded into every LLM pass.
-  const directives = buildDirectives(focus, language);
   log(`Mode : ${mode} · période : ${fmtDate(range.startISO)} → ${fmtDate(range.endISO)} · langue : ${language?.trim() || "français"}`);
   opts.onProgress?.({ phase: "search", message: "Recherche des emails par mot-clé…", percent: 5 });
 
@@ -860,16 +912,15 @@ export async function extractTopicDecisions(
     };
   }
 
-  const detailed = await mapExtract(records, topic, directives, mode === "soft", opts);
-
-  opts.onProgress?.({ phase: "curate", message: "Chronologie épurée — décisions clés…", percent: 68 });
-  const curated = await curate(detailed, topic, directives, opts);
-
-  opts.onProgress?.({ phase: "major", message: "Regroupement des décisions majeures…", percent: 76 });
-  const major = await selectMajorDecisions(detailed, records, topic, directives, mode === "deep", opts);
-
-  opts.onProgress?.({ phase: "synthesize", message: "Rédaction de l'intro et de la synthèse…", percent: 85 });
-  const { intro, conclusion } = await writeIntroConclusion(major, topic, directives, records.length, detailed.length);
+  const { detailed, curated, major, intro, conclusion } = await analyzeRecordsToReport(records, {
+    topic,
+    focus,
+    language,
+    ignoreMinor: mode === "soft",
+    withDetailParagraph: mode === "deep",
+    withCurated: true,
+    ...opts,
+  });
 
   const report: DecisionReport = {
     topic,

@@ -17,18 +17,24 @@ L'utilisateur veut PREPARER une reunion, obtenir un BRIEFING, ou se renseigner a
    - Si un seul evenement correspond, utilise-le directement.
    - Tu as besoin de l'`id` de l'evenement pour l'etape suivante.
 
-2. **Lancer la preparation** : Utilise `prepare_meeting` avec l'event_id de l'evenement choisi.
-   - Ce processus prend 30 a 60 secondes. Previens l'utilisateur avant de lancer.
-   - Le pipeline analyse les emails echanges avec chaque participant, les classe par pertinence semantique, et genere un briefing structure. Il TÉLÉCHARGE AUSSI un rapport Word (briefing + emails sources cliquables par participant).
-   - **Paramètres optionnels** :
-     - `mode` : « deep » (approfondi, défaut) ou « soft » (rapide). Si l'utilisateur dit « vite / rapide / juste un aperçu », mets `soft`. En cas de doute, laisse `deep`.
-     - `language` : la langue de l'utilisateur (ex : « français », « english »). Défaut français.
-     - `focus` : un angle si l'utilisateur le précise (ex : « surtout le budget », « côté technique »). Sinon laisse vide.
+2. **Cadrer : demander la PROFONDEUR et la PÉRIODE** (avant de lancer) :
+   - **`mode`** :
+     > « Tu veux un **briefing global rapide** (vue d'ensemble), ou une **analyse approfondie** qui passe
+     > en revue tous tes échanges avec les participants pour en sortir les décisions majeures (plus long) ? »
+     - « global / rapide / aperçu » → `soft`. « approfondi / décisions / exhaustif » → `deep`.
+   - **`start_date` / `end_date`** : la **période** d'échanges à analyser (ex : 6 ou 12 derniers mois).
+     Demande-la (surtout en deep). Défaut fin = aujourd'hui.
+   - **`language`** : la langue de l'utilisateur (défaut français).
+   - PAS de mots-clés ni d'angle à demander : on regarde TOUS les échanges avec les participants, et
+     l'angle est défini automatiquement par le **titre + la description de la réunion**.
 
-3. **Presenter le briefing** : Affiche le champ `briefing` retourne par l'outil tel quel.
-   - Ne reformule PAS le briefing, affiche-le directement en Markdown.
-   - Tu peux ajouter une phrase d'introduction avant le briefing.
-   - Mentionne le nombre de participants et d'emails analyses (champs `participantCount` et `emailsAnalyzed`), et que le **rapport Word a été téléchargé** (champ `report_downloaded`).
+3. **Lancer** : Utilise `prepare_meeting` avec l'event_id + ces paramètres. Préviens que ça prend du temps
+   (deep plus long). L'outil affiche le résultat ET **télécharge un rapport Word** :
+   - soft → briefing + emails sources cliquables par participant ;
+   - deep → décisions majeures + synthèse + emails sources cliquables.
+
+4. **Presenter** : Affiche le champ `briefing`/résumé retourné tel quel (Markdown), sans le reformuler.
+   - Mentionne `participantCount`, `emailsAnalyzed`, et que le **rapport Word a été téléchargé** (`report_downloaded`).
 
 ## Pour TROUVER UNE DATE / un créneau
 Ce n'est PAS ce skill. Si l'utilisateur veut ORGANISER une réunion ou trouver une disponibilité

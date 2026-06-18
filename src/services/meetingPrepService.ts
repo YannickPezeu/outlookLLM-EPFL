@@ -9,7 +9,8 @@ import { getUserByEmail } from "./graphMailService";
 // Dynamic import to avoid pulling pdfjs-dist in Node.js eval environment
 const loadAttachmentService = () => import("./attachmentService");
 import type { AttachmentText } from "./attachmentService";
-import type { MeetingReport, MeetingParticipantBlock, DecisionSource } from "./exportService";
+import type { MeetingReport, MeetingParticipantBlock, DecisionSource, DecisionReport } from "./exportService";
+import { analyzeRecordsToReport, type MailRecord } from "./topicDecisionService";
 
 // ─── Report directives (angle + language), threaded into the briefing prompt ──
 // Inlined (not imported from topicDecisionService) to keep this module free of the
@@ -32,11 +33,12 @@ export type MeetingMode = "deep" | "soft";
 
 export interface MeetingPrepOptions {
   language?: string;
-  focus?: string;
   mode?: MeetingMode;
+  // Period to look back over for participant exchanges (chosen by the user).
+  // Filtered client-side ($search can't be combined with a date $filter).
+  startISO?: string;
+  endISO?: string;
 }
-
-const SOFT_MAX_EMAILS = 60; // cap on emails loaded into the briefing in soft mode
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -62,9 +64,12 @@ export interface MeetingBriefing {
   participants: Participant[];
   participantBriefings: ParticipantBriefing[];
   finalBriefing: string;
-  // Structured, source-linked report data (built by the pipeline, rendered to
-  // .docx by exportMeetingReport in the browser).
-  report: MeetingReport;
+  mode: MeetingMode;
+  // SOFT: structured briefing report (rendered by exportMeetingReport).
+  report?: MeetingReport;
+  // DEEP: decisions-style report (major decisions + synthesis, rendered by
+  // exportDecisionReport). Built from all participant exchanges over the period.
+  decisionReport?: DecisionReport;
 }
 
 export type PipelinePhase =
@@ -960,8 +965,9 @@ async function generateFinalBriefing(
         "3. **Sujets probables à aborder** : déduits des emails\n" +
         "4. **Actions en attente** : engagements non tenus, questions ouvertes\n" +
         "5. **Emails clés à relire** : les plus importants avec date et sujet\n\n" +
-        "Utilise le format Markdown. Sois concis, actionnable, et utile. " +
-        "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown)." +
+        "Utilise le format Markdown (titres, listes à puces, gras). Sois concis, actionnable, et utile. " +
+        "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown). " +
+        "N'utilise PAS de TABLEAUX markdown (le rendu Word ne les gère pas) : utilise des listes à puces à la place." +
         directives,
     },
     {
@@ -1066,7 +1072,9 @@ export async function prepareMeeting(
   opts: MeetingPrepOptions = {}
 ): Promise<MeetingBriefing> {
   const mode: MeetingMode = opts.mode === "soft" ? "soft" : "deep";
-  const directives = buildDirectives(opts.focus, opts.language);
+  // Soft-mode briefing language (the meeting's own subject/description already
+  // sets the angle, so no separate focus is needed).
+  const directives = buildDirectives(undefined, opts.language);
   // Phase 1: Extract context
   const { event, participants, query, eventAttachmentsText } = await extractContext(
     ds, eventId, onProgress
@@ -1087,6 +1095,7 @@ export async function prepareMeeting(
       participants: [],
       participantBriefings: [],
       finalBriefing: reason,
+      mode,
       report: {
         subject: event.subject,
         date: new Date(event.start.dateTime).toLocaleDateString("fr-CH"),
@@ -1105,6 +1114,26 @@ export async function prepareMeeting(
 
   // Phase 2: Collect emails per participant
   const emailsByParticipant = await collectEmails(ds, participants, onProgress);
+
+  // Period filter (chosen by the user) — applied client-side since $search can't
+  // be combined with a date $filter. Bounds how far back we look for exchanges.
+  if (opts.startISO || opts.endISO) {
+    const start = opts.startISO ? new Date(opts.startISO).getTime() : -Infinity;
+    const end = opts.endISO ? new Date(opts.endISO).getTime() : Infinity;
+    let kept = 0;
+    let before = 0;
+    for (const [pe, emails] of emailsByParticipant) {
+      before += emails.length;
+      const filtered = emails.filter((e) => {
+        const t = new Date(e.receivedDateTime).getTime();
+        return t >= start && t <= end;
+      });
+      emailsByParticipant.set(pe, filtered);
+      kept += filtered.length;
+    }
+    onProgress({ phase: "collecting_emails", message: `Filtre période : ${before} → ${kept} emails dans la fenêtre choisie`, percent: 25 });
+  }
+
   let totalCollected = 0;
   for (const [email, emails] of emailsByParticipant) {
     console.log(`[MeetingPrep] Phase 2 — Collecte: ${email} → ${emails.length} emails`);
@@ -1142,26 +1171,29 @@ export async function prepareMeeting(
     percent: 27,
   });
 
-  // SOFT skips per-email attachment extraction (slow) — meeting's own docs are
-  // still read in Phase 1.
-  const enriched = await fetchAndCleanBodies(ds, dedupedLight, onProgress, mode === "deep");
-  let rankedEmails = await embedAndRank(query, enriched, onProgress);
-  // SOFT caps the email volume for a quick briefing.
-  if (mode === "soft" && rankedEmails.length > SOFT_MAX_EMAILS) {
-    rankedEmails = rankedEmails.slice(0, SOFT_MAX_EMAILS);
-    onProgress({ phase: "embedding_ranking", message: `Mode rapide : limité aux ${SOFT_MAX_EMAILS} emails les plus pertinents`, percent: 46 });
+  const enriched = await fetchAndCleanBodies(ds, dedupedLight, onProgress);
+
+  // ─── DEEP mode: 20-by-20 map-reduce over ALL participant exchanges ──────────
+  // No embedding pre-rank: process everything, let the extraction's relevance
+  // filter keep only what concerns this meeting, then build a decisions-style
+  // report (major decisions + synthesis + clickable sources), like the topic one.
+  if (mode === "deep") {
+    return await prepareMeetingDeep(event, participants, enriched, dedupedLight, eventAttachmentsText, opts, onProgress, onStream);
   }
+
+  // ─── SOFT mode = the original holistic pipeline (embedding rank → 1 briefing) ──
+  let rankedEmails = await embedAndRank(query, enriched, onProgress);
   console.log(
     `[MeetingPrep] Phase 3 — Pipeline: ${totalCollected} collectés → ${dedupedLight.length} après dedup → ` +
       `${enriched.length} avec bodies → top ${rankedEmails.length} ` +
       `(score max: ${rankedEmails[0]?.score.toFixed(3) || "N/A"}, min: ${rankedEmails[rankedEmails.length - 1]?.score.toFixed(3) || "N/A"})`
   );
 
-  // Phase 5: Non-participant email search — DEEP only (skipped in SOFT for speed).
+  // Phase 5: Non-participant email search (part of the original soft pipeline).
   const existingEmailIds = new Set(rankedEmails.map((r) => r.email.id));
-  const nonParticipantEmails = mode === "deep"
-    ? await searchNonParticipantEmails(ds, query, event, existingEmailIds, participants, onProgress)
-    : [];
+  const nonParticipantEmails = await searchNonParticipantEmails(
+    ds, query, event, existingEmailIds, participants, onProgress
+  );
 
   // ─── Always load directly into context (Kimi K2.6 = 262k tokens) ────────
   // The old Mistral relevance filter (Phase 4) and per-participant summaries
@@ -1279,6 +1311,111 @@ export async function prepareMeeting(
     participants,
     participantBriefings,
     finalBriefing,
+    mode,
     report,
+  };
+}
+
+// ─── DEEP meeting pipeline (20-by-20 map-reduce, decisions-style report) ─────
+
+async function prepareMeetingDeep(
+  event: CalendarEvent,
+  participants: Participant[],
+  enriched: EnrichedEmail[],
+  dedupedLight: Array<{ email: LightEmail; participantEmail: string }>,
+  eventAttachmentsText: AttachmentText[],
+  opts: MeetingPrepOptions,
+  onProgress: ProgressCallback,
+  onStream: StreamCallback
+): Promise<MeetingBriefing> {
+  const PER_MAIL = 16000;
+  const eventBody = (event.body?.content ? cleanEmailBody(event.body.content) : event.bodyPreview || "").slice(0, 600);
+
+  // Build records (one per deduped participant email) for the map-reduce.
+  const records: MailRecord[] = enriched.map((e, i) => {
+    const f = e.fullEmail;
+    const iso = f.sentDateTime || f.receivedDateTime;
+    const to = (f.toRecipients || []).map((r) => r.emailAddress?.name || r.emailAddress?.address || "").filter(Boolean);
+    const from = f.from?.emailAddress?.name || f.from?.emailAddress?.address;
+    let body = (e.cleanBodyFull || e.cleanBody || f.bodyPreview || "").slice(0, PER_MAIL);
+    if (f.attachmentTexts && f.attachmentTexts.length > 0) {
+      body += "\n\nPIÈCES JOINTES :\n" + f.attachmentTexts.map((a) => `# ${a.name}\n${a.text}`).join("\n\n");
+    }
+    return {
+      marker: `E${i}`,
+      id: f.id,
+      kind: "email" as const,
+      date: new Date(iso).toLocaleDateString("fr-CH"),
+      sortKey: new Date(iso).getTime() || 0,
+      participants: `${from || "?"}${to.length ? ` → ${to.slice(0, 4).join(", ")}` : ""}`,
+      subject: f.subject || "(sans objet)",
+      webLink: f.webLink,
+      body,
+    };
+  });
+
+  const meetingDesc = `la réunion « ${event.subject} »${eventBody ? ` (${eventBody})` : ""}`;
+  onProgress({ phase: "summarizing_participants", message: `Analyse 20-par-20 de ${records.length} emails (filtrés sur le sujet de la réunion)…`, percent: 40 });
+
+  const { major, intro, conclusion } = await analyzeRecordsToReport(records, {
+    topic: event.subject,
+    focus: `Préparer la réunion « ${event.subject} ». ${eventBody}`,
+    language: opts.language,
+    ignoreMinor: false,
+    withDetailParagraph: true,
+    withCurated: false, // deep meeting report = major decisions + synthesis only
+    relevanceHint: meetingDesc,
+    onProgress: (p) => onProgress({ phase: "generating_briefing", message: p.message, percent: Math.min(95, 40 + Math.round(p.percent * 0.5)) }),
+    log: (m) => console.log(`[MeetingPrep:deep] ${m}`),
+  });
+
+  const decisionReport: DecisionReport = {
+    topic: event.subject,
+    generatedOn: new Date().toLocaleDateString("fr-CH"),
+    emailsScanned: records.length,
+    intro,
+    detailed: [], // dropped on purpose — most participant mails are off-topic
+    curated: [],
+    major,
+    conclusion,
+    language: opts.language,
+    mode: "deep",
+  };
+
+  // Stream a chat-facing summary (intro + major decisions + synthesis).
+  const lines: string[] = [];
+  lines.push(`## Préparation — ${event.subject}`);
+  lines.push("");
+  lines.push(intro);
+  lines.push("");
+  lines.push(`### Points / décisions majeurs (${major.length})`);
+  for (const m of major) lines.push(`- **${m.title}** — ${m.summary}`);
+  lines.push("");
+  lines.push(`### Synthèse`);
+  lines.push(conclusion);
+  lines.push("");
+  lines.push(`📄 **Rapport Word téléchargé** (préparation approfondie) — ${major.length} points majeurs + synthèse, avec liens cliquables vers les emails sources, sur ${records.length} emails analysés.`);
+  const chatMd = lines.join("\n");
+  onStream(chatMd);
+
+  // Per-participant counts for stats.
+  const countByP = new Map<string, number>();
+  for (const item of dedupedLight) countByP.set(item.participantEmail, (countByP.get(item.participantEmail) || 0) + 1);
+  const participantBriefings: ParticipantBriefing[] = participants.map((p) => ({
+    participant: p,
+    summary: "(mode approfondi — voir le rapport Word)",
+    emailCount: countByP.get(p.email) || 0,
+    relevantEmailIds: [],
+  }));
+
+  onProgress({ phase: "done", message: "Préparation approfondie terminée !", percent: 100 });
+
+  return {
+    event,
+    participants,
+    participantBriefings,
+    finalBriefing: chatMd,
+    mode: "deep",
+    decisionReport,
   };
 }

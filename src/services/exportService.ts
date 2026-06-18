@@ -807,21 +807,15 @@ export async function exportDecisionReport(report: DecisionReport): Promise<void
   children.push(sectionHeading(L.secIntro));
   children.push(...textBlock(report.intro || L.dash));
 
-  // §1 Detailed timeline (mail by mail) — DEEP only.
-  if (report.mode !== "soft") {
+  // §1 Detailed timeline (mail by mail) — rendered only when present and not soft.
+  if (report.mode !== "soft" && report.detailed.length > 0) {
     children.push(sectionHeading(L.secDetailed));
-    if (report.detailed.length === 0) {
-      children.push(new Paragraph({ children: [new TextRun({ text: L.none, font: REPORT_FONT })] }));
-    } else {
-      children.push(...decisionList(report.detailed, L));
-    }
+    children.push(...decisionList(report.detailed, L));
   }
 
-  // §2 Condensed timeline (key decisions)
-  children.push(sectionHeading(L.secCurated));
-  if (report.curated.length === 0) {
-    children.push(new Paragraph({ children: [new TextRun({ text: L.dash, font: REPORT_FONT })] }));
-  } else {
+  // §2 Condensed timeline (key decisions) — rendered only when present.
+  if (report.curated.length > 0) {
+    children.push(sectionHeading(L.secCurated));
     children.push(...decisionList(report.curated, L));
   }
 

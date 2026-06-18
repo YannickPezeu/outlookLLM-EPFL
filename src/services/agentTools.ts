@@ -25,7 +25,7 @@ import { GraphMailDataSource } from "./graphMailDataSource";
 import { resolveEmailRef, resolveEmailRefMetadata } from "./emailRefs";
 import { extractTextFromAttachments } from "./attachmentService";
 import { extractTopicDecisions, countTopicEmails } from "./topicDecisionService";
-import { exportMeetingReport } from "./exportService";
+import { exportMeetingReport, exportDecisionReport } from "./exportService";
 
 // ─── Tool Definitions (OpenAI function-calling format) ──────────────
 
@@ -353,18 +353,25 @@ export const AGENT_TOOLS: ToolDefinition[] = [
           },
           mode: {
             type: "string",
-            enum: ["deep", "soft"],
+            enum: ["soft", "deep"],
             description:
-              "Profondeur du briefing. 'deep' = approfondi (recherche hors-participants, pièces jointes des emails, " +
-              "plus d'emails). 'soft' = rapide (sans hors-participants ni PJ d'emails, volume réduit). Défaut: 'deep'.",
+              "Profondeur, à DEMANDER à l'utilisateur. " +
+              "'soft' = briefing global rapide (tous les emails pertinents chargés d'un coup → 1 briefing). " +
+              "'deep' = analyse approfondie : on regarde TOUS les échanges avec les participants sur la période, " +
+              "traités 20-par-20 et filtrés sur le sujet de la réunion → rapport Word (décisions majeures + synthèse " +
+              "+ emails sources cliquables). L'angle est défini par le titre/description de la réunion (pas de mots-clés). Défaut: 'soft'.",
           },
           language: {
             type: "string",
             description: "Langue de rédaction du briefing/rapport, d'après la langue de l'utilisateur (ex: 'français', 'english'). Défaut: français.",
           },
-          focus: {
+          start_date: {
             type: "string",
-            description: "Optionnel : angle/perspective pour orienter le briefing (ex: 'budget', 'aspects techniques', 'conformité'). Laisse vide si neutre.",
+            description: "Début de la période d'échanges à analyser (ISO 8601). À DEMANDER à l'utilisateur (ex: 6 ou 12 derniers mois).",
+          },
+          end_date: {
+            type: "string",
+            description: "Fin de la période (ISO 8601). Défaut: aujourd'hui.",
           },
         },
         required: ["event_id"],
@@ -1239,7 +1246,8 @@ const executors: Record<string, ToolExecutor> = {
     const eventId = args.event_id as string;
     const mode = (args.mode as string)?.trim() === "soft" ? "soft" : "deep";
     const language = (args.language as string)?.trim() || undefined;
-    const focus = (args.focus as string)?.trim() || undefined;
+    const startISO = (args.start_date as string)?.trim() || undefined;
+    const endISO = (args.end_date as string)?.trim() || undefined;
 
     log(`Démarrage de la préparation de réunion (mode ${mode})...`);
     onProgress?.("Démarrage...");
@@ -1253,19 +1261,21 @@ const executors: Record<string, ToolExecutor> = {
         log(`[${progress.phase}] ${progress.message}${progress.detail ? ` — ${progress.detail}` : ""}`);
         onProgress?.(`${progress.message} (${progress.percent}%)`);
       },
-      // Phase 8 streams the final briefing token-by-token. Forward it straight to
-      // the UI so it appears live instead of accumulating invisibly (~40s blank),
-      // and flag already_displayed below so the agent doesn't re-emit the whole
-      // briefing on its next turn (which previously caused a double generation).
+      // The final output streams token-by-token (soft briefing) or once (deep
+      // summary). Forward to the UI and flag already_displayed so the agent
+      // doesn't re-emit it.
       (chunk) => onStream?.(chunk),
-      { mode, language, focus }
+      { mode, language, startISO, endISO }
     );
 
-    // Build + download the structured Word report (briefing + clickable sources).
+    // Build + download the appropriate Word report (browser-only).
+    //  - SOFT → structured briefing report (briefing + per-participant sources)
+    //  - DEEP → decisions-style report (major decisions + synthesis + sources)
     let reportDownloaded = false;
     if (result.participants.length > 0) {
       try {
-        await exportMeetingReport(result.report);
+        if (result.decisionReport) await exportDecisionReport(result.decisionReport);
+        else if (result.report) await exportMeetingReport(result.report);
         reportDownloaded = true;
         log("Rapport Word de préparation téléchargé.");
       } catch (err) {
@@ -1283,7 +1293,9 @@ const executors: Record<string, ToolExecutor> = {
       already_displayed: true,
       briefing: result.finalBriefing,
       note: reportDownloaded
-        ? "Briefing affiché + rapport Word téléchargé (briefing + emails sources cliquables par participant)."
+        ? (mode === "deep"
+            ? "Résumé affiché + rapport Word approfondi téléchargé (décisions majeures + synthèse + emails sources cliquables)."
+            : "Briefing affiché + rapport Word téléchargé (briefing + emails sources cliquables par participant).")
         : undefined,
     });
   },

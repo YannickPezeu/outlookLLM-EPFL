@@ -14,6 +14,7 @@ import {
   Card,
   CardHeader,
   Badge,
+  Switch,
 } from "@fluentui/react-components";
 import {
   CalendarLtr24Regular,
@@ -30,7 +31,7 @@ import {
 } from "../services/meetingPrepService";
 import { GraphMailDataSource } from "../services/graphMailDataSource";
 import { useOutlookItem } from "./OutlookItemContext";
-import { exportToWord, exportToHtml, exportMeetingReport } from "../services/exportService";
+import { exportToWord, exportToHtml, exportMeetingReport, exportDecisionReport } from "../services/exportService";
 
 /* global Office */
 
@@ -204,6 +205,14 @@ export const MeetingPrepView: React.FC = () => {
     date: string;
     attendees: string[];
   } | null>(null);
+  // Report depth + period to look back over (defaults: soft, last 6 months).
+  const [mode, setMode] = useState<"soft" | "deep">("soft");
+  const [startDate, setStartDate] = useState<string>(() => {
+    const d = new Date();
+    d.setMonth(d.getMonth() - 6);
+    return d.toISOString().slice(0, 10);
+  });
+  const [endDate, setEndDate] = useState<string>(() => new Date().toISOString().slice(0, 10));
   const abortRef = useRef(false);
 
   const handlePrepare = useCallback(async () => {
@@ -307,6 +316,11 @@ export const MeetingPrepView: React.FC = () => {
         },
         (chunk) => {
           if (!abortRef.current) setBriefingText((prev) => prev + chunk);
+        },
+        {
+          mode,
+          startISO: startDate ? `${startDate}T00:00:00Z` : undefined,
+          endISO: endDate ? `${endDate}T23:59:59Z` : undefined,
         }
       );
 
@@ -332,7 +346,7 @@ export const MeetingPrepView: React.FC = () => {
     } finally {
       if (!abortRef.current) setLoading(false);
     }
-  }, [dialogItem]);
+  }, [dialogItem, mode, startDate, endDate]);
 
   const handleReset = useCallback(() => {
     setBriefingText("");
@@ -366,6 +380,38 @@ export const MeetingPrepView: React.FC = () => {
         Ouvrez un événement calendrier, puis cliquez pour générer un briefing basé sur
         vos échanges email avec les participants.
       </Text>
+
+      {/* Options : profondeur + période */}
+      <div style={{ display: "flex", flexDirection: "column", gap: "6px", padding: "8px 0" }}>
+        <Switch
+          checked={mode === "deep"}
+          disabled={loading}
+          onChange={(_, d) => setMode(d.checked ? "deep" : "soft")}
+          label={
+            mode === "deep"
+              ? "Analyse approfondie — décisions majeures + synthèse (plus long)"
+              : "Briefing global rapide"
+          }
+        />
+        <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+          <Text size={200}>Période :</Text>
+          <input
+            type="date"
+            value={startDate}
+            max={endDate}
+            disabled={loading}
+            onChange={(e) => setStartDate(e.target.value)}
+          />
+          <Text size={200}>→</Text>
+          <input
+            type="date"
+            value={endDate}
+            min={startDate}
+            disabled={loading}
+            onChange={(e) => setEndDate(e.target.value)}
+          />
+        </div>
+      </div>
 
       <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
         <Button
@@ -491,9 +537,13 @@ export const MeetingPrepView: React.FC = () => {
             icon={<ArrowDownload24Regular />}
             size="small"
             onClick={() => {
-              // Prefer the structured, source-linked report (briefing + clickable
-              // source emails per participant); fall back to the plain briefing.
-              if (briefingData?.report) {
+              // Prefer the structured, source-linked report:
+              //  - deep → decisions-style report (major decisions + synthesis)
+              //  - soft → briefing + per-participant sources
+              // Fall back to the plain briefing export.
+              if (briefingData?.decisionReport) {
+                exportDecisionReport(briefingData.decisionReport);
+              } else if (briefingData?.report) {
                 exportMeetingReport(briefingData.report);
               } else {
                 const title = eventInfo?.subject || "Briefing";
