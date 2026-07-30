@@ -52,11 +52,20 @@ export interface ToolCallResponse {
 
 // ─── RCP API Client ──────────────────────────────────────────────────
 
+// Models retired from RCP. A user who picked one by hand has it in localStorage,
+// where it would survive this update and 404 on every call. Remap instead.
+// 2026-07-30: Kimi-K2.6 is no longer served 24/7, replaced by Kimi-K2.7-Code.
+const RETIRED_MODELS = ["moonshotai/Kimi-K2.6", "moonshotai/Kimi-K2.5"];
+
 function getRcpConfig() {
   // Allow runtime override from localStorage (user settings in UI)
   const storedUrl = localStorage.getItem("rcp_base_url");
   const storedKey = localStorage.getItem("rcp_api_key");
-  const storedModel = localStorage.getItem("rcp_model");
+  let storedModel = localStorage.getItem("rcp_model");
+  if (storedModel && RETIRED_MODELS.includes(storedModel)) {
+    localStorage.setItem("rcp_model", config.rcp.defaultModel);
+    storedModel = config.rcp.defaultModel;
+  }
 
   return {
     baseUrl: storedUrl || config.rcp.baseUrl,
@@ -66,7 +75,9 @@ function getRcpConfig() {
 }
 
 // Max context window (tokens) per model family — probed on RCP (2026-06):
-// Kimi-K2.6 = 262144, gpt-oss-120b = 131072, Mistral-Small-3.2 = 131072.
+// Kimi-K2.7-Code = 262144, gpt-oss-120b = 131072, Mistral-Small-3.2 = 131072.
+// Confirmed 2026-07-30 on K2.7-Code: max_model_len = max_total_tokens = 262144,
+// i.e. prompt + completion combined, not input alone.
 const MODEL_CONTEXT_TOKENS: Array<[RegExp, number]> = [
   [/kimi-k2/i, 262144],
   [/gpt-oss/i, 131072],
@@ -100,9 +111,16 @@ export function getContextBudgetChars(model?: string): number {
 // is silently ignored by Kimi). Each model family has its own key, so we scope by
 // model name. Verified on RCP 2026-05-28 (DPO-Agent probe_kimi_thinking.py):
 // chat_template_kwargs.thinking=false → 0 reasoning chars, ~1s vs 2-4s.
+//
+// ⚠️ Scoped to K2.5/K2.6 ONLY. Re-probed on K2.7-Code 2026-07-30: there the flag
+// does not suppress reasoning, it MOVES it out of reasoning_content (which our
+// SSE parser drops) and into content (which we render). Same one-answer question:
+// 273 chars of rambling instead of 12, and slower (16.7s vs 13.9s at 200k tokens).
+// Left alone, K2.7-Code keeps its reasoning in reasoning_content — exactly what we
+// want. Do not widen this regex to new Kimi releases without re-running the probe.
 function applyModelTweaks(body: Record<string, unknown>): Record<string, unknown> {
   const model = typeof body.model === "string" ? body.model : "";
-  if (/kimi-k2/i.test(model)) {
+  if (/kimi-k2\.[56]/i.test(model)) {
     const existing = (body.chat_template_kwargs as Record<string, unknown>) ?? {};
     body.chat_template_kwargs = { ...existing, thinking: false };
     // Moonshot's published spec for NON-thinking mode requires these sampling

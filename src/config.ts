@@ -24,7 +24,7 @@ export const config = {
       ? "https://expert-finder.epfl.ch/outlook/api/rcp"
       : "https://inference.rcp.epfl.ch/v1",
     apiKey: "", // User sets this in the UI settings, or stored in localStorage
-    defaultModel: "moonshotai/Kimi-K2.6",
+    defaultModel: "moonshotai/Kimi-K2.7-Code",
     embeddingModel: "Qwen/Qwen3-Embedding-8B",
     rerankerModel: "BAAI/bge-reranker-v2-m3",
     filterModel: "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",

@@ -16,7 +16,7 @@ import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
 import { isAuthenticated, isUsingNaa, getAccount, signOut, getGraphToken } from "../services/authService";
 
 const AVAILABLE_MODELS = [
-  "moonshotai/Kimi-K2.6",
+  "moonshotai/Kimi-K2.7-Code",
   "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
   "openai/gpt-oss-120b",
 ];

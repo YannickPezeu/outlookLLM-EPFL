@@ -1202,7 +1202,7 @@ export async function prepareMeeting(
     ds, query, event, existingEmailIds, participants, onProgress
   );
 
-  // ─── Always load directly into context (Kimi K2.6 = 262k tokens) ────────
+  // ─── Always load directly into context (Kimi K2.7 = 262k tokens) ────────
   // The old Mistral relevance filter (Phase 4) and per-participant summaries
   // (Phase 6/7) existed only to compress content into a smaller window — and the
   // filter was slow. We skip them entirely: keep the top emails by EMBEDDING rank
