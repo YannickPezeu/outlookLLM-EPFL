@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { FluentProvider, webLightTheme } from "@fluentui/react-components";
+import { FluentProvider } from "@fluentui/react-components";
+import { epflLightTheme } from "../theme/epflTheme";
 import { App } from "./App";
 
 /* global Office */
@@ -8,7 +9,7 @@ import { App } from "./App";
 Office.onReady(() => {
   const root = createRoot(document.getElementById("root")!);
   root.render(
-    <FluentProvider theme={webLightTheme} style={{ height: "100%" }}>
+    <FluentProvider theme={epflLightTheme} style={{ height: "100%" }}>
       <App />
     </FluentProvider>
   );

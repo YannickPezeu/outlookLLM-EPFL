@@ -22,6 +22,7 @@ import { MeetingPrepView } from "../components/MeetingPrepView";
 import { SettingsView } from "../components/SettingsView";
 import { OutlookItemProvider, useOutlookItem } from "../components/OutlookItemContext";
 import type { OutlookItemData } from "../types/dialogMessages";
+import { epflBrand } from "../theme/epflTheme";
 
 /* global Office */
 
@@ -44,11 +45,36 @@ const useStyles = makeStyles({
     justifyContent: "space-between",
     marginBottom: "8px",
   },
+  lockup: {
+    display: "flex",
+    alignItems: "center",
+    columnGap: "8px",
+    minWidth: 0,
+  },
+  // The one place the vivid brand red is right: a filled mark, not text.
+  // brand[110] rather than a token because Fluent's light theme never exposes
+  // that rung as a foreground on light ground — see epflTheme.ts.
+  logo: {
+    height: "16px",
+    width: "auto",
+    flexShrink: 0,
+    color: epflBrand[110],
+  },
+  rule: {
+    width: "1px",
+    height: "17px",
+    backgroundColor: tokens.colorNeutralStroke2,
+    flexShrink: 0,
+  },
   title: {
     fontSize: tokens.fontSizeBase400,
     fontWeight: tokens.fontWeightSemibold,
     margin: "0",
-    color: tokens.colorBrandForeground1,
+    // Was colorBrandForeground1. In the EPFL lockup the logo carries the red
+    // and the service name is set in text colour; two reds side by side would
+    // read as one long red word.
+    color: tokens.colorNeutralForeground1,
+    whiteSpace: "nowrap",
   },
   content: {
     flex: 1,
@@ -305,7 +331,32 @@ const AppContent: React.FC<{ inDialog: boolean }> = ({ inDialog }) => {
     <div className={styles.container}>
       <div className={styles.header}>
         <div className={styles.headerRow}>
-          <h1 className={styles.title}>EPFL Mail AI</h1>
+          <div className={styles.lockup}>
+            {/* EPFL logo, inlined from elements/svg/epfl-logo.svg. Elements ships
+                it with a `<style>.cls-1{fill:red}</style>` block; that is dropped
+                here so the mark inherits `currentColor` and stays one value to
+                retheme. The rule and the service name after it are the standard
+                EPFL lockup for a tool that is not epfl.ch itself — which is also
+                why the title loses its "EPFL " prefix: the logo says it. */}
+            <svg
+              className={styles.logo}
+              viewBox="0 0 182.4 53"
+              role="img"
+              aria-label="EPFL"
+              fill="currentColor"
+            >
+              <polygon points="0 21.6 11.43 21.6 11.43 9.8 38.34 9.8 38.34 0 0 0 0 21.6" />
+              <polygon points="0 53 38.34 53 38.34 43.2 11.43 43.2 11.43 31.4 0 31.4 0 53" />
+              <rect x="11.43" y="21.6" width="24.61" height="9.8" />
+              <path d="M86,4.87a16.12,16.12,0,0,0-5.68-3.53A23.76,23.76,0,0,0,71.82,0H48.14V53H59.57V31.4H71.82a23.76,23.76,0,0,0,8.46-1.34A16.12,16.12,0,0,0,86,26.53a13.43,13.43,0,0,0,3.19-5,17.38,17.38,0,0,0,0-11.62A13.52,13.52,0,0,0,86,4.87ZM78,18.73a5.7,5.7,0,0,1-2.26,1.8,11.33,11.33,0,0,1-3.27.85,32,32,0,0,1-3.86.22H59.57V9.8h9.05a32,32,0,0,1,3.86.22,11,11,0,0,1,3.27.86A5.59,5.59,0,0,1,78,12.67a5,5,0,0,1,.86,3A5,5,0,0,1,78,18.73Z" />
+              <polygon points="155.47 43.2 155.47 0 144.04 0 144.04 53 182.38 53 182.38 43.2 155.47 43.2" />
+              <polygon points="97.42 21.6 108.85 21.6 108.85 9.8 135.76 9.8 135.76 0 97.42 0 97.42 21.6" />
+              <rect x="97.42" y="31.4" width="11.43" height="21.6" />
+              <rect x="108.85" y="21.6" width="24.61" height="9.8" />
+            </svg>
+            <span className={styles.rule} aria-hidden="true" />
+            <h1 className={styles.title}>Mail AI</h1>
+          </div>
           {!inDialog && (
             <Tooltip content="Ouvrir dans une fenêtre dédiée" relationship="label">
               <Button

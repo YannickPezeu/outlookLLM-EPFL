@@ -48,29 +48,36 @@ function buildHtmlDocument(
 <meta charset="utf-8"/>
 <title>${title} — EPFL Mail AI</title>
 <style>
+  /* EPFL palette, same Elements values as the add-in's theme (see
+     src/theme/epflTheme.ts). Hard-coded rather than tokenised because this
+     stylesheet is serialised into a standalone .doc/.html file that leaves the
+     app — no Fluent runtime on the other side. Kept deliberately plain: Word
+     re-renders this, and anything clever degrades unpredictably there. */
   * { box-sizing: border-box; }
   body {
-    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-    font-size: 14px; line-height: 1.7; color: #24292f;
+    font-family: "Suisse Int'l", Arial, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px; line-height: 1.7; color: #212121;
     max-width: 820px; margin: 0 auto; padding: 32px 24px;
     background: #fff;
   }
   .header { text-align: center; margin-bottom: 24px; }
-  .header h1 { font-size: 22px; font-weight: 600; color: #24292f; margin: 0 0 8px; }
-  .meta { color: #656d76; font-size: 13px; font-style: italic; margin: 2px 0; }
-  .divider { border: none; border-top: 2px solid #d0d7de; margin: 20px 0; }
-  h2 { font-size: 17px; font-weight: 600; margin: 24px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #d8dee4; color: #24292f; }
-  h3 { font-size: 15px; font-weight: 600; margin: 18px 0 8px; color: #24292f; }
-  h4 { font-size: 14px; font-weight: 600; margin: 14px 0 6px; }
+  .header h1 { font-size: 22px; font-weight: 700; color: #212121; margin: 0 0 8px; }
+  .meta { color: #707070; font-size: 13px; font-style: italic; margin: 2px 0; }
+  /* The one red mark in the document: a thick rule under the title, the way an
+     EPFL page opens. Elsewhere red would compete with the text. */
+  .divider { border: none; border-top: 2px solid #ff0000; margin: 20px 0; }
+  h2 { font-size: 17px; font-weight: 700; margin: 24px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #e6e6e6; color: #212121; }
+  h3 { font-size: 15px; font-weight: 700; margin: 18px 0 8px; color: #212121; }
+  h4 { font-size: 14px; font-weight: 700; margin: 14px 0 6px; }
   p { margin: 6px 0; }
   ul, ol { padding-left: 24px; margin: 6px 0; }
   li { margin-bottom: 4px; }
-  strong { font-weight: 600; }
+  strong { font-weight: 700; }
   em { font-style: italic; }
-  hr { border: none; border-top: 1px solid #d8dee4; margin: 16px 0; }
-  code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-  blockquote { border-left: 3px solid #d0d7de; margin: 8px 0; padding: 4px 16px; color: #656d76; }
-  .footer { text-align: center; color: #8b949e; font-size: 11px; margin-top: 32px; border-top: 1px solid #d8dee4; padding-top: 12px; }
+  hr { border: none; border-top: 1px solid #e6e6e6; margin: 16px 0; }
+  code { background: #f4f4f4; padding: 2px 6px; border-radius: 2px; font-size: 13px; }
+  blockquote { border-left: 3px solid #b51f1f; margin: 8px 0; padding: 4px 16px; color: #707070; }
+  .footer { text-align: center; color: #8e8e8e; font-size: 11px; margin-top: 32px; border-top: 1px solid #e6e6e6; padding-top: 12px; }
   @media print { body { padding: 16px; } .footer { display: none; } }
 </style>
 </head><body>
