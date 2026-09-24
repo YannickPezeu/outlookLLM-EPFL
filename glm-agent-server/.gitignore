@@ -1,0 +1,5 @@
+# Données de travail volumineuses, non utilisées par le code (arbre du site
+# EPFL : milliers de fichiers, chemins trop longs pour Windows).
+epfl-sitemap-tree/
+sitemap.xml
+__pycache__/
