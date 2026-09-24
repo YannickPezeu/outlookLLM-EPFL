@@ -24,7 +24,11 @@ const cases = [
     const h = await waitHealth();
     if (!/GLM-5\.3-Flash/.test(h.model)) throw new Error(`modèle inattendu : ${h.model}`);
   }],
-  ["proxy : réflexion coupée → aucun bloc de réflexion", async () => {
+  // `low` RÉDUIT la réflexion, il ne la supprime pas toujours : RCP renvoie
+  // parfois un bloc de 3 caractères (4 à 10 jetons de sortie en tout, contre
+  // ~45 sans l'en-tête — mesuré le 24.09.2026). On vérifie donc la réduction,
+  // pas l'absence. Surtout pas `none` : il déverse la réflexion dans la réponse.
+  ["proxy : réflexion coupée → réflexion réduite", async () => {
     const r = await fetch("http://127.0.0.1:8791/v1/messages", {
       method: "POST",
       headers: {
@@ -43,7 +47,11 @@ const cases = [
     const j = await r.json();
     if (!r.ok) throw new Error(`HTTP ${r.status} ${JSON.stringify(j).slice(0, 200)}`);
     const blocks = j.content ?? [];
-    if (blocks.some((b) => b.type === "thinking")) throw new Error("bloc de réflexion présent : l'en-tête n'est pas traduit");
+    const thinking = blocks.filter((b) => b.type === "thinking").map((b) => b.thinking ?? "").join("");
+    const out = j.usage?.output_tokens ?? 0;
+    if (out > 25 || thinking.length > 30) {
+      throw new Error(`réflexion non réduite (${out} jetons, ${thinking.length} car. de réflexion) : l'en-tête n'est pas traduit`);
+    }
     const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("");
     if (!text.includes("391")) throw new Error(`réponse inattendue : ${text.slice(0, 120)}`);
   }],

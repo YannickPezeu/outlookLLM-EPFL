@@ -61,6 +61,18 @@ litellm.register_model({
     name: _MODEL_CARD for name in (f"openai/{MODEL}", MODEL, MODEL.split("/")[-1])
 })
 
+# Le SDK coupe au milieu tout résultat d'outil de plus de 50 000 caractères
+# (« <response clipped> Due to the max output limit… »). Un document lu en
+# entier par read_document (jusqu'à 300 000 caractères côté Personal RAG)
+# arrivait tronqué, et l'agent relançait des recherches pour combler le trou
+# (constaté le 24.09.2026). Relevé au-dessus de ce plafond, enveloppe JSON
+# comprise ; le modèle sert un million de jetons. Le SDK lit cette valeur à
+# chaque appel, par son nom de module : la réassigner ici suffit.
+import openhands.sdk.llm.message as _oh_message  # noqa: E402
+
+TOOL_RESULT_MAX_CHARS = 500_000
+_oh_message.DEFAULT_TEXT_CONTENT_LIMIT = TOOL_RESULT_MAX_CHARS
+
 app = FastAPI()
 
 # ── Contexte de run mutable, partagé avec les callbacks/executors ────────────

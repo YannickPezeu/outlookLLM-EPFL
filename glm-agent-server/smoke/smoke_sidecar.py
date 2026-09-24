@@ -40,7 +40,12 @@ class ToolHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
         TOOL_CALLS.append(body)
-        result = {"results": [{"number": 1, "text": "Le projet stocke les données sur un serveur EPFL à Lausanne."}]}
+        if body.get("name") == "read_document":
+            # Document long, code caché EN PLEIN MILIEU : là où le SDK coupait.
+            filler = "Clause standard sans intérêt particulier. " * 1500
+            result = {"results": [{"number": 1, "text": filler + " Le code d'accès est ZEBRE-4217. " + filler}]}
+        else:
+            result = {"results": [{"number": 1, "text": "Le projet stocke les données sur un serveur EPFL à Lausanne."}]}
         out = json.dumps({"ok": True, "result": json.dumps(result)}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -134,12 +139,28 @@ def case_tool_with_image():
     assert "lausanne" in text.lower(), f"résultat d'outil non utilisé : {text[:200]!r}"
 
 
+def case_long_tool_result():
+    # Régression du 24.09.2026 : au-delà de 50 000 caractères, le SDK coupait
+    # le résultat d'outil au milieu, et un document lu en entier arrivait amputé.
+    TOOL_CALLS.clear()
+    tools = [{
+        "name": "read_document",
+        "description": "Lit le document de l'utilisateur en entier.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }]
+    text, _ = run("Lis le document « contrat.pdf » avec read_document et donne-moi le code d'accès qu'il contient.",
+                  tools=tools, system="Réponds en français. Utilise read_document pour lire le document.")
+    assert TOOL_CALLS, "l'agent n'a pas lu le document"
+    assert "4217" in text, f"code du milieu du document introuvable (résultat tronqué ?) : {text[:200]!r}"
+
+
 CASES = [
     ("réflexion coupée", case_reasoning_low),
     ("réflexion libre, séparée de la réponse", case_reasoning_free),
     ("lecture d'une image", case_image),
     ("historique rejoué", case_history),
     ("appel d'outil + image dans le même tour", case_tool_with_image),
+    ("long résultat d'outil transmis en entier", case_long_tool_result),
 ]
 
 
