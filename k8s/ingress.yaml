@@ -5,7 +5,14 @@ metadata:
   namespace: epfl-chatbot
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "10m"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    # 30 min : les appels LLM non streamés (map-reduce du mode deep) tiennent
+    # la connexion ouverte sans renvoyer un octet pendant plusieurs minutes.
+    # NB : ces annotations sont celles d'ingress-nginx ; l'ingressClass ici est
+    # traefik, qui les ignore (son responseHeaderTimeout par défaut vaut 0 = pas
+    # de limite). Le plafond réel est le proxy_read_timeout du nginx du pod,
+    # voir k8s/nginx.conf. On les garde alignées pour éviter les surprises si
+    # l'ingressClass change un jour.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "1800"
 spec:
   ingressClassName: traefik
   rules:

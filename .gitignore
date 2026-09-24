@@ -13,3 +13,6 @@ results/
 manifest.zip
 manifest-prod.zip
 src/services/agentTools_backup.ts
+
+# manifestes générés (contiennent un jeton de passerelle)
+claude-gateway/manifest-*.xml

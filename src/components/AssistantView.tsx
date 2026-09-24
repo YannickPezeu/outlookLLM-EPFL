@@ -13,10 +13,13 @@ import {
 } from "@fluentui/react-components";
 import { Send24Regular, Bot24Regular, ArrowReset24Regular, Stop24Filled, DocumentText24Regular } from "@fluentui/react-icons";
 import { runAgent, resolveEmailRef, type ToolProgressCallback, type StreamCallback, type EmailListCallback, type EmailListItem, type LogCallback } from "../services/agentService";
+import { applyToolProgress, appendTraceStep, type ToolTrace } from "../services/toolTraces";
+import { isUltraEngine, runUltraAgent, resetUltraSession, getUltraRefs, setUltraRefs, type DetailedSummaryRequest } from "../services/glmAgentService";
+import { summarizeExchanges } from "../services/exchangeSummaryService";
 import { clearEmailRefs } from "../services/emailRefs";
 import { loadConv, saveConv, removeConv } from "../services/convStorage";
 import { Mail24Regular } from "@fluentui/react-icons";
-import { type AgentMessage } from "../services/rcpApiService";
+import { type AgentMessage, setRcpUsageListener } from "../services/rcpApiService";
 
 // ─── Markdown config ────────────────────────────────────────────────
 
@@ -30,14 +33,26 @@ renderer.link = ({ href, text }: { href: string; text: string }) => {
 };
 marked.setOptions({ breaks: true, gfm: true, renderer });
 
+// Disable INDENTED code blocks (lines indented 4+ spaces). The agent's multi-step
+// narration ("Je vais chercher…  Pas de résultat…") often arrives indented across
+// streamed iterations, and CommonMark would render the whole thing as a <pre> code
+// block. We never want that in chat. Fenced code blocks (```) are untouched — they
+// go through the separate `fences` tokenizer.
+marked.use({
+  tokenizer: {
+    code() {
+      return undefined;
+    },
+  },
+});
+
 // ─── Types ──────────────────────────────────────────────────────────
 
-interface ToolTrace {
-  toolName: string;
-  args?: string;
-  steps: string[];
-  status: "calling" | "done" | "error";
-  errorMsg?: string;
+/** 1234 → "1.2k", 1234567 → "1.2M" — affichage compact du compteur de tokens. */
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
 }
 
 interface ChatMessage {
@@ -104,6 +119,24 @@ const useStyles = makeStyles({
     "& p": {
       margin: "4px 0",
     },
+    // Code blocks (intended, or an accidental ``` fence the model wrapped its
+    // reply in) must WRAP, not force horizontal page scroll in the narrow pane.
+    "& pre": {
+      whiteSpace: "pre-wrap",
+      overflowWrap: "anywhere",
+      wordBreak: "break-word",
+      backgroundColor: tokens.colorNeutralBackground3,
+      padding: "8px",
+      borderRadius: tokens.borderRadiusSmall,
+      margin: "4px 0",
+      maxWidth: "100%",
+      overflowX: "auto",
+    },
+    "& code": {
+      whiteSpace: "pre-wrap",
+      overflowWrap: "anywhere",
+      wordBreak: "break-word",
+    },
     "& .email-link": {
       display: "inline-flex",
       alignItems: "center",
@@ -154,21 +187,25 @@ const useStyles = makeStyles({
   },
   traceToolHeader: {
     display: "flex",
-    alignItems: "center",
+    alignItems: "flex-start",
     gap: "6px",
     fontSize: tokens.fontSizeBase100,
     color: tokens.colorNeutralForeground2,
     marginLeft: "4px",
+    minWidth: 0,
   },
   traceToolArgs: {
     fontFamily: tokens.fontFamilyMonospace,
     fontSize: tokens.fontSizeBase100,
     color: tokens.colorNeutralForeground3,
     opacity: 0.8,
-    maxWidth: "60%",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
+    // Flex child: minWidth:0 lets it shrink so the text WRAPS within the panel
+    // instead of forcing a horizontal scroll (default min-width:auto would keep
+    // the nowrap content at full width and overflow the container).
+    flex: "1 1 auto",
+    minWidth: 0,
+    overflowWrap: "anywhere",
+    wordBreak: "break-word",
   },
   traceSteps: {
     margin: "2px 0 4px 20px",
@@ -176,6 +213,8 @@ const useStyles = makeStyles({
     listStyle: "disc",
     "& li": {
       margin: "2px 0",
+      overflowWrap: "anywhere",
+      wordBreak: "break-word",
     },
   },
   traceError: {
@@ -321,6 +360,7 @@ const formatToolArgs = (raw?: string): string => {
     if (args.topic) parts.push(`topic: "${String(args.topic).slice(0, 60)}${String(args.topic).length > 60 ? "…" : ""}"`);
     if (args.name) parts.push(`name: "${args.name}"`);
     if (args.query) parts.push(`query: "${args.query}"`);
+    if (args.sender) parts.push(`from: "${args.sender}"`);
     if (args.months) parts.push(`${args.months} mois`);
     if (args.max_emails) parts.push(`max_emails: ${args.max_emails}`);
     if (args.max_people) parts.push(`max_people: ${args.max_people}`);
@@ -396,19 +436,35 @@ const CONV_STORAGE_KEY = "epfl-mail-ai-conversation";
 interface PersistedConv {
   messages: ChatMessage[];
   conversation: AgentMessage[];
+  tokenUsage: { input: number; output: number } | null;
+  /** Mode Ultra sans état : table des refs email renvoyée par le backend. */
+  ultraRefs: unknown;
 }
 
-function loadPersistedConv(): PersistedConv {
+function parsePersistedConv(raw: string | null): PersistedConv {
+  const empty: PersistedConv = { messages: [], conversation: [], tokenUsage: null, ultraRefs: null };
+  if (!raw) return empty;
   try {
-    const raw = localStorage.getItem(CONV_STORAGE_KEY);
-    if (!raw) return { messages: [], conversation: [] };
     const data = JSON.parse(raw);
     return {
       messages: Array.isArray(data.messages) ? data.messages : [],
       conversation: Array.isArray(data.conversation) ? data.conversation : [],
+      tokenUsage:
+        data.tokenUsage && typeof data.tokenUsage.input === "number"
+          ? { input: data.tokenUsage.input, output: data.tokenUsage.output || 0 }
+          : null,
+      ultraRefs: data.ultraRefs ?? null,
     };
   } catch {
-    return { messages: [], conversation: [] };
+    return empty;
+  }
+}
+
+function loadPersistedConv(): PersistedConv {
+  try {
+    return parsePersistedConv(localStorage.getItem(CONV_STORAGE_KEY));
+  } catch {
+    return parsePersistedConv(null);
   }
 }
 
@@ -416,19 +472,37 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
   const styles = useStyles();
   const initialConv = useMemo(() => loadPersistedConv(), []);
   const [messages, setMessages] = useState<ChatMessage[]>(initialConv.messages);
+  // Dernière valeur de `messages`, lue par handleSend (dont les dépendances
+  // n'incluent pas `messages`) pour envoyer l'historique au backend Ultra.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [liveTraces, setLiveTraces] = useState<ToolTrace[]>([]);
   const [streamingContent, setStreamingContent] = useState("");
+  // Tokens consommés sur la conversation. Ultra : événements usage du backend.
+  // Standard : listener global de rcpApiService (include_usage sur les streams).
+  // Persisté avec la conversation (survit aux remontages du taskpane).
+  const [tokenUsage, setTokenUsage] = useState<{ input: number; output: number } | null>(initialConv.tokenUsage);
   const [isCompose, setIsCompose] = useState(detectComposeMode);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const conversationRef = useRef<AgentMessage[]>(initialConv.conversation);
   const pendingEmailListRef = useRef<{ name: string; emails: EmailListItem[] } | null>(null);
+  // Mode Ultra : demande de pipeline détaillé (summarize_exchanges) émise par le
+  // backend pendant le tour — exécutée côté frontend une fois le tour terminé.
+  const pendingSummaryRef = useRef<DetailedSummaryRequest | null>(null);
   const tracesRef = useRef<ToolTrace[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Persist messages + LLM history whenever the chat changes.
+  // Restore the Ultra email-ref table on mount so multi-turn continues after a
+  // taskpane remount (Outlook unmounts panes when switching emails).
+  useEffect(() => {
+    if (initialConv.ultraRefs) setUltraRefs(initialConv.ultraRefs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist messages + LLM history + token count whenever the chat changes.
   // conversationRef is set just before setMessages in handleSend, so by the
   // time this effect runs (post-render), both are in sync.
   useEffect(() => {
@@ -438,9 +512,14 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     }
     void saveConv(
       CONV_STORAGE_KEY,
-      JSON.stringify({ messages, conversation: conversationRef.current })
+      JSON.stringify({
+        messages,
+        conversation: conversationRef.current,
+        tokenUsage,
+        ultraRefs: getUltraRefs(),
+      })
     );
-  }, [messages]);
+  }, [messages, tokenUsage]);
 
   // Reconcile with OfficeRuntime.storage on mount. The synchronous initial load
   // (loadPersistedConv) reads localStorage for instant paint, but on desktop the
@@ -451,17 +530,15 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     (async () => {
       const raw = await loadConv(CONV_STORAGE_KEY);
       if (cancelled || !raw) return;
-      try {
-        const data = JSON.parse(raw);
-        if (!Array.isArray(data.messages) || data.messages.length === 0) return;
-        setMessages((prev) => {
-          if (prev.length > 0) return prev; // already populated (sync load or user input)
-          conversationRef.current = Array.isArray(data.conversation) ? data.conversation : [];
-          return data.messages;
-        });
-      } catch {
-        // ignore malformed payloads
-      }
+      const data = parsePersistedConv(raw);
+      if (data.messages.length === 0) return;
+      setMessages((prev) => {
+        if (prev.length > 0) return prev; // already populated (sync load or user input)
+        conversationRef.current = data.conversation;
+        setTokenUsage(data.tokenUsage);
+        if (data.ultraRefs) setUltraRefs(data.ultraRefs);
+        return data.messages;
+      });
     })();
     return () => { cancelled = true; };
   }, []);
@@ -473,15 +550,11 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
   useEffect(() => {
     const onStorage = (e: StorageEvent) => {
       if (e.key !== CONV_STORAGE_KEY || e.newValue == null || loading) return;
-      try {
-        const data = JSON.parse(e.newValue);
-        if (Array.isArray(data.messages)) {
-          conversationRef.current = Array.isArray(data.conversation) ? data.conversation : [];
-          setMessages(data.messages);
-        }
-      } catch {
-        // ignore malformed payloads
-      }
+      const data = parsePersistedConv(e.newValue);
+      conversationRef.current = data.conversation;
+      setTokenUsage(data.tokenUsage);
+      if (data.ultraRefs) setUltraRefs(data.ultraRefs);
+      setMessages(data.messages);
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
@@ -513,6 +586,10 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     const text = (typeof overrideText === "string" ? overrideText : input).trim();
     if (!text || loading) return;
 
+    // Historique AVANT ce message : c'est lui que le backend Ultra (sans état)
+    // rejoue comme contexte.
+    const history = messagesRef.current.map(({ role, content }) => ({ role, content }));
+
     setInput("");
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setLoading(true);
@@ -521,35 +598,13 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     setStreamingContent("");
     streamBufferRef.current = "";
 
-    const findLastTraceIdx = (toolName: string): number => {
-      for (let i = tracesRef.current.length - 1; i >= 0; i--) {
-        if (tracesRef.current[i].toolName === toolName) return i;
-      }
-      return -1;
-    };
-
     const updateTraces = (updater: (prev: ToolTrace[]) => ToolTrace[]) => {
       tracesRef.current = updater(tracesRef.current);
       setLiveTraces(tracesRef.current);
     };
 
     const onToolProgress: ToolProgressCallback = (toolName, status, detail) => {
-      const isInitialCall = status === "calling" && !!detail && detail.trim().startsWith("{");
-      if (isInitialCall) {
-        updateTraces((prev) => [...prev, { toolName, args: detail, steps: [], status: "calling" }]);
-        return;
-      }
-      const idx = findLastTraceIdx(toolName);
-      if (idx < 0) return;
-      updateTraces((prev) => {
-        const next = [...prev];
-        next[idx] = {
-          ...next[idx],
-          status: status === "done" || status === "error" ? status : next[idx].status,
-          errorMsg: status === "error" ? detail : next[idx].errorMsg,
-        };
-        return next;
-      });
+      updateTraces((prev) => applyToolProgress(prev, toolName, status, detail));
     };
 
     const onLog: LogCallback = (msg) => {
@@ -558,13 +613,7 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
       const prefix = match[1];
       const rest = match[2];
       if (prefix === "Agent") return;
-      const idx = findLastTraceIdx(prefix);
-      if (idx < 0) return;
-      updateTraces((prev) => {
-        const next = [...prev];
-        next[idx] = { ...next[idx], steps: [...next[idx].steps, rest] };
-        return next;
-      });
+      updateTraces((prev) => appendTraceStep(prev, prefix, rest));
     };
 
     const onStream: StreamCallback = (chunk) => {
@@ -585,17 +634,50 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     abortControllerRef.current = controller;
 
     try {
-      const { response, updatedHistory } = await runAgent(
-        text,
-        conversationRef.current,
-        onToolProgress,
-        onStream,
-        onLog,
-        onEmailList,
-        controller.signal
-      );
-
-      conversationRef.current = updatedHistory;
+      let response: string;
+      if (isUltraEngine()) {
+        // Mode Ultra : backend agent + GLM-5.3-Flash (glm-agent-server), sans
+        // état — l'historique de l'UI part avec le message.
+        // conversationRef n'est pas mis à jour dans ce mode.
+        ({ response } = await runUltraAgent(
+          text,
+          history,
+          onToolProgress,
+          onStream,
+          onLog,
+          controller.signal,
+          (delta) => {
+            setTokenUsage((prev) => ({
+              input: (prev?.input || 0) + delta.input,
+              output: (prev?.output || 0) + delta.output,
+            }));
+          },
+          onEmailList,
+          (request) => {
+            pendingSummaryRef.current = request;
+          }
+        ));
+      } else {
+        // Moteur standard : chaque appel RCP (boucle agent, résumés internes…)
+        // remonte son usage via le listener, actif le temps de ce runAgent.
+        setRcpUsageListener((delta) => {
+          setTokenUsage((prev) => ({
+            input: (prev?.input || 0) + delta.input,
+            output: (prev?.output || 0) + delta.output,
+          }));
+        });
+        const result = await runAgent(
+          text,
+          conversationRef.current,
+          onToolProgress,
+          onStream,
+          onLog,
+          onEmailList,
+          controller.signal
+        );
+        response = result.response;
+        conversationRef.current = result.updatedHistory;
+      }
       const emailList = pendingEmailListRef.current;
       pendingEmailListRef.current = null;
       const finalTraces = tracesRef.current;
@@ -615,6 +697,58 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
       streamBufferRef.current = "";
       tracesRef.current = [];
       setLiveTraces([]);
+
+      // ── Phase 2 (mode Ultra) : pipeline détaillé délégué par le backend ──
+      // L'agent a appelé summarize_exchanges : on exécute ici l'ancien schéma
+      // (map-reduce + rapport Word + emails sources cliquables), en streamant
+      // dans la conversation comme le ferait le moteur standard.
+      const summaryReq = pendingSummaryRef.current;
+      if (summaryReq) {
+        pendingSummaryRef.current = null;
+        // Compter aussi les tokens du pipeline (appels RCP frontend)
+        setRcpUsageListener((delta) => {
+          setTokenUsage((prev) => ({
+            input: (prev?.input || 0) + delta.input,
+            output: (prev?.output || 0) + delta.output,
+          }));
+        });
+        onToolProgress(
+          "summarize_exchanges",
+          "calling",
+          JSON.stringify({ people: summaryReq.people.map((p) => p.name), mode: summaryReq.mode })
+        );
+        const result = await summarizeExchanges(
+          {
+            people: summaryReq.people,
+            mode: summaryReq.mode,
+            focus: summaryReq.focus,
+            language: summaryReq.language,
+            startISO: summaryReq.start_date,
+            endISO: summaryReq.end_date,
+          },
+          {
+            log: (m) => onLog(`[summarize_exchanges] ${m}`),
+            onProgress: (m) => onLog(`[summarize_exchanges] ${m}`),
+            onStream: (chunk) => onStream(chunk),
+            signal: controller.signal,
+          }
+        );
+        onToolProgress("summarize_exchanges", "done");
+        const reportTraces = tracesRef.current;
+        const reportContent = streamBufferRef.current || result.chatMarkdown;
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: reportContent,
+            traces: reportTraces.length > 0 ? reportTraces : undefined,
+          },
+        ]);
+        setStreamingContent("");
+        streamBufferRef.current = "";
+        tracesRef.current = [];
+        setLiveTraces([]);
+      }
     } catch (err: any) {
       const wasAborted = err?.name === "AbortError" || controller.signal.aborted;
       const finalTraces = tracesRef.current;
@@ -644,6 +778,7 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
       tracesRef.current = [];
       setLiveTraces([]);
     } finally {
+      setRcpUsageListener(null); // ne pas capter l'usage des autres onglets
       abortControllerRef.current = null;
       setLoading(false);
     }
@@ -684,6 +819,9 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
     setStreamingContent("");
     conversationRef.current = [];
     pendingEmailListRef.current = null;
+    pendingSummaryRef.current = null;
+    resetUltraSession(); // mode Ultra : oublie la table des refs email
+    setTokenUsage(null);
     void removeConv(CONV_STORAGE_KEY);
     clearEmailRefs();
   }, []);
@@ -695,7 +833,7 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
         <Text size={300} weight="semibold">
           Assistant EPFL Mail
         </Text>
-        <div style={{ marginLeft: "auto" }}>
+        <div style={{ marginLeft: "auto", display: "flex", flexDirection: "column", alignItems: "flex-end" }}>
           {!isEmpty && (
             <Tooltip content="Nouvelle conversation" relationship="label">
               <Button
@@ -705,6 +843,16 @@ export const AssistantView: React.FC<{ isActive?: boolean }> = ({ isActive = tru
                 onClick={handleReset}
                 disabled={loading}
               />
+            </Tooltip>
+          )}
+          {tokenUsage && (
+            <Tooltip
+              content={`Tokens consommés sur cette conversation : ${tokenUsage.input.toLocaleString("fr-CH")} en entrée, ${tokenUsage.output.toLocaleString("fr-CH")} en sortie`}
+              relationship="description"
+            >
+              <Text size={100} style={{ color: tokens.colorNeutralForeground3, whiteSpace: "nowrap" }}>
+                in {formatTokenCount(tokenUsage.input)} · out {formatTokenCount(tokenUsage.output)}
+              </Text>
             </Tooltip>
           )}
         </div>

@@ -1,0 +1,28 @@
+{
+  "name": "glm-agent-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend agent multi-frontends (OpenHands ou Claude Code) + GLM-5.3-Flash via RCP EPFL",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/server.ts",
+    "start": "tsx --env-file=.env src/server.ts",
+    "test": "tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0",
+    "fastest-levenshtein": "^1.0.16",
+    "jose": "^6.2.3",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.12.0",
+    "pdfjs-dist": "^6.1.200",
+    "tsx": "^4.19.0",
+    "xlsx": "^0.18.5",
+    "zod": "^3.24.1",
+    "zod-to-json-schema": "^3.25.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

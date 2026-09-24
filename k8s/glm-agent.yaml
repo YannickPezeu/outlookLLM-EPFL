@@ -1,0 +1,137 @@
+# glm-agent-server : backend agent Ultra (harness Claude Code ou OpenHands + GLM-5.3-Flash via RCP)
+# Exposé sur https://expert-finder.epfl.ch/outlook/agent
+#
+# Deux conteneurs dans le pod : le serveur Node (point d'entrée, tools, auth)
+# et le sidecar OpenHands (boucle agent, moteur par défaut depuis le
+# 24.09.2026), qu'il appelle sur 127.0.0.1:8792 — même pod, même localhost.
+#
+# Prérequis (une fois) :
+#   kubectl create secret generic glm-agent-secrets -n epfl-chatbot \
+#     --from-literal=RCP_API_KEY=sk-...
+#
+# Déploiement : ./glm-agent-server/deploy.ps1
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glm-agent
+  namespace: epfl-chatbot
+  labels:
+    app: glm-agent
+spec:
+  # Deux réplicas depuis le passage au mode sans état (historique et table des
+  # refs envoyés par le client). Seul l'appel d'outil client en cours reste
+  # attaché à un pod — d'où le cookie d'affinité sur le Service ci-dessous.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: glm-agent
+  template:
+    metadata:
+      labels:
+        app: glm-agent
+    spec:
+      containers:
+        - name: glm-agent
+          image: ic-registry.epfl.ch/mr-pezeu/glm-agent-server:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8790
+          env:
+            - name: RCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: glm-agent-secrets
+                  key: RCP_API_KEY
+            - name: USER_TIMEZONE
+              value: "Europe/Zurich"
+            - name: CORS_ORIGINS
+              value: "https://localhost:3000,https://expert-finder.epfl.ch,https://personal-rag.epfl.ch,http://localhost:8000"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8790
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Le SDK spawn un process Node (harness) par requête active — prévoir
+          # plus large que le pod nginx statique.
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1.5Gi"
+              cpu: "1500m"
+        - name: openhands
+          image: ic-registry.epfl.ch/mr-pezeu/glm-agent-openhands:latest
+          imagePullPolicy: Always
+          env:
+            - name: RCP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: glm-agent-secrets
+                  key: RCP_API_KEY
+          # Sonde exec, pas httpGet : le sidecar n'écoute que sur le localhost du
+          # pod, qu'une sonde HTTP du kubelet (depuis le nœud) n'atteint pas.
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8792/health', timeout=3)"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1.5Gi"
+              cpu: "1500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glm-agent-svc
+  namespace: epfl-chatbot
+spec:
+  selector:
+    app: glm-agent
+  ports:
+    - port: 80
+      targetPort: 8790
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: glm-agent-ingress
+  namespace: epfl-chatbot
+  annotations:
+    # Réponses SSE longues (l'agent peut travailler plusieurs minutes).
+    # 30 min, aligné sur le reste de la chaîne.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "1800"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # Affinité par cookie : pendant un tour, l'extension renvoie le résultat de
+    # ses outils (search_local…) par un POST /tool-result séparé, qui doit
+    # atteindre LE pod qui attend ce résultat. Syntaxe nginx : le Traefik du
+    # cluster (v3.6) lit les Ingress avec son fournisseur de compatibilité
+    # ingress-nginx, qui IGNORE les annotations traefik.* (vérifié le 24.09 :
+    # aucun cookie posé avec elles). SameSite=None + Secure : le cookie doit
+    # suivre les requêtes de l'extension et de personal-rag.epfl.ch.
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "glm_agent_affinity"
+    nginx.ingress.kubernetes.io/session-cookie-secure: "true"
+    nginx.ingress.kubernetes.io/session-cookie-samesite: "None"
+    nginx.ingress.kubernetes.io/session-cookie-path: "/outlook/agent"
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: expert-finder.epfl.ch
+      http:
+        paths:
+          - path: /outlook/agent
+            pathType: Prefix
+            backend:
+              service:
+                name: glm-agent-svc
+                port:
+                  number: 80

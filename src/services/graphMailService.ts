@@ -1,4 +1,4 @@
-import { getGraphToken } from "./authService";
+import { getGraphToken, markAuthFailed } from "./authService";
 import { config } from "../config";
 import { distance as levenshtein } from "fastest-levenshtein";
 import type { ParticipantCollectStats } from "./mailTypes";
@@ -22,6 +22,10 @@ export interface EmailMessage {
   isRead: boolean;
   hasAttachments?: boolean;
   attachmentTexts?: Array<{ name: string; text: string }>;
+  // OWA deep link to open the message in the browser (used for clickable
+  // email sources in generated Word reports).
+  webLink?: string;
+  conversationId?: string;
 }
 
 export interface GraphAttachment {
@@ -38,6 +42,7 @@ export interface LightEmail {
   id: string;
   subject: string;
   bodyPreview: string;
+  body?: { contentType: string; content: string };
   from?: { emailAddress: { name: string; address: string } };
   toRecipients?: Array<{ emailAddress: { name: string; address: string } }>;
   receivedDateTime: string;
@@ -61,6 +66,9 @@ export interface CalendarEvent {
   isOrganizer: boolean;
   organizer?: { emailAddress: { name: string; address: string } };
   seriesMasterId?: string;
+  hasAttachments?: boolean;
+  // OWA deep link to open the event in the calendar (clickable source in reports).
+  webLink?: string;
 }
 
 export interface DateRange {
@@ -167,7 +175,16 @@ async function graphFetch<T>(
   }
 
   if (response.status === 401) {
-    const freshToken = await recoverToken();
+    let freshToken: string;
+    try {
+      freshToken = await recoverToken();
+    } catch (err) {
+      // Token recovery itself failed (silent refresh + interactive both gave up):
+      // the session is broken, not a transient blip. Flip the auth badge so the
+      // user sees "Non connecté" and can hit "Reconnecter".
+      markAuthFailed();
+      throw err;
+    }
     const retry = await fetch(url, {
       ...options,
       headers: {
@@ -179,6 +196,9 @@ async function graphFetch<T>(
     if (!retry.ok) {
       const errorBody = await retry.text();
       console.error(`[Graph] Error ${retry.status} after token recovery:`, errorBody);
+      // A 401 even with a freshly-refreshed token means the session is genuinely
+      // broken (revoked/expired refresh token) — surface it in the UI.
+      if (retry.status === 401) markAuthFailed();
       throw new Error(`Graph API error ${retry.status}: ${errorBody}`);
     }
     return retry.json();
@@ -227,7 +247,7 @@ export async function searchEmailsFromSender(
   dateRange?: DateRange,
   onPage?: (itemsSoFar: number) => void
 ): Promise<EmailMessage[]> {
-  const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead,hasAttachments";
+  const select = "id,subject,bodyPreview,body,from,receivedDateTime,parentFolderId,isRead,hasAttachments,webLink,conversationId";
 
   // Narrow to this sender with $search (reliable for from/to via the search
   // index — unlike $filter on from/emailAddress/address, which under-returns).
@@ -254,7 +274,7 @@ export async function searchEmailsSentTo(
   dateRange?: DateRange,
   onPage?: (itemsSoFar: number) => void
 ): Promise<EmailMessage[]> {
-  const select = "id,subject,bodyPreview,body,toRecipients,sentDateTime,parentFolderId,hasAttachments";
+  const select = "id,subject,bodyPreview,body,toRecipients,sentDateTime,receivedDateTime,parentFolderId,hasAttachments,webLink,conversationId";
 
   // Same reliable approach as searchEmailsFromSender: $search narrows to this
   // recipient (search index), date pushed into the KQL query (sent:start..end)
@@ -290,7 +310,7 @@ export async function getAllInteractions(
  * Get a single email by ID with full body.
  */
 export async function getEmail(messageId: string): Promise<EmailMessage> {
-  const url = `${GRAPH}/me/messages/${messageId}?$select=id,subject,body,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,parentFolderId,isRead,hasAttachments`;
+  const url = `${GRAPH}/me/messages/${messageId}?$select=id,subject,body,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,parentFolderId,isRead,hasAttachments,webLink`;
   return graphFetch<EmailMessage>(url);
 }
 
@@ -309,10 +329,21 @@ export async function getMessageAttachments(messageId: string): Promise<GraphAtt
  * Get a single calendar event by ID.
  */
 export async function getCalendarEvent(eventId: string): Promise<CalendarEvent> {
-  const url = `${GRAPH}/me/events/${eventId}?$select=id,subject,body,bodyPreview,start,end,location,attendees,isOrganizer,organizer,seriesMasterId`;
+  const url = `${GRAPH}/me/events/${eventId}?$select=id,subject,body,bodyPreview,start,end,location,attendees,isOrganizer,organizer,seriesMasterId,hasAttachments,webLink`;
   return graphFetch<CalendarEvent>(url, {
     headers: { Prefer: `outlook.timezone="${USER_TIMEZONE}"` },
   });
+}
+
+/**
+ * Get file attachments for a calendar event. Meetings sometimes carry their real
+ * agenda/context as an attached document rather than in the body. Same shape as
+ * getMessageAttachments — reuses the attachmentService extractors downstream.
+ */
+export async function getEventAttachments(eventId: string): Promise<GraphAttachment[]> {
+  const url = `${GRAPH}/me/events/${eventId}/attachments`;
+  const response = await graphFetch<{ value: GraphAttachment[] }>(url);
+  return response.value;
 }
 
 /**
@@ -530,6 +561,35 @@ export async function getRecentSentEmails(
   const startDate = new Date(Date.now() - months * 30 * 24 * 60 * 60 * 1000);
   const dateFilter = `sentDateTime ge ${startDate.toISOString().slice(0, 10)}T00:00:00Z`;
   const url = `${GRAPH}/me/mailFolders/sentitems/messages?$filter=${encodeURI(dateFilter)}&$orderby=sentDateTime desc&$select=${select}&$top=50`;
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+/**
+ * Get received emails (inbox + all folders) within an EXPLICIT date range.
+ * Used by extract_topic_decisions for the period-bounded semantic recall pool.
+ */
+export async function getReceivedInRange(
+  startISO: string,
+  endISO: string,
+  maxResults = 1500
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId";
+  const filter = `receivedDateTime ge ${startISO} and receivedDateTime le ${endISO}`;
+  const url = `${GRAPH}/me/messages?$filter=${encodeURI(filter)}&$orderby=receivedDateTime desc&$select=${select}&$top=50`;
+  return fetchAllPages<LightEmail>(url, maxResults);
+}
+
+/**
+ * Get sent emails within an EXPLICIT date range. Counterpart to getReceivedInRange.
+ */
+export async function getSentInRange(
+  startISO: string,
+  endISO: string,
+  maxResults = 1500
+): Promise<LightEmail[]> {
+  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,conversationId";
+  const filter = `sentDateTime ge ${startISO} and sentDateTime le ${endISO}`;
+  const url = `${GRAPH}/me/mailFolders/sentitems/messages?$filter=${encodeURI(filter)}&$orderby=sentDateTime desc&$select=${select}&$top=50`;
   return fetchAllPages<LightEmail>(url, maxResults);
 }
 
@@ -983,31 +1043,52 @@ export async function searchContactsByName(
 
 /**
  * Full-text search across all messages.
+ *
+ * `sender` (optional) restricts to emails FROM a given person (name or address),
+ * combined with the free-text query in a SINGLE Graph $search via the KQL
+ * `from:` operator — so "from:matéo docling" is one fast request, no embeddings.
  */
 export async function searchEmails(
   query: string,
   maxResults = 20,
-  dateRange?: DateRange
+  dateRange?: DateRange,
+  sender?: string
 ): Promise<LightEmail[]> {
-  const select = "id,subject,bodyPreview,from,toRecipients,receivedDateTime,conversationId,hasAttachments";
+  // Include `body` in the projection so the search returns the full content in
+  // the SAME paginated request (like searchEmailsFromSender) — no per-email
+  // fetch. Lets callers read the actual content (e.g. extract a URL).
+  const select = "id,subject,bodyPreview,body,from,toRecipients,receivedDateTime,conversationId,hasAttachments";
 
   if (dateRange) {
-    // Can't combine $search + $filter on messages, so $filter date + post-filter text client-side
+    // Can't combine $search + $filter on messages, so $filter date + post-filter
+    // text client-side. Sender is also matched client-side here (against from
+    // name/address). The body is in the projection, so deep matches count too.
     const dateFilter = buildDateFilter(dateRange);
     const url = `${GRAPH}/me/messages?$filter=${encodeURI(dateFilter)}&$orderby=receivedDateTime desc&$select=${select}&$top=50`;
     const results = await fetchAllPages<LightEmail>(url, 1000);
     const lower = query.toLowerCase();
-    const filtered = results.filter(e =>
-      e.subject?.toLowerCase().includes(lower) ||
-      e.bodyPreview?.toLowerCase().includes(lower) ||
-      e.from?.emailAddress?.name?.toLowerCase().includes(lower) ||
-      e.from?.emailAddress?.address?.toLowerCase().includes(lower)
-    );
+    const senderLower = sender?.toLowerCase();
+    const filtered = results.filter(e => {
+      const textMatch = !lower ||
+        e.subject?.toLowerCase().includes(lower) ||
+        e.bodyPreview?.toLowerCase().includes(lower) ||
+        e.body?.content?.toLowerCase().includes(lower) ||
+        e.from?.emailAddress?.name?.toLowerCase().includes(lower) ||
+        e.from?.emailAddress?.address?.toLowerCase().includes(lower);
+      const senderMatch = !senderLower ||
+        e.from?.emailAddress?.name?.toLowerCase().includes(senderLower) ||
+        e.from?.emailAddress?.address?.toLowerCase().includes(senderLower);
+      return textMatch && senderMatch;
+    });
     return filtered.slice(0, maxResults);
   }
 
-  const encodedQuery = encodeURIComponent(query);
-  const url = `${GRAPH}/me/messages?$search="${encodedQuery}"&$select=${select}&$top=50`;
+  // KQL: `from:<sender>` narrows to the sender, ANDed with the free-text query.
+  // Quote the sender if it contains spaces (e.g. a full name) so KQL treats it
+  // as one phrase rather than two terms.
+  const fromClause = sender ? `from:${/\s/.test(sender) ? `"${sender}"` : sender} ` : "";
+  const kql = `${fromClause}${query}`.trim();
+  const url = `${GRAPH}/me/messages?$search="${encodeURIComponent(kql)}"&$select=${select}&$top=50`;
   return fetchAllPages<LightEmail>(url, maxResults);
 }
 

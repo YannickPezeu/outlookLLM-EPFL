@@ -4,3 +4,9 @@ dist
 .env
 *.md
 .github
+
+# Services annexes, hors du build front : ce sont des serveurs séparés avec
+# leurs propres images. glm-agent-server embarque un .venv Python — sans ça,
+# tout part dans le contexte envoyé au daemon Docker à chaque build.
+glm-agent-server
+claude-gateway

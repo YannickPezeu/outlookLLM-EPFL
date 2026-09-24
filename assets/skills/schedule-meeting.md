@@ -18,13 +18,20 @@ free/busy des autres participants : c'est précisément ce que fait `find_common
 ## Workflow obligatoire
 1. **Identifier les participants** : pour chaque personne nommée, appelle `search_contacts` pour
    obtenir son adresse email exacte. Si plusieurs résultats, désambiguïse (ou demande).
-2. **Appeler l'outil** : `find_common_slots(participants=[emails], include_self, duration_minutes,
+2. **Décider de `include_self`** (paramètre OBLIGATOIRE). Suis cet ordre de priorité :
+   1. **Signal explicite dans la demande** → il l'emporte sur tout le reste :
+      - inclut l'utilisateur (« avec X et moi », « qu'on se voie avec Y ») → `include_self=true` ;
+      - exclut l'utilisateur (« quand est libre X ? », « les dispos de Y ») → `include_self=false`.
+   2. **Sinon, défaut configuré** : reporte-toi à la section « Préférence de participation »
+      ajoutée plus bas (réglages utilisateur). Si un défaut est réglé, applique-le **sans
+      demander**, en mentionnant brièvement l'hypothèse dans ta réponse.
+   3. **Sinon (aucun signal, aucun défaut réglé)** : DEMANDE à l'utilisateur s'il fait partie de
+      la réunion avant d'appeler l'outil, et signale-lui qu'il peut régler ce défaut dans Config.
+3. **Appeler l'outil** : `find_common_slots(participants=[emails], include_self, duration_minutes,
    start_date, end_date, days_of_week…)`.
-   - `include_self=true` si la réunion inclut l'utilisateur (« organise une réu avec X et moi »).
-   - `include_self=false` si on cherche seulement la dispo d'autres personnes (« quand est libre X ? »).
    - Par défaut 7 jours / heures ouvrées / créneaux de 30 min ; élargis (`start_date`/`end_date`)
      si l'utilisateur le demande.
-3. **Présenter le résultat de l'outil** : affiche les créneaux RÉELLEMENT retournés.
+4. **Présenter le résultat de l'outil** : affiche les créneaux RÉELLEMENT retournés.
    - Si `all_free_slot_found` : liste les créneaux où tout le monde est libre.
    - Sinon (`fallback_mode`) : présente les meilleurs créneaux avec `free_participants` /
      `busy_participants` pour que l'utilisateur arbitre (« le 10 à 14h, tout le monde sauf Martin »).

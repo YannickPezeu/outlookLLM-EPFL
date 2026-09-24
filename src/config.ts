@@ -3,6 +3,10 @@
  * Replace placeholder values with your actual Azure AD and RCP API settings.
  */
 export const config = {
+  // Build/deploy timestamp (ISO 8601), baked in by update.ps1 at deploy time.
+  // Empty string for local dev builds. Used to verify which version is running.
+  buildTime: process.env.BUILD_TIME || "",
+
   // Azure AD / Entra ID
   auth: {
     clientId: process.env.ENTRA_CLIENT_ID || "YOUR_CLIENT_ID",
@@ -24,13 +28,17 @@ export const config = {
       ? "https://expert-finder.epfl.ch/outlook/api/rcp"
       : "https://inference.rcp.epfl.ch/v1",
     apiKey: "", // User sets this in the UI settings, or stored in localStorage
-    defaultModel: "moonshotai/Kimi-K2.7-Code",
+    // Modèle UNIQUE depuis le 24.09.2026, comme Personal RAG (DPO-Agent) : les
+    // profils Standard / Advanced ne changent que la réflexion accordée (cf.
+    // rcpApiService.isThinkingEnabled), Ultra passe par le backend agent.
+    defaultModel: "zai-org/GLM-5.3-Flash",
     embeddingModel: "Qwen/Qwen3-Embedding-8B",
-    rerankerModel: "BAAI/bge-reranker-v2-m3",
-    filterModel: "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
+    // Vision-LLM OCR for scanned PDF attachments (image-only pages). Same RCP
+    // endpoint/key as chat — see attachmentService. PaddleOCR-VL handles accented
+    // French far better than Tesseract eng-only (benchmarked in DPO-Agent).
+    ocrModel: "PaddlePaddle/PaddleOCR-VL",
     completionsEndpoint: "/chat/completions",
     embeddingsEndpoint: "/embeddings",
-    rerankEndpoint: "/rerank",
   },
 
   // Feature defaults
@@ -40,8 +48,6 @@ export const config = {
     maxEmailsPerParticipant: 200,
     embeddingTopK: 400,
     embeddingMinPerParticipant: 30,
-    filterThreshold: 6,
-    filterBatchSize: 30,
     recentMonths: 6,
     nonParticipantTopK: 20,
   },

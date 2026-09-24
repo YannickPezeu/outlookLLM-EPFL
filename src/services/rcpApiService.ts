@@ -1,4 +1,5 @@
 import { config } from "../config";
+import { persistSetting } from "./settingsStore";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -52,33 +53,50 @@ export interface ToolCallResponse {
 
 // ─── RCP API Client ──────────────────────────────────────────────────
 
-// Models retired from RCP. A user who picked one by hand has it in localStorage,
-// where it would survive this update and 404 on every call. Remap instead.
-// 2026-07-30: Kimi-K2.6 is no longer served 24/7, replaced by Kimi-K2.7-Code.
-const RETIRED_MODELS = ["moonshotai/Kimi-K2.6", "moonshotai/Kimi-K2.5"];
-
+// Le modèle n'est plus un choix de l'usager (24.09.2026) : un seul modèle,
+// GLM-5.3-Flash, pour toutes les fonctions. Un `rcp_model` resté en
+// localStorage (Kimi, Mistral, gpt-oss, saisie libre) est ignoré.
 function getRcpConfig() {
   // Allow runtime override from localStorage (user settings in UI)
   const storedUrl = localStorage.getItem("rcp_base_url");
   const storedKey = localStorage.getItem("rcp_api_key");
-  let storedModel = localStorage.getItem("rcp_model");
-  if (storedModel && RETIRED_MODELS.includes(storedModel)) {
-    localStorage.setItem("rcp_model", config.rcp.defaultModel);
-    storedModel = config.rcp.defaultModel;
-  }
 
   return {
     baseUrl: storedUrl || config.rcp.baseUrl,
     apiKey: storedKey || config.rcp.apiKey,
-    model: storedModel || config.rcp.defaultModel,
+    model: config.rcp.defaultModel,
   };
 }
 
+// ─── Profil de réflexion ─────────────────────────────────────────────
+// Standard (défaut) : réflexion réduite. Advanced et Ultra : réflexion libre.
+// Même compromis que Personal RAG, mesuré par DPO-Agent/docs/loadtest/
+// resultats-2026-09-15.md : `low` ne coûte rien en lecture de document pour
+// sept fois moins de jetons, et 0,19 point sur les questions de recherche.
+const THINKING_KEY = "assistant_thinking";
+
+export function isThinkingEnabled(): boolean {
+  return localStorage.getItem(THINKING_KEY) === "on";
+}
+
+export function setThinkingEnabled(enabled: boolean): void {
+  // Absence de la clé = réflexion réduite (défaut).
+  persistSetting(THINKING_KEY, enabled ? "on" : null);
+}
+
+// Réflexion libre : jetons réservés à la réflexion EN PLUS du plafond de
+// réponse demandé par l'appelant, pour qu'elle ne mange pas la réponse (les
+// appels JSON à 2-4k jetons rendraient sinon un contenu vide). Le profil libre
+// produit ~4 300 jetons par réponse en moyenne au banc de DPO-Agent.
+const THINKING_HEADROOM_TOKENS = 24_576;
+
 // Max context window (tokens) per model family — probed on RCP (2026-06):
 // Kimi-K2.7-Code = 262144, gpt-oss-120b = 131072, Mistral-Small-3.2 = 131072.
-// Confirmed 2026-07-30 on K2.7-Code: max_model_len = max_total_tokens = 262144,
-// i.e. prompt + completion combined, not input alone.
 const MODEL_CONTEXT_TOKENS: Array<[RegExp, number]> = [
+  // GLM-5.3-Flash sert 1 048 576 jetons (mesuré sur RCP le 22.09.2026), mais on
+  // plafonne volontairement au budget de Kimi : à un million de jetons, le seul
+  // prefill prend ~87 s. La réunion et les résumés gardent leur comportement.
+  [/glm-5/i, 262144],
   [/kimi-k2/i, 262144],
   [/gpt-oss/i, 131072],
   [/mistral-small|ministral|magistral|devstral/i, 131072],
@@ -102,6 +120,62 @@ export function getContextBudgetChars(model?: string): number {
   return Math.floor(getModelMaxContextTokens(model) * 2.3);
 }
 
+/**
+ * Middle-out truncate a string to at most maxChars: keep the head and tail
+ * (where the salient context usually sits) and replace the middle with a marker
+ * so the model knows content was dropped (and doesn't treat the join as seamless).
+ */
+export function truncateMiddle(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const omitted = text.length - maxChars;
+  const marker = `\n\n[⚠️ CONTENU TRONQUÉ : ~${omitted} caractères omis au milieu pour tenir dans la fenêtre de contexte du modèle]\n\n`;
+  const keep = Math.max(0, maxChars - marker.length);
+  const head = Math.ceil(keep / 2);
+  const tail = keep - head;
+  return text.slice(0, head) + marker + (tail > 0 ? text.slice(text.length - tail) : "");
+}
+
+/**
+ * Single backstop that enforces the active model's input-character budget across
+ * the WHOLE message array — every email body, attachment, tool result and agent
+ * turn we ever stuff into a prompt passes through here (via buildChatBody).
+ *
+ * Water-filling: small messages (system prompt, instructions) are kept intact;
+ * only the largest messages are middle-out truncated, down to a uniform cap,
+ * until the total fits the budget. Returns NEW message objects and never mutates
+ * the caller's array (the agent loop reuses it across turns).
+ */
+function truncateMessagesToBudget<T extends { content: string | null }>(
+  messages: T[],
+  model: string
+): T[] {
+  const budget = getContextBudgetChars(model);
+  const sizes = messages.map((m) => m.content?.length ?? 0);
+  const total = sizes.reduce((a, b) => a + b, 0);
+  if (total <= budget) return messages;
+
+  // Find the uniform per-message cap C such that Σ min(size_i, C) ≤ budget.
+  const sorted = [...sizes].sort((a, b) => a - b);
+  let remaining = budget;
+  let cap = Infinity;
+  for (let i = 0; i < sorted.length; i++) {
+    const fairShare = remaining / (sorted.length - i);
+    if (sorted[i] <= fairShare) {
+      remaining -= sorted[i];
+    } else {
+      cap = Math.floor(fairShare);
+      break;
+    }
+  }
+  if (!isFinite(cap)) return messages;
+
+  return messages.map((m) =>
+    m.content && m.content.length > cap
+      ? { ...m, content: truncateMiddle(m.content, cap) }
+      : m
+  );
+}
+
 // Reasoning models served by RCP (self-hosted vLLM) emit a chain-of-thought
 // before the answer/tool call. We don't need it for tool orchestration or
 // summaries and it adds large latency (minutes on long context → timeouts), and
@@ -120,6 +194,17 @@ export function getContextBudgetChars(model?: string): number {
 // want. Do not widen this regex to new Kimi releases without re-running the probe.
 function applyModelTweaks(body: Record<string, unknown>): Record<string, unknown> {
   const model = typeof body.model === "string" ? body.model : "";
+  // GLM-5.x : `reasoning_effort: "low"` est le SEUL levier qui coupe la
+  // réflexion. ⚠️ `chat_template_kwargs.enable_thinking: false` ne la coupe
+  // pas : il la déverse dans `content` à la place de la réponse, sans erreur.
+  if (/glm-5/i.test(model)) {
+    if (isThinkingEnabled()) {
+      body.max_tokens = (body.max_tokens as number) + THINKING_HEADROOM_TOKENS;
+    } else {
+      body.reasoning_effort = "low";
+    }
+    return body;
+  }
   if (/kimi-k2\.[56]/i.test(model)) {
     const existing = (body.chat_template_kwargs as Record<string, unknown>) ?? {};
     body.chat_template_kwargs = { ...existing, thinking: false };
@@ -135,6 +220,30 @@ function applyModelTweaks(body: Record<string, unknown>): Record<string, unknown
   return body;
 }
 
+// ─── Comptage de tokens ──────────────────────────────────────────────
+// Listener global posé par l'UI (AssistantView) le temps d'un runAgent :
+// chaque appel RCP (stream ou non) remonte son usage. Les features hors
+// assistant (prépa réunion, résumés) ne comptent que si le listener est actif.
+
+export interface RcpUsageDelta {
+  input: number;
+  output: number;
+}
+
+let usageListener: ((delta: RcpUsageDelta) => void) | null = null;
+
+export function setRcpUsageListener(listener: ((delta: RcpUsageDelta) => void) | null): void {
+  usageListener = listener;
+}
+
+function reportUsage(usage: unknown): void {
+  if (!usageListener || !usage) return;
+  const u = usage as { prompt_tokens?: number; completion_tokens?: number };
+  const input = u.prompt_tokens || 0;
+  const output = u.completion_tokens || 0;
+  if (input || output) usageListener({ input, output });
+}
+
 /**
  * Build a chat/completions request body shared by all RCP calls, so request
  * params (temperature, max_tokens, per-model tweaks) live in one place.
@@ -146,13 +255,26 @@ function buildChatBody(opts: {
   tools?: ToolDefinition[];
   maxTokens?: number;
 }): Record<string, unknown> {
+  // Single enforcement point for the model's input budget: middle-out truncate
+  // anything that would overflow the context window, regardless of which feature
+  // built the prompt.
+  const messages = truncateMessagesToBudget(
+    opts.messages as Array<ChatMessage | AgentMessage>,
+    opts.model
+  );
+
   const body: Record<string, unknown> = {
     model: opts.model,
-    messages: opts.messages,
+    messages,
     temperature: 0.3,
     max_tokens: opts.maxTokens ?? 8192,
     stream: opts.stream,
   };
+  if (opts.stream) {
+    // Le dernier chunk SSE porte alors l'usage (prompt/completion_tokens) —
+    // consommé par reportUsage pour le compteur de tokens de l'assistant.
+    body.stream_options = { include_usage: true };
+  }
   if (opts.tools && opts.tools.length > 0) {
     body.tools = opts.tools;
     body.tool_choice = "auto";
@@ -193,7 +315,9 @@ export async function chatCompletion(
     throw new Error(`RCP API error ${response.status}: ${errorText}`);
   }
 
-  return response.json();
+  const json: ChatCompletionResponse = await response.json();
+  reportUsage((json as unknown as { usage?: unknown }).usage);
+  return json;
 }
 
 /**
@@ -263,6 +387,7 @@ export async function chatCompletionStream(
 
       try {
         const parsed = JSON.parse(data);
+        if (parsed.usage) reportUsage(parsed.usage); // dernier chunk (include_usage)
         const delta = parsed.choices?.[0]?.delta?.content;
         if (delta) {
           fullText += delta;
@@ -312,7 +437,9 @@ export async function chatCompletionWithTools(
     throw new Error(`RCP API error ${response.status}: ${errorText}`);
   }
 
-  return response.json();
+  const json: ToolCallResponse = await response.json();
+  reportUsage((json as unknown as { usage?: unknown }).usage);
+  return json;
 }
 
 /**
@@ -396,6 +523,7 @@ export async function chatCompletionWithToolsStream(
 
       try {
         const parsed = JSON.parse(data);
+        if (parsed.usage) reportUsage(parsed.usage); // dernier chunk (include_usage)
         const choice = parsed.choices?.[0];
         if (!choice) continue;
 
@@ -465,6 +593,71 @@ export async function chatCompletionWithToolsStream(
     },
     finish_reason: finishReason,
   };
+}
+
+// ─── OCR (vision LLM) ────────────────────────────────────────────────
+
+// Prompt mirrors DPO-Agent's PaddleOCR-VL prompt: raw text, no commentary, no
+// markdown fences, reading order preserved.
+const OCR_PROMPT =
+  "OCR this page. Return the full text exactly as written, preserving line " +
+  "breaks and reading order. No commentary, no markdown fences.";
+
+// A dense A4 French page ≈ 1000 completion tokens; 6000 gives headroom without
+// making a runaway repetition loop dramatically worse (attachmentService's
+// degenerate-output detector is the real safety net).
+const OCR_MAX_TOKENS = 6000;
+
+/**
+ * OCR a single page image via the RCP vision model (PaddleOCR-VL).
+ * `imageDataUrl` must be a full data URL (e.g. "data:image/png;base64,...").
+ * Returns the extracted text, or throws on network/HTTP/parse failure so the
+ * caller can fall back (skip the page) rather than poison the result silently.
+ */
+export async function ocrImageViaRcp(
+  imageDataUrl: string,
+  signal?: AbortSignal
+): Promise<string> {
+  const cfg = getRcpConfig();
+
+  if (!cfg.apiKey) {
+    throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
+  }
+
+  const body = {
+    model: config.rcp.ocrModel,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: OCR_PROMPT },
+          { type: "image_url", image_url: { url: imageDataUrl } },
+        ],
+      },
+    ],
+    max_tokens: OCR_MAX_TOKENS,
+    temperature: 0,
+    stream: false,
+  };
+
+  const response = await fetch(`${cfg.baseUrl}${config.rcp.completionsEndpoint}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${cfg.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`RCP OCR error ${response.status}: ${errorText}`);
+  }
+
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  return typeof text === "string" ? text.trim() : "";
 }
 
 // ─── High-level functions ────────────────────────────────────────────
@@ -560,142 +753,22 @@ export async function summarizeInteractions(
   return extractContent(response);
 }
 
-// ─── Reranker (BAAI/bge-reranker-v2-m3) ─────────────────────────────
-
-interface RerankApiResponse {
-  id: string;
-  results: Array<{
-    index: number;
-    relevance_score: number;
-    document?: { text: string };
-  }>;
-}
-
-export interface RerankResult {
-  index: number;
-  score: number;
-}
-
-function isRerankLengthError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /maximum context length|context length is|exceeds.*tokens|too long/i.test(msg);
-}
-
-async function callRerankApi(query: string, documents: string[], model: string): Promise<RerankResult[]> {
-  const cfg = getRcpConfig();
-  if (!cfg.apiKey) {
-    throw new Error("Clé API RCP non configurée. Allez dans l'onglet Config pour la saisir.");
-  }
-
-  const response = await fetch(`${cfg.baseUrl}${config.rcp.rerankEndpoint}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${cfg.apiKey}`,
-    },
-    body: JSON.stringify({ model, query, documents }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`RCP rerank error ${response.status}: ${errorText}`);
-  }
-
-  const json: RerankApiResponse = await response.json();
-  return json.results.map((r) => ({ index: r.index, score: r.relevance_score }));
-}
-
-const RERANK_BATCH_SIZE = 50;
-
-/**
- * Rerank a single batch, with token-level truncation on length error.
- */
-async function rerankBatchWithRetry(
-  query: string,
-  documents: string[],
-  model: string
-): Promise<RerankResult[]> {
-  try {
-    return await callRerankApi(query, documents, model);
-  } catch (err) {
-    if (!isRerankLengthError(err)) throw err;
-
-    console.log(`[Rerank] Length error on batch of ${documents.length}, truncating with char limit fallback...`);
-
-    // Simple char-based truncation instead of tokenizer (which hangs on large docs)
-    const MAX_DOC_CHARS = 10000;
-    const MAX_QUERY_CHARS = 2000;
-
-    const truncQuery = query.length > MAX_QUERY_CHARS ? query.slice(0, MAX_QUERY_CHARS) : query;
-    let truncCount = 0;
-    const truncDocs = documents.map((d) => {
-      if (d.length > MAX_DOC_CHARS) {
-        truncCount++;
-        return d.slice(0, MAX_DOC_CHARS);
-      }
-      return d;
-    });
-    console.log(`[Rerank] Truncated ${truncCount}/${documents.length} docs to ${MAX_DOC_CHARS} chars (query: ${truncQuery.length} chars)`);
-
-    return await callRerankApi(truncQuery, truncDocs, model);
-  }
-}
-
-/**
- * Rerank documents against a query using BAAI/bge-reranker-v2-m3.
- *
- * Splits documents into batches of 50 to avoid socket errors on large payloads.
- * Each batch is scored independently, then results are merged and sorted globally.
- *
- * Returns results sorted by relevance_score descending.
- */
-export async function rerank(
-  query: string,
-  documents: string[],
-  model: string = config.rcp.rerankerModel
-): Promise<RerankResult[]> {
-  if (documents.length === 0) return [];
-
-  if (documents.length <= RERANK_BATCH_SIZE) {
-    return await rerankBatchWithRetry(query, documents, model);
-  }
-
-  console.log(`[Rerank] Splitting ${documents.length} docs into batches of ${RERANK_BATCH_SIZE}`);
-  const allResults: RerankResult[] = [];
-
-  for (let i = 0; i < documents.length; i += RERANK_BATCH_SIZE) {
-    const batchDocs = documents.slice(i, i + RERANK_BATCH_SIZE);
-    const batchResults = await rerankBatchWithRetry(query, batchDocs, model);
-    for (const r of batchResults) {
-      allResults.push({ index: i + r.index, score: r.score });
-    }
-  }
-
-  allResults.sort((a, b) => b.score - a.score);
-  return allResults;
-}
-
 // ─── Settings persistence ────────────────────────────────────────────
 
 export function saveRcpSettings(
   baseUrl: string,
   apiKey: string,
   model: string,
-  relevanceFilterEnabled?: boolean,
   customPrompt?: string
 ): void {
-  localStorage.setItem("rcp_base_url", baseUrl);
-  localStorage.setItem("rcp_api_key", apiKey);
-  localStorage.setItem("rcp_model", model);
-  if (typeof relevanceFilterEnabled === "boolean") {
-    // Storage key kept as "rcp_gemma_filter_enabled" for backward compat — don't
-    // rename it or existing users' disabled setting silently resets to enabled.
-    localStorage.setItem("rcp_gemma_filter_enabled", relevanceFilterEnabled ? "1" : "0");
-  }
+  // persistSetting écrit en localStorage ET OfficeRuntime.storage : sur Outlook
+  // desktop le localStorage seul peut être purgé au redémarrage (clé API perdue).
+  persistSetting("rcp_base_url", baseUrl);
+  persistSetting("rcp_api_key", apiKey);
+  persistSetting("rcp_model", model);
   if (typeof customPrompt === "string") {
     const trimmed = customPrompt.trim();
-    if (trimmed) localStorage.setItem("user_custom_prompt", trimmed);
-    else localStorage.removeItem("user_custom_prompt");
+    persistSetting("user_custom_prompt", trimmed || null);
   }
 }
 
@@ -703,12 +776,10 @@ export function loadRcpSettings(): {
   baseUrl: string;
   apiKey: string;
   model: string;
-  relevanceFilterEnabled: boolean;
   customPrompt: string;
 } {
   return {
     ...getRcpConfig(),
-    relevanceFilterEnabled: isRelevanceFilterEnabled(),
     customPrompt: getUserCustomPrompt(),
   };
 }
@@ -723,9 +794,14 @@ export function getUserCustomPrompt(): string {
 }
 
 /**
- * Whether the relevance-filter pass (meeting prep Phase 4) is enabled.
- * Default: true. Disable for faster runs in testing at the cost of relevance precision.
+ * Whether the user is, by default, a participant in the meetings they schedule.
+ * Drives the `include_self` parameter of find_common_slots when the request has no
+ * explicit "avec moi" / "sans moi" signal:
+ *   - "include" → assume include_self=true   (typical for a manager/organizer)
+ *   - "exclude" → assume include_self=false  (typical for an assistant booking for others)
+ *   - null      → unset: the assistant must ASK before scheduling.
  */
-export function isRelevanceFilterEnabled(): boolean {
-  return localStorage.getItem("rcp_gemma_filter_enabled") !== "0";
+export function getMeetingSelfDefault(): "include" | "exclude" | null {
+  const v = localStorage.getItem("meeting_self_default");
+  return v === "include" || v === "exclude" ? v : null;
 }

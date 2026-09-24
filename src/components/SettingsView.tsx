@@ -7,19 +7,25 @@ import {
   makeStyles,
   tokens,
   Badge,
-  Switch,
   Textarea,
   InfoLabel,
+  Switch,
 } from "@fluentui/react-components";
 import { Settings24Regular, Checkmark24Regular } from "@fluentui/react-icons";
-import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
-import { isAuthenticated, isUsingNaa, getAccount, signOut, getGraphToken } from "../services/authService";
-
-const AVAILABLE_MODELS = [
-  "moonshotai/Kimi-K2.7-Code",
-  "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
-  "openai/gpt-oss-120b",
-];
+import { config } from "../config";
+import { saveRcpSettings, loadRcpSettings, isThinkingEnabled, setThinkingEnabled } from "../services/rcpApiService";
+import { persistSetting } from "../services/settingsStore";
+import { isUltraEngine, setUltraEngine, getUltraBackendUrl } from "../services/glmAgentService";
+import {
+  isAuthenticated,
+  isUsingNaa,
+  getAccount,
+  signOut,
+  getGraphToken,
+  acquireTokenInteractive,
+  reconnect,
+  onAuthStateChanged,
+} from "../services/authService";
 
 const useStyles = makeStyles({
   container: { display: "flex", flexDirection: "column", gap: "16px" },
@@ -55,18 +61,29 @@ const useStyles = makeStyles({
   },
 });
 
-const CUSTOM_MODEL_VALUE = "__custom__";
+// Trois profils sur un modèle unique (GLM-5.3-Flash), comme Personal RAG :
+//   standard  réflexion réduite (`reasoning_effort: low`)
+//   advanced  réflexion libre
+//   ultra     onglet Assistant délégué au backend agent (glm-agent-server/,
+//             harness OpenHands), réflexion libre ; les autres onglets
+//             appellent RCP en direct.
+type AssistantProfile = "standard" | "advanced" | "ultra";
 
 export const SettingsView: React.FC = () => {
   const styles = useStyles();
   const [rcpUrl, setRcpUrl] = useState("");
   const [rcpKey, setRcpKey] = useState("");
-  const [rcpModel, setRcpModel] = useState("");
-  const [relevanceFilterEnabled, setRelevanceFilterEnabled] = useState(true);
   const [customPrompt, setCustomPrompt] = useState("");
-  // True when the user picked "Autre…" to type a model not in the preset list.
-  const [customModelMode, setCustomModelMode] = useState(false);
-  const [graphToken, setGraphToken] = useState("");
+  const [profile, setProfile] = useState<AssistantProfile>("standard");
+  // Auth status is module-level state in authService — re-render when it changes.
+  const [, setAuthTick] = useState(0);
+  const [connecting, setConnecting] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  // OCR for scanned PDF attachments. On unless explicitly disabled (see attachmentService).
+  const [ocrEnabled, setOcrEnabled] = useState(true);
+  // Default meeting participation, drives find_common_slots' include_self when the
+  // request gives no explicit "avec moi"/"sans moi" signal. "unset" → assistant asks.
+  const [meetingSelfDefault, setMeetingSelfDefault] = useState<"unset" | "include" | "exclude">("unset");
   const [saved, setSaved] = useState(false);
   // Don't persist during the initial load (when state is populated from storage),
   // otherwise the auto-save effect would fire and re-write the same values.
@@ -77,26 +94,62 @@ export const SettingsView: React.FC = () => {
     const settings = loadRcpSettings();
     setRcpUrl(settings.baseUrl);
     setRcpKey(settings.apiKey);
-    setRcpModel(settings.model);
-    setRelevanceFilterEnabled(settings.relevanceFilterEnabled);
     setCustomPrompt(settings.customPrompt);
-    setGraphToken(localStorage.getItem("graph_dev_token") || "");
+    setOcrEnabled(localStorage.getItem("ocr_enabled") !== "false");
+    const self = localStorage.getItem("meeting_self_default");
+    setMeetingSelfDefault(self === "include" || self === "exclude" ? self : "unset");
+    setProfile(isUltraEngine() ? "ultra" : isThinkingEnabled() ? "advanced" : "standard");
     loadedRef.current = true;
   }, []);
+
+  // Refresh the auth badge whenever a token is acquired or the user signs out.
+  useEffect(() => onAuthStateChanged(() => setAuthTick((t) => t + 1)), []);
 
   // Auto-save on every change once the initial values are loaded.
   useEffect(() => {
     if (!loadedRef.current) return;
-    saveRcpSettings(rcpUrl, rcpKey, rcpModel, relevanceFilterEnabled, customPrompt);
-    if (graphToken.trim()) {
-      localStorage.setItem("graph_dev_token", graphToken.trim());
-    } else {
-      localStorage.removeItem("graph_dev_token");
-    }
+    saveRcpSettings(rcpUrl, rcpKey, config.rcp.defaultModel, customPrompt);
+    // Store only the "off" state — absence of the key means OCR is on (default).
+    persistSetting("ocr_enabled", ocrEnabled ? null : "false");
+    // Absence of the key means "unset" (the assistant asks before scheduling).
+    persistSetting("meeting_self_default", meetingSelfDefault === "unset" ? null : meetingSelfDefault);
+    setUltraEngine(profile === "ultra");
+    setThinkingEnabled(profile !== "standard");
     setSaved(true);
     clearTimeout(savedTimer.current);
     savedTimer.current = setTimeout(() => setSaved(false), 1500);
-  }, [rcpUrl, rcpKey, rcpModel, relevanceFilterEnabled, customPrompt, graphToken]);
+  }, [rcpUrl, rcpKey, customPrompt, ocrEnabled, meetingSelfDefault, profile]);
+
+  const handleSignIn = async () => {
+    setConnecting(true);
+    setAuthError(null);
+    try {
+      await acquireTokenInteractive();
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    setAuthError(null);
+    await signOut();
+  };
+
+  // NAA-safe recovery from a stale "connected but Graph fails" state: forces a
+  // fresh token without the broken logoutPopup that would strand the user.
+  const handleReconnect = async () => {
+    setConnecting(true);
+    setAuthError(null);
+    try {
+      await reconnect();
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConnecting(false);
+    }
+  };
 
   const account = getAccount();
 
@@ -130,11 +183,37 @@ export const SettingsView: React.FC = () => {
             </Badge>
           )}
         </div>
+        {!isAuthenticated() && (
+          <Button
+            size="small"
+            appearance="primary"
+            disabled={connecting}
+            onClick={handleSignIn}
+          >
+            {connecting ? "Connexion en cours…" : "Se connecter"}
+          </Button>
+        )}
+        {authError && (
+          <Text size={100} style={{ color: tokens.colorPaletteRedForeground1 }}>
+            Échec de la connexion : {authError}
+          </Text>
+        )}
         {isAuthenticated() && (
           <>
-          <Button size="small" onClick={signOut}>
-            Se déconnecter
-          </Button>
+          {/* Under NAA the Office broker owns the session: logoutPopup is unsupported
+              and a real sign-out only strands the user in a "disconnected" state. Offer
+              instead a "Reconnecter" that forces a fresh token (the NAA-safe equivalent
+              of the old deco/reco when the badge says connected but Graph calls fail).
+              Outside NAA, keep the standard sign-out. */}
+          {isUsingNaa() ? (
+            <Button size="small" disabled={connecting} onClick={handleReconnect}>
+              {connecting ? "Reconnexion en cours…" : "Reconnecter"}
+            </Button>
+          ) : (
+            <Button size="small" onClick={handleSignOut}>
+              Se déconnecter
+            </Button>
+          )}
           <Button size="small" onClick={async () => {
             try {
               const token = await getGraphToken();
@@ -159,29 +238,6 @@ export const SettingsView: React.FC = () => {
           </Button>
           </>
         )}
-      </div>
-
-      {/* Graph Dev Token */}
-      <div className={styles.section}>
-        <Text weight="semibold" size={200}>
-          Token Graph API (dev)
-        </Text>
-        <Text size={100}>
-          Collez un token depuis Graph Explorer pour tester sans Azure AD App Registration.
-          Laissez vide pour utiliser l'auth MSAL normale.
-        </Text>
-        <div className={styles.field}>
-          <Label htmlFor="graph-token" size="small">
-            Access Token
-          </Label>
-          <Input
-            id="graph-token"
-            type="password"
-            placeholder="eyJ0eXAiOiJKV1Qi..."
-            value={graphToken}
-            onChange={(_, data) => setGraphToken(data.value)}
-          />
-        </div>
       </div>
 
       {/* Personnalisation — prompt utilisateur */}
@@ -217,13 +273,61 @@ export const SettingsView: React.FC = () => {
             Il reste stocké localement sur votre poste.
           </Text>
         </div>
+
+        <div className={styles.field}>
+          <InfoLabel
+            htmlFor="meeting-self-default"
+            size="small"
+            info={
+              <>
+                Quand vous demandez à organiser une réunion sans préciser « avec moi » ou
+                « sans moi », l'assistant doit savoir si vous comptez parmi les participants.
+                Choisissez votre cas habituel : un dirigeant participe en général aux réunions
+                qu'il organise, un·e assistant·e planifie souvent pour d'autres. Tant que ce
+                réglage reste « Demander à chaque fois », l'assistant vous posera la question.
+                Une précision explicite dans la demande prime toujours sur ce réglage.
+              </>
+            }
+          >
+            Participation par défaut aux réunions
+          </InfoLabel>
+          <select
+            id="meeting-self-default"
+            className={styles.select}
+            value={meetingSelfDefault}
+            onChange={(e) =>
+              setMeetingSelfDefault(e.target.value as "unset" | "include" | "exclude")
+            }
+          >
+            <option value="unset">Demander à chaque fois</option>
+            <option value="include">Je participe à la réunion</option>
+            <option value="exclude">Je ne participe pas (je planifie pour d'autres)</option>
+          </select>
+        </div>
       </div>
 
       {/* RCP API settings */}
       <div className={styles.section}>
-        <Text weight="semibold" size={200}>
+        <InfoLabel
+          weight="semibold"
+          size="small"
+          info={
+            <>
+              Nécessite une clé API RCP <strong>premium</strong>. Créez-la sur le{" "}
+              <a
+                href="https://portal.rcp.epfl.ch/aiaas/keys"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                portail RCP (portal.rcp.epfl.ch/aiaas/keys)
+              </a>
+              . La clé premium doit être validée par votre chef d'unité avant de
+              pouvoir être utilisée.
+            </>
+          }
+        >
           API RCP (LLM)
-        </Text>
+        </InfoLabel>
 
         <div className={styles.field}>
           <Label htmlFor="rcp-url" size="small">
@@ -251,50 +355,49 @@ export const SettingsView: React.FC = () => {
         </div>
 
         <div className={styles.field}>
-          <Label htmlFor="rcp-model" size="small">
-            Modèle
+          <Label htmlFor="rcp-profile" size="small">
+            Profil de l'assistant
           </Label>
           <select
-            id="rcp-model"
+            id="rcp-profile"
             className={styles.select}
-            value={customModelMode || (rcpModel && !AVAILABLE_MODELS.includes(rcpModel)) ? CUSTOM_MODEL_VALUE : rcpModel}
-            onChange={(e) => {
-              const v = e.target.value;
-              if (v === CUSTOM_MODEL_VALUE) {
-                setCustomModelMode(true);
-              } else {
-                setCustomModelMode(false);
-                setRcpModel(v);
-              }
-            }}
+            value={profile}
+            onChange={(e) => setProfile(e.target.value as AssistantProfile)}
           >
-            {AVAILABLE_MODELS.map((model) => (
-              <option key={model} value={model}>
-                {model}
-              </option>
-            ))}
-            <option value={CUSTOM_MODEL_VALUE}>Autre (personnalisé)…</option>
+            <option value="standard">Standard — réflexion réduite, rapide</option>
+            <option value="advanced">Advanced — réflexion approfondie, plus lent</option>
+            <option value="ultra">⚡ Ultra — agent autonome (expérimental)</option>
           </select>
-          {(customModelMode || (rcpModel && !AVAILABLE_MODELS.includes(rcpModel))) && (
-            <Input
-              aria-label="Modèle personnalisé"
-              placeholder="Saisir un identifiant de modèle"
-              value={rcpModel}
-              onChange={(_, data) => setRcpModel(data.value)}
-            />
-          )}
+          <Text size={200}>
+            {profile === "standard" &&
+              "Un seul modèle, GLM-5.3-Flash, qui réfléchit peu avant de répondre : aussi bon pour lire vos emails et documents, et bien plus rapide."}
+            {profile === "advanced" &&
+              "Le même modèle, GLM-5.3-Flash, laissé libre de réfléchir avant de répondre : meilleur sur les questions qui demandent de trier et recouper, mais plus lent. Vaut pour tous les onglets."}
+            {profile === "ultra" &&
+              `L'onglet Assistant passe par le backend agent (${getUltraBackendUrl()}) : GLM-5.3-Flash en réflexion libre, dans le harness agentique open source OpenHands. Les autres onglets (Réunion, résumés…) appellent le modèle directement, en réflexion libre aussi.`}
+          </Text>
         </div>
 
         <div className={styles.field}>
+          <InfoLabel
+            size="small"
+            info={
+              <>
+                Pour les PDF scannés (sans couche texte), reconnaît le texte des
+                pages-images via le modèle vision PaddleOCR-VL de l'API RCP. Ne se
+                déclenche que sur les pages sans texte natif. Plus lent (~1–12 s par
+                page scannée) et consomme l'API — désactivez-le si vous ne traitez
+                jamais de documents scannés.
+              </>
+            }
+          >
+            OCR des pièces jointes scannées
+          </InfoLabel>
           <Switch
-            checked={relevanceFilterEnabled}
-            onChange={(_, data) => setRelevanceFilterEnabled(data.checked)}
-            label="Filtrage de pertinence (préparation de réunion)"
+            checked={ocrEnabled}
+            onChange={(_, data) => setOcrEnabled(data.checked)}
+            label={ocrEnabled ? "Activé" : "Désactivé"}
           />
-          <Text size={100}>
-            Désactiver pour accélérer la préparation de réunion (skip Phase 4).
-            Qualité du tri légèrement réduite — utile pour les tests.
-          </Text>
         </div>
 
         <div className={styles.row}>
@@ -309,6 +412,30 @@ export const SettingsView: React.FC = () => {
           </Text>
         </div>
       </div>
+
+      {/* Retours utilisateurs */}
+      <div className={styles.section}>
+        <Text weight="semibold" size={200}>
+          Vos retours
+        </Text>
+        <Text size={200}>
+          Un bug, une suggestion, un cas d'usage qui manque ? Écrivez-nous à{" "}
+          <a href="mailto:feedback_genai@epfl.ch?subject=EPFL%20Mail%20AI%20%E2%80%94%20retour">
+            feedback_genai@epfl.ch
+          </a>
+          . Vos retours orientent directement les prochaines versions.
+        </Text>
+      </div>
+
+      {/* Version déployée — permet de vérifier que le cache est à jour */}
+      <Text size={100} style={{ color: tokens.colorNeutralForeground3, textAlign: "center" }}>
+        {config.buildTime
+          ? `Version déployée le ${new Date(config.buildTime).toLocaleString("fr-CH", {
+              dateStyle: "short",
+              timeStyle: "short",
+            })}`
+          : "Build de développement local"}
+      </Text>
     </div>
   );
 };

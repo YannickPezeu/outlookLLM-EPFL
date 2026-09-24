@@ -1,9 +1,31 @@
-# Skill : Afficher les emails d'un contact
+# Skill : Afficher / rechercher des emails
 
 ## Objectif
-L'utilisateur veut VOIR, MONTRER ou AFFICHER ses emails avec quelqu'un, eventuellement filtres par un sujet ou un critere.
+L'utilisateur veut VOIR, MONTRER, AFFICHER ou TROUVER des emails — soit avec un contact precis, soit par sujet/mot-cle dans toute sa boite.
 
 ## Workflow obligatoire
+
+### Etape 0 : MOT-CLE D'ABORD — choisir le moteur de recherche
+
+**Regle d'or : commence TOUJOURS par `search_emails` (recherche mot-cle, rapide, une requete, sans embeddings).**
+Ne bascule sur le SEMANTIQUE (`get_email_interactions` avec query — embeddings, lent) QUE si la demande est une IDEE FLOUE sans terme distinctif. Pour un RESUME d'echanges, c'est `summarize_email_interactions`.
+
+**1. Recherche MOT-CLE — le defaut, des qu'il y a un terme cherchable** (nom de produit « docling », une URL, un mot precis, un numero de ticket, un sujet nomme) :
+- Appelle `search_emails(query=<mots-cles>)`.
+- **Si l'utilisateur nomme l'expediteur** (« l'email de Matéo qui parle de docling », « le mail où Martin donne le budget », « ce que Carlos m'a envoyé sur X ») → AJOUTE `sender=<nom ou email>` dans le MEME appel.
+  Exemple : « l'email de Matéo sur docling » → `search_emails(query="docling", sender="Matéo")`. UN SEUL appel.
+  C'est OBLIGATOIRE de passer `sender` des qu'une personne est nommee — sinon un mot-cle courant noie le resultat dans les emails de tout le monde.
+- N'appelle PAS `search_contacts` avant : le nom suffit dans `sender` (le `from:` KQL accepte un nom). N'appelle PAS `get_email_interactions`.
+- Ne repete PAS la recherche : un seul `search_emails` suffit.
+- Lis les corps (~2000 car.) retournes, EXTRAIS l'info demandee (URL, endpoint, montant, date, decision) directement dans ta reponse, puis `display_emails(email_ids=[refs pertinents])` pour la liste cliquable.
+
+**2. Recherche SEMANTIQUE — exception, seulement pour une IDEE FLOUE** où le vocabulaire de l'email peut differer des mots de la demande (« les mails sur le recrutement » → l'email dit « candidat », « entretien », « CV » ; « ce qui touche a l'IA » → « machine learning », « LLM ») :
+- AVEC un contact nomme → Etape 1 (search_contacts) puis Etape 2 Cas B (get_email_interactions query + display_emails).
+- SANS contact → `search_emails` reste souvent suffisant ; n'utilise le semantique thematique que si le mot-cle echoue vraiment.
+
+**3. Lister TOUS les echanges avec un contact (sans filtre de contenu)** (« montre mes emails avec Patrick », « tous mes echanges avec Martin ») → Etape 1 puis Etape 2 Cas A (get_email_interactions sans query).
+
+**INTERDIT :** `get_email_interactions` avec le nom de l'utilisateur lui-meme (« echanges avec moi-meme » = absurde, tire toute la boite).
 
 ### Etape 1 : Identifier le contact
 Utilise `search_contacts` avec le nom mentionne.

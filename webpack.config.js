@@ -32,7 +32,13 @@ module.exports = async (env, argv) => {
     },
     output: {
       path: path.resolve(__dirname, "dist"),
-      filename: "[name].bundle.js",
+      // Content-hash in prod so each deploy yields a new filename
+      // (taskpane.<hash>.bundle.js). This is what defeats the Outlook Mac
+      // webview's heuristic caching: no old file exists under the new URL,
+      // so it physically cannot serve stale code. taskpane.html (no-cache,
+      // see k8s/nginx.conf) is revalidated each load and points to the new
+      // bundle. Dev keeps stable names for simpler debugging.
+      filename: isDev ? "[name].bundle.js" : "[name].[contenthash].bundle.js",
       clean: true,
       publicPath: isGhPages ? "/outlookLLM-EPFL/" : isK8s ? "/outlook/" : "/",
     },
@@ -80,6 +86,8 @@ module.exports = async (env, argv) => {
         "process.env.ENTRA_CLIENT_ID": JSON.stringify(process.env.ENTRA_CLIENT_ID || ""),
         "process.env.ENTRA_TENANT_ID": JSON.stringify(process.env.ENTRA_TENANT_ID || ""),
         "process.env.DEPLOY_TARGET": JSON.stringify(isK8s ? "k8s" : isGhPages ? "ghpages" : "dev"),
+        // Deploy timestamp injected by update.ps1 (ISO 8601). Empty for local dev.
+        "process.env.BUILD_TIME": JSON.stringify(process.env.BUILD_TIME || ""),
       }),
     ],
     devServer: {

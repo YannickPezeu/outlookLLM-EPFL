@@ -5,7 +5,7 @@ L'utilisateur veut un RÉSUMÉ / une analyse de l'email ACTUELLEMENT OUVERT dans
 
 ## Workflow
 1. Appelle `summarize_current_email` (aucun paramètre) — il lit l'email ouvert (corps + pièces
-   jointes : PDF, DOCX, TXT, CSV, HTML) et renvoie son contenu.
+   jointes : PDF, DOCX, XLSX, PPTX, TXT, CSV, HTML) et renvoie son contenu.
 2. Rédige le résumé en suivant le champ `instructions` du résultat, avec ces sections :
    `## Contexte / projet`, `## Ce qui est demandé`, `## Échéances`, `## Points d'attention`.
 3. Reste factuel, n'invente rien, signale ce qui est ambigu ou absent. Si une section est vide,

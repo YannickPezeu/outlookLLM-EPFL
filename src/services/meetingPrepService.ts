@@ -1,13 +1,62 @@
 import { config } from "../config";
 import type { CalendarEvent, LightEmail, EmailMessage, MailDataSource } from "./mailTypes";
 import { batchEmbed, rankBySimilarity } from "./embeddingService";
-import { chatCompletionStream, chatCompletion, ChatMessage, isRelevanceFilterEnabled, getContextBudgetChars } from "./rcpApiService";
+import { chatCompletionStream, ChatMessage, getContextBudgetChars } from "./rcpApiService";
 import { cleanEmailBody } from "./cleanEmailBody";
 import { cleanEmailBodyFull } from "./cleanEmailBody";
 import { getAccount } from "./authService";
 import { getUserByEmail } from "./graphMailService";
 // Dynamic import to avoid pulling pdfjs-dist in Node.js eval environment
 const loadAttachmentService = () => import("./attachmentService");
+import type { AttachmentText } from "./attachmentService";
+import type { MeetingReport, MeetingParticipantBlock, DecisionSource, DecisionReport } from "./exportService";
+import { analyzeRecordsToReport, type MailRecord } from "./topicDecisionService";
+
+// ─── Report directives (angle + language), threaded into the briefing prompt ──
+// Inlined (not imported from topicDecisionService) to keep this module free of the
+// static attachmentService/pdfjs import that the Node eval environment avoids.
+function focusLine(focus?: string): string {
+  return focus && focus.trim()
+    ? `\nANGLE PRIORITAIRE DEMANDÉ PAR L'UTILISATEUR : « ${focus.trim()} ». ` +
+        "Oriente le briefing sous cet angle en priorité (sans ignorer les autres éléments importants)."
+    : "";
+}
+function langLine(language?: string): string {
+  const lang = language?.trim() || "français";
+  return `\nLANGUE DE RÉDACTION : produis TOUTE ta sortie rédigée en ${lang}.`;
+}
+function buildDirectives(focus?: string, language?: string): string {
+  return focusLine(focus) + langLine(language);
+}
+
+/** The signed-in user — the person the briefing is prepared FOR. */
+function selfIdentity(): { name: string; email: string } {
+  const a = getAccount() as { name?: string; username?: string } | null;
+  const email = a?.username || "";
+  const name = a?.name || email || "l'utilisateur";
+  return { name, email };
+}
+
+/** Instruction telling the LLM whose perspective to write the briefing from. */
+function selfLine(self: { name: string; email: string }): string {
+  return (
+    `\nTU PRÉPARES CE BRIEFING POUR ${self.name}${self.email ? ` (${self.email})` : ""} — ` +
+    "l'utilisateur courant, qui PARTICIPE à la réunion. Écris de SON point de vue : " +
+    `parle à ${self.name} à la 2e personne (« vous »), et ne parle JAMAIS de ${self.name} à la 3e personne. ` +
+    "Les autres personnes citées sont SES interlocuteurs."
+  );
+}
+
+export type MeetingMode = "deep" | "soft";
+
+export interface MeetingPrepOptions {
+  language?: string;
+  mode?: MeetingMode;
+  // Period to look back over for participant exchanges (chosen by the user).
+  // Filtered client-side ($search can't be combined with a date $filter).
+  startISO?: string;
+  endISO?: string;
+}
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -33,6 +82,12 @@ export interface MeetingBriefing {
   participants: Participant[];
   participantBriefings: ParticipantBriefing[];
   finalBriefing: string;
+  mode: MeetingMode;
+  // SOFT: structured briefing report (rendered by exportMeetingReport).
+  report?: MeetingReport;
+  // DEEP: decisions-style report (major decisions + synthesis, rendered by
+  // exportDecisionReport). Built from all participant exchanges over the period.
+  decisionReport?: DecisionReport;
 }
 
 export type PipelinePhase =
@@ -59,11 +114,21 @@ type StreamCallback = (chunk: string) => void;
 
 // ─── Phase 1: Extract Context ───────────────────────────────────────
 
+// Max chars of attachment text folded into the semantic query. The embedding
+// signal degrades if the query is dominated by one long document, so we cap the
+// contribution; the full text is still passed to the final briefing prompt.
+const QUERY_ATTACHMENT_BUDGET = 6000;
+
 async function extractContext(
   ds: MailDataSource,
   eventId: string,
   onProgress: ProgressCallback
-): Promise<{ event: CalendarEvent; participants: Participant[]; query: string }> {
+): Promise<{
+  event: CalendarEvent;
+  participants: Participant[];
+  query: string;
+  eventAttachmentsText: AttachmentText[];
+}> {
   onProgress({
     phase: "extracting_context",
     message: "Extraction du contexte de la réunion...",
@@ -71,6 +136,30 @@ async function extractContext(
   });
 
   const event = await ds.getCalendarEvent(eventId);
+
+  // The meeting's own attachments often hold the real agenda/context (an agenda
+  // PDF, a slide deck) rather than the event body. Extract their text so it feeds
+  // both the semantic query and the final briefing.
+  let eventAttachmentsText: AttachmentText[] = [];
+  if (event.hasAttachments) {
+    try {
+      const attachments = await ds.getEventAttachments(eventId);
+      if (attachments.length > 0) {
+        onProgress({
+          phase: "extracting_context",
+          message: `Lecture des pièces jointes de la réunion (${attachments.length})...`,
+          percent: 7,
+        });
+        const { extractTextFromAttachments } = await loadAttachmentService();
+        eventAttachmentsText = await extractTextFromAttachments(attachments, undefined, {
+          onProgress: (m) =>
+            onProgress({ phase: "extracting_context", message: m, percent: 7 }),
+        });
+      }
+    } catch (err) {
+      console.warn("[MeetingPrep] Failed to read event attachments:", err);
+    }
+  }
 
   // Exclude the current signed-in user from the participant list. Their bucket
   // would contain mostly threads with non-meeting people (their wife, dentist,
@@ -113,20 +202,27 @@ async function extractContext(
   });
   const enrichedCount = participants.filter((p) => p.jobTitle || p.department).length;
 
-  // Build the semantic query from subject + cleaned body
+  // Build the semantic query from subject + cleaned body + (capped) attachment text
   const eventBody = event.body?.content ? cleanEmailBody(event.body.content) : event.bodyPreview;
-  const query = [event.subject, eventBody].filter(Boolean).join(" ");
+  const attachmentQueryText = eventAttachmentsText
+    .map((a) => a.text)
+    .join("\n")
+    .slice(0, QUERY_ATTACHMENT_BUDGET);
+  const query = [event.subject, eventBody, attachmentQueryText].filter(Boolean).join(" ");
 
   onProgress({
     phase: "extracting_context",
     message: `Réunion : ${event.subject}`,
     detail:
       `${participants.length} participant(s), ${enrichedCount} enrichi(s) via annuaire` +
+      (eventAttachmentsText.length > 0
+        ? `, ${eventAttachmentsText.length} pièce(s) jointe(s) de réunion lue(s)`
+        : "") +
       (excludedSelf ? " (utilisateur courant exclu)" : ""),
     percent: 10,
   });
 
-  return { event, participants, query };
+  return { event, participants, query, eventAttachmentsText };
 }
 
 /** Format a participant's directory info as a one-line tag for prompts. */
@@ -229,7 +325,6 @@ interface RankedEmail {
   cleanBody?: string;
   cleanBodyFull?: string;
   fullEmail?: EmailMessage;
-  relevanceScore?: number;     // Set after relevance filter (Phase 4)
 }
 
 // Step 1 — flatten participant buckets, dedup by email id, then dedup by
@@ -281,7 +376,8 @@ function flattenAndDedup(
 async function fetchAndCleanBodies(
   ds: MailDataSource,
   items: Array<{ email: LightEmail; participantEmail: string }>,
-  onProgress: ProgressCallback
+  onProgress: ProgressCallback,
+  readAttachments = true
 ): Promise<EnrichedEmail[]> {
   if (items.length === 0) return [];
 
@@ -294,7 +390,7 @@ async function fetchAndCleanBodies(
   const messageIds = items.map((it) => it.email.id);
   const fullEmails = await ds.getEmailsBatch(messageIds);
 
-  const emailsWithAttachments = fullEmails.filter((e) => e.hasAttachments);
+  const emailsWithAttachments = readAttachments ? fullEmails.filter((e) => e.hasAttachments) : [];
   if (emailsWithAttachments.length > 0) {
     onProgress({
       phase: "reading_emails",
@@ -504,141 +600,6 @@ async function embedAndRank(
   return topRanked;
 }
 
-// ─── Phase 4: Relevance Filter ──────────────────────────────────────
-
-const RELEVANCE_FILTER_SYSTEM_PROMPT = `Tu es un assistant expert qui filtre des emails avant une réunion.
-
-CONTEXTE : Les participants à cette réunion travaillent sur PLUSIEURS projets différents. Tu vas recevoir des emails échangés avec ces participants — certains sont utiles pour préparer cette réunion, d'autres non.
-
-CRITÈRE : L'email contient-il de l'information exploitable pour rédiger un briefing de cette réunion ?
-
-Échelle :
-- 9-10 : Indispensable. Décisions, résultats, problèmes critiques directement liés à la réunion.
-  Ex: "Les tests montrent une réduction de 40% de latence. Je recommande la prod."
-  Ex: "Le budget est réduit de 30%. Il faut couper le module NLP ou reporter."
-- 7-8 : Très utile. Avancées concrètes, engagements, questions ouvertes.
-  Ex: "L'intégration du module multilingue avance. Résultats FR/DE prometteurs."
-  Ex: "Le partenariat Milano est confirmé. 3 datasets d'ici fin mars."
-- 5-6 : Contexte secondaire. Logistique, coordination informative.
-  Ex: "Salle BC 410 réservée pour la démo du 20 mars."
-  Ex: "Budget GPU restant : 12'000 CHF. Arbitrage nécessaire."
-- 3-4 : Faible valeur. Accusés de réception, relances sans contenu.
-  Ex: "OK pour mardi."
-  Ex: "Bien reçu, on en parle jeudi."
-- 1-2 : Quasi inutile.
-- 0 : Aucun rapport avec la réunion.
-
-Réponds UNIQUEMENT en JSON : [{"index":0,"score":7},{"index":1,"score":3}, ...]`;
-
-async function filterByRelevance(
-  rankedEmails: RankedEmail[],
-  event: CalendarEvent,
-  participants: Participant[],
-  onProgress: ProgressCallback
-): Promise<RankedEmail[]> {
-  const BATCH_SIZE = config.defaults.filterBatchSize;
-  const THRESHOLD = config.defaults.filterThreshold;
-  const MAX_BODY_CHARS = 3000; // Cap body for context window safety
-  const CONCURRENCY = 5; // Parallel RCP calls (key supports ≥5 concurrent)
-
-  const participantNames = participants.map((p) => p.name).join(", ");
-  const eventDate = new Date(event.start.dateTime).toLocaleDateString("fr-FR");
-
-  // Build all batches up front so workers can pull from a shared queue.
-  const batches: RankedEmail[][] = [];
-  for (let i = 0; i < rankedEmails.length; i += BATCH_SIZE) {
-    batches.push(rankedEmails.slice(i, i + BATCH_SIZE));
-  }
-
-  onProgress({
-    phase: "filtering_emails",
-    message: `Filtrage intelligent de ${rankedEmails.length} emails (filtrage de pertinence, ${CONCURRENCY} appels en parallèle)...`,
-    percent: 50,
-  });
-
-  let scored = 0;
-  let parseFails = 0;
-  let batchesDone = 0;
-  let nextBatchIdx = 0; // shared index, incremented atomically by workers
-
-  async function processBatch(batch: RankedEmail[], batchNum: number): Promise<void> {
-    const emailsStr = batch.map((r, idx) => {
-      const body = (r.cleanBodyFull || r.cleanBody || r.email.bodyPreview).slice(0, MAX_BODY_CHARS);
-      return `[${idx}] Sujet: ${r.email.subject}\n${body}`;
-    }).join("\n\n---\n\n");
-
-    const userPrompt =
-      `## Réunion\nSujet : ${event.subject}\nDate : ${eventDate}\n` +
-      `Participants : ${participantNames}\n\n` +
-      `## Emails à noter\n\n${emailsStr}\n\nNote chaque email de 0 à 10.`;
-
-    const messages: ChatMessage[] = [
-      { role: "system", content: RELEVANCE_FILTER_SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ];
-
-    try {
-      const response = await chatCompletion(messages, config.rcp.filterModel);
-      const text = response.choices?.[0]?.message?.content || "";
-      const match = text.match(/\[[\s\S]*\]/);
-      if (match) {
-        const arr = JSON.parse(match[0]) as Array<{ index: number; score: number }>;
-        for (const s of arr) {
-          if (typeof s.index === "number" && s.index >= 0 && s.index < batch.length) {
-            batch[s.index].relevanceScore = s.score;
-            scored++;
-          }
-        }
-      } else {
-        parseFails++;
-        console.warn(`[MeetingPrep] Phase 4 — relevance filter parse fail on batch ${batchNum}`);
-      }
-    } catch (err) {
-      parseFails++;
-      console.warn(`[MeetingPrep] Phase 4 — relevance filter error on batch ${batchNum}:`, err);
-    }
-  }
-
-  async function worker(): Promise<void> {
-    while (true) {
-      const myIdx = nextBatchIdx++;
-      if (myIdx >= batches.length) return;
-      await processBatch(batches[myIdx], myIdx + 1);
-      batchesDone++;
-      const emailsAnalyzed = Math.min(batchesDone * BATCH_SIZE, rankedEmails.length);
-      onProgress({
-        phase: "filtering_emails",
-        message: `Filtrage : ${emailsAnalyzed}/${rankedEmails.length} emails analysés (${batchesDone}/${batches.length} batches)...`,
-        percent: 50 + (batchesDone / batches.length) * 12,
-      });
-    }
-  }
-
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, batches.length) }, () => worker()));
-
-  // Filter by threshold
-  const filtered = rankedEmails.filter((r) => (r.relevanceScore ?? 0) >= THRESHOLD);
-
-  // Sort by relevance score desc (best first)
-  filtered.sort((a, b) => (b.relevanceScore ?? 0) - (a.relevanceScore ?? 0));
-
-  console.log(`[MeetingPrep] Phase 4 — filtrage de pertinence: ${rankedEmails.length} → ${filtered.length} emails ` +
-    `(seuil≥${THRESHOLD}, scored=${scored}, parseFails=${parseFails})`);
-  console.log(`[MeetingPrep] Phase 4 — Score distribution: ` +
-    `≥9: ${rankedEmails.filter((r) => (r.relevanceScore ?? 0) >= 9).length}, ` +
-    `7-8: ${rankedEmails.filter((r) => (r.relevanceScore ?? 0) >= 7 && (r.relevanceScore ?? 0) < 9).length}, ` +
-    `5-6: ${rankedEmails.filter((r) => (r.relevanceScore ?? 0) >= 5 && (r.relevanceScore ?? 0) < 7).length}, ` +
-    `<5: ${rankedEmails.filter((r) => (r.relevanceScore ?? 0) < 5).length}`);
-
-  onProgress({
-    phase: "filtering_emails",
-    message: `${filtered.length} emails retenus après filtrage intelligent`,
-    percent: 62,
-  });
-
-  return filtered;
-}
-
 // ─── Phase 5: Non-Participant Email Search ──────────────────────────
 
 async function searchNonParticipantEmails(
@@ -741,9 +702,8 @@ function formatEmailBlock(r: RankedEmail): string {
   const e = r.fullEmail || r.email;
   const from = e.from?.emailAddress?.address || "inconnu";
   const date = new Date(e.receivedDateTime).toLocaleDateString("fr-FR");
-  const relevanceTag = r.relevanceScore !== undefined ? ` [pertinence: ${r.relevanceScore}/10]` : "";
   const bodyText = r.cleanBodyFull || r.cleanBody || e.bodyPreview;
-  let text = `[${date}] De: ${from} | Sujet: ${e.subject}${relevanceTag}\n${bodyText}`;
+  let text = `[${date}] De: ${from} | Sujet: ${e.subject}\n${bodyText}`;
 
   const full = r.fullEmail;
   if (full?.attachmentTexts && full.attachmentTexts.length > 0) {
@@ -984,7 +944,10 @@ async function generateFinalBriefing(
   participants: Participant[],
   participantBlocks: string,
   nonParticipantSection: string,
+  meetingDocsSection: string,
   contentKind: "résumés" | "emails",
+  directives: string,
+  self: { name: string; email: string },
   onStream: StreamCallback,
   onProgress: ProgressCallback
 ): Promise<string> {
@@ -1004,8 +967,8 @@ async function generateFinalBriefing(
   });
 
   const sourceSentence = contentKind === "emails"
-    ? "À partir des emails échangés avec chaque participant (et du contexte externe éventuel), génère un briefing final structuré en français."
-    : "À partir des résumés d'échanges par participant, génère un briefing final structuré en français.";
+    ? "À partir des emails échangés avec chaque participant (et du contexte externe éventuel), génère un briefing final structuré."
+    : "À partir des résumés d'échanges par participant, génère un briefing final structuré.";
   const sectionHeader = contentKind === "emails" ? "Emails par participant" : "Résumés par participant";
 
   const messages: ChatMessage[] = [
@@ -1021,8 +984,10 @@ async function generateFinalBriefing(
         "3. **Sujets probables à aborder** : déduits des emails\n" +
         "4. **Actions en attente** : engagements non tenus, questions ouvertes\n" +
         "5. **Emails clés à relire** : les plus importants avec date et sujet\n\n" +
-        "Utilise le format Markdown. Sois concis, actionnable, et utile. " +
-        "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown).",
+        "Utilise le format Markdown (titres, listes à puces, gras, tableaux si pertinent). Sois concis, actionnable, et utile. " +
+        "IMPORTANT : écris directement en Markdown, ne mets PAS le contenu dans un bloc de code (pas de ```markdown)." +
+        selfLine(self) +
+        directives,
     },
     {
       role: "user",
@@ -1031,8 +996,9 @@ async function generateFinalBriefing(
         `**Date :** ${startDate}\n` +
         `**Participants :**\n` +
         participants.map((p) => `- ${p.name}${formatParticipantProfile(p)}`).join("\n") + "\n" +
-        `**Description :** ${event.bodyPreview || "(aucune)"}\n\n` +
-        `## ${sectionHeader}\n\n${participantBlocks}${nonParticipantSection}\n\n` +
+        `**Description :** ${event.bodyPreview || "(aucune)"}\n` +
+        meetingDocsSection +
+        `\n## ${sectionHeader}\n\n${participantBlocks}${nonParticipantSection}\n\n` +
         `Génère le briefing final pour préparer cette réunion.`,
     },
   ];
@@ -1079,10 +1045,10 @@ function buildTraceLog(
 
   for (const p of participants) {
     const emails = byParticipant.get(p.email) || [];
-    lines.push(`\n--- Emails de ${p.name} (${emails.length} retenus, seuil≥${config.defaults.filterThreshold}) ---`);
+    lines.push(`\n--- Emails de ${p.name} (${emails.length}) ---`);
     for (const r of emails) {
       const date = new Date(r.email.receivedDateTime).toLocaleDateString("fr-FR");
-      lines.push(`  [pertinence=${r.relevanceScore ?? "?"}] ${date} | ${r.email.subject}`);
+      lines.push(`  ${date} | ${r.email.subject}`);
     }
   }
 
@@ -1110,7 +1076,8 @@ function buildTraceLog(
  *           (3b) Fetch full bodies (per-id, concurrency=4) → clean
  *           (3c) Embed on cleanBody[:10000] → rank → per-participant quota
  *                + global fill → top 400
- *   Phase 4: Relevance filter — Mistral Small (5 calls in parallel, batch 30, threshold ≥ 6)
+ *   (The former Mistral relevance filter is gone — the top embedding-ranked
+ *    emails that fit the model's context budget are loaded directly, see below.)
  *   Phase 5: Non-participant email search (Graph $search → embed → top 20)
  *   Phase 6: Per-participant summaries (modèle principal)
  *   Phase 7: Non-participant summary (modèle principal)
@@ -1120,13 +1087,17 @@ export async function prepareMeeting(
   ds: MailDataSource,
   eventId: string,
   onProgress: ProgressCallback,
-  onStream: StreamCallback
+  onStream: StreamCallback,
+  opts: MeetingPrepOptions = {}
 ): Promise<MeetingBriefing> {
-  // Phase 4 now runs on Mistral Small (config.rcp.filterModel), which RCP keeps
-  // warm — no cold-start to hide, so the former Gemma E2B warmup is gone.
-
+  const mode: MeetingMode = opts.mode === "soft" ? "soft" : "deep";
+  // Soft-mode briefing language (the meeting's own subject/description already
+  // sets the angle, so no separate focus is needed).
+  const directives = buildDirectives(undefined, opts.language);
   // Phase 1: Extract context
-  const { event, participants, query } = await extractContext(ds, eventId, onProgress);
+  const { event, participants, query, eventAttachmentsText } = await extractContext(
+    ds, eventId, onProgress
+  );
 
   if (participants.length === 0) {
     const onlySelf = (event.attendees || []).some((a) => a.type !== "resource");
@@ -1143,6 +1114,18 @@ export async function prepareMeeting(
       participants: [],
       participantBriefings: [],
       finalBriefing: reason,
+      mode,
+      report: {
+        subject: event.subject,
+        date: new Date(event.start.dateTime).toLocaleDateString("fr-CH"),
+        generatedOn: new Date().toLocaleDateString("fr-CH"),
+        briefing: reason,
+        participants: [],
+        externalSources: [],
+        meetingDocs: [],
+        language: opts.language,
+        mode,
+      },
     };
   }
 
@@ -1150,6 +1133,26 @@ export async function prepareMeeting(
 
   // Phase 2: Collect emails per participant
   const emailsByParticipant = await collectEmails(ds, participants, onProgress);
+
+  // Period filter (chosen by the user) — applied client-side since $search can't
+  // be combined with a date $filter. Bounds how far back we look for exchanges.
+  if (opts.startISO || opts.endISO) {
+    const start = opts.startISO ? new Date(opts.startISO).getTime() : -Infinity;
+    const end = opts.endISO ? new Date(opts.endISO).getTime() : Infinity;
+    let kept = 0;
+    let before = 0;
+    for (const [pe, emails] of emailsByParticipant) {
+      before += emails.length;
+      const filtered = emails.filter((e) => {
+        const t = new Date(e.receivedDateTime).getTime();
+        return t >= start && t <= end;
+      });
+      emailsByParticipant.set(pe, filtered);
+      kept += filtered.length;
+    }
+    onProgress({ phase: "collecting_emails", message: `Filtre période : ${before} → ${kept} emails dans la fenêtre choisie`, percent: 25 });
+  }
+
   let totalCollected = 0;
   for (const [email, emails] of emailsByParticipant) {
     console.log(`[MeetingPrep] Phase 2 — Collecte: ${email} → ${emails.length} emails`);
@@ -1188,6 +1191,16 @@ export async function prepareMeeting(
   });
 
   const enriched = await fetchAndCleanBodies(ds, dedupedLight, onProgress);
+
+  // ─── DEEP mode: 20-by-20 map-reduce over ALL participant exchanges ──────────
+  // No embedding pre-rank: process everything, let the extraction's relevance
+  // filter keep only what concerns this meeting, then build a decisions-style
+  // report (major decisions + synthesis + clickable sources), like the topic one.
+  if (mode === "deep") {
+    return await prepareMeetingDeep(event, participants, enriched, dedupedLight, eventAttachmentsText, opts, onProgress, onStream);
+  }
+
+  // ─── SOFT mode = the original holistic pipeline (embedding rank → 1 briefing) ──
   let rankedEmails = await embedAndRank(query, enriched, onProgress);
   console.log(
     `[MeetingPrep] Phase 3 — Pipeline: ${totalCollected} collectés → ${dedupedLight.length} après dedup → ` +
@@ -1195,8 +1208,7 @@ export async function prepareMeeting(
       `(score max: ${rankedEmails[0]?.score.toFixed(3) || "N/A"}, min: ${rankedEmails[rankedEmails.length - 1]?.score.toFixed(3) || "N/A"})`
   );
 
-  // Phase 5: Non-participant email search (independent of the relevance filter;
-  // both paths need it, and its volume counts toward the direct-load gate below).
+  // Phase 5: Non-participant email search (part of the original soft pipeline).
   const existingEmailIds = new Set(rankedEmails.map((r) => r.email.id));
   const nonParticipantEmails = await searchNonParticipantEmails(
     ds, query, event, existingEmailIds, participants, onProgress
@@ -1254,8 +1266,16 @@ export async function prepareMeeting(
     ? `\n\n## Contexte externe (hors participants)\n\n${nonParticipantEmails.map(formatEmailBlock).join("\n---\n")}`
     : "";
 
+  // Meeting's own attached documents (agenda PDF, slide deck, …) — full text,
+  // placed up front so the LLM treats it as primary context for the meeting.
+  const meetingDocsSection = eventAttachmentsText.length > 0
+    ? `\n## Documents joints à la réunion\n\n` +
+      eventAttachmentsText.map((a) => `### ${a.name}\n${a.text}`).join("\n\n") + "\n"
+    : "";
+
   const finalBriefing = await generateFinalBriefing(
-    event, participants, participantBlocks, nonParticipantSection, "emails", onStream, onProgress
+    event, participants, participantBlocks, nonParticipantSection, meetingDocsSection,
+    "emails", directives, selfIdentity(), onStream, onProgress
   );
 
   // Per-participant counts for the result/UI stats; no intermediate summary here.
@@ -1276,10 +1296,146 @@ export async function prepareMeeting(
   const traceLog = buildTraceLog(event, participants, emailsForTrace, nonParticipantEmails, totalCollected, rankedEmails.length);
   console.log(`[MeetingPrep] === TRACE LOG ===\n${traceLog}`);
 
+  // ─── Structured, source-linked report data (rendered to .docx by the caller) ──
+  const toSource = (r: RankedEmail): DecisionSource => {
+    const e = r.fullEmail || r.email;
+    return {
+      date: new Date(e.receivedDateTime).toLocaleDateString("fr-CH"),
+      subject: e.subject || "(sans objet)",
+      webLink: r.fullEmail?.webLink,
+    };
+  };
+  const reportParticipants: MeetingParticipantBlock[] = participants.map((p) => ({
+    name: p.name,
+    profile: [p.jobTitle, p.department].filter(Boolean).join(", ") || undefined,
+    sources: (byParticipant.get(p.email) || [])
+      .slice()
+      .sort((a, b) => new Date((b.fullEmail || b.email).receivedDateTime).getTime() - new Date((a.fullEmail || a.email).receivedDateTime).getTime())
+      .map(toSource),
+  }));
+  const report: MeetingReport = {
+    subject: event.subject,
+    date: new Date(event.start.dateTime).toLocaleDateString("fr-CH"),
+    generatedOn: new Date().toLocaleDateString("fr-CH"),
+    briefing: finalBriefing,
+    participants: reportParticipants,
+    externalSources: nonParticipantEmails.map(toSource),
+    meetingDocs: eventAttachmentsText.map((a) => a.name),
+    language: opts.language,
+    mode,
+  };
+
   return {
     event,
     participants,
     participantBriefings,
     finalBriefing,
+    mode,
+    report,
+  };
+}
+
+// ─── DEEP meeting pipeline (20-by-20 map-reduce, decisions-style report) ─────
+
+async function prepareMeetingDeep(
+  event: CalendarEvent,
+  participants: Participant[],
+  enriched: EnrichedEmail[],
+  dedupedLight: Array<{ email: LightEmail; participantEmail: string }>,
+  eventAttachmentsText: AttachmentText[],
+  opts: MeetingPrepOptions,
+  onProgress: ProgressCallback,
+  onStream: StreamCallback
+): Promise<MeetingBriefing> {
+  const PER_MAIL = 16000;
+  const eventBody = (event.body?.content ? cleanEmailBody(event.body.content) : event.bodyPreview || "").slice(0, 600);
+
+  // Build records (one per deduped participant email) for the map-reduce.
+  const records: MailRecord[] = enriched.map((e, i) => {
+    const f = e.fullEmail;
+    const iso = f.sentDateTime || f.receivedDateTime;
+    const to = (f.toRecipients || []).map((r) => r.emailAddress?.name || r.emailAddress?.address || "").filter(Boolean);
+    const from = f.from?.emailAddress?.name || f.from?.emailAddress?.address;
+    let body = (e.cleanBodyFull || e.cleanBody || f.bodyPreview || "").slice(0, PER_MAIL);
+    if (f.attachmentTexts && f.attachmentTexts.length > 0) {
+      body += "\n\nPIÈCES JOINTES :\n" + f.attachmentTexts.map((a) => `# ${a.name}\n${a.text}`).join("\n\n");
+    }
+    return {
+      marker: `E${i}`,
+      id: f.id,
+      kind: "email" as const,
+      date: new Date(iso).toLocaleDateString("fr-CH"),
+      sortKey: new Date(iso).getTime() || 0,
+      participants: `${from || "?"}${to.length ? ` → ${to.slice(0, 4).join(", ")}` : ""}`,
+      subject: f.subject || "(sans objet)",
+      webLink: f.webLink,
+      body,
+    };
+  });
+
+  const self = selfIdentity();
+  const meetingDesc = `la réunion « ${event.subject} »${eventBody ? ` (${eventBody})` : ""}`;
+  onProgress({ phase: "summarizing_participants", message: `Analyse 20-par-20 de ${records.length} emails (filtrés sur le sujet de la réunion)…`, percent: 40 });
+
+  const { major, intro, conclusion } = await analyzeRecordsToReport(records, {
+    topic: event.subject,
+    focus: `Préparer la réunion « ${event.subject} » POUR ${self.name}${self.email ? ` (${self.email})` : ""}, l'utilisateur qui y participe (écris de son point de vue, ne le cite pas à la 3e personne). ${eventBody}`,
+    language: opts.language,
+    ignoreMinor: false,
+    withDetailParagraph: true,
+    withCurated: false, // deep meeting report = major decisions + synthesis only
+    relevanceHint: meetingDesc,
+    onProgress: (p) => onProgress({ phase: "generating_briefing", message: p.message, percent: Math.min(95, 40 + Math.round(p.percent * 0.5)) }),
+    log: (m) => console.log(`[MeetingPrep:deep] ${m}`),
+  });
+
+  const decisionReport: DecisionReport = {
+    topic: event.subject,
+    generatedOn: new Date().toLocaleDateString("fr-CH"),
+    emailsScanned: records.length,
+    intro,
+    detailed: [], // dropped on purpose — most participant mails are off-topic
+    curated: [],
+    major,
+    conclusion,
+    language: opts.language,
+    mode: "deep",
+  };
+
+  // Stream a chat-facing summary (intro + major decisions + synthesis).
+  const lines: string[] = [];
+  lines.push(`## Préparation — ${event.subject}`);
+  lines.push("");
+  lines.push(intro);
+  lines.push("");
+  lines.push(`### Points / décisions majeurs (${major.length})`);
+  for (const m of major) lines.push(`- **${m.title}** — ${m.summary}`);
+  lines.push("");
+  lines.push(`### Synthèse`);
+  lines.push(conclusion);
+  lines.push("");
+  lines.push(`📄 **Rapport Word téléchargé** (préparation approfondie) — ${major.length} points majeurs + synthèse, avec liens cliquables vers les emails sources, sur ${records.length} emails analysés.`);
+  const chatMd = lines.join("\n");
+  onStream(chatMd);
+
+  // Per-participant counts for stats.
+  const countByP = new Map<string, number>();
+  for (const item of dedupedLight) countByP.set(item.participantEmail, (countByP.get(item.participantEmail) || 0) + 1);
+  const participantBriefings: ParticipantBriefing[] = participants.map((p) => ({
+    participant: p,
+    summary: "(mode approfondi — voir le rapport Word)",
+    emailCount: countByP.get(p.email) || 0,
+    relevantEmailIds: [],
+  }));
+
+  onProgress({ phase: "done", message: "Préparation approfondie terminée !", percent: 100 });
+
+  return {
+    event,
+    participants,
+    participantBriefings,
+    finalBriefing: chatMd,
+    mode: "deep",
+    decisionReport,
   };
 }

@@ -1,0 +1,9 @@
+# Ignore propre à glm-agent-server/Dockerfile (BuildKit le préfère au
+# .dockerignore racine, qui exclut glm-agent-server/ pour le build du front).
+# Liste blanche : seuls les fichiers que le Dockerfile copie partent au daemon.
+**
+!glm-agent-server/package.json
+!glm-agent-server/package-lock.json
+!glm-agent-server/tsconfig.json
+!glm-agent-server/src
+!assets/skills
