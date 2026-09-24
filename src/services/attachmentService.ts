@@ -131,7 +131,7 @@ function attachmentKind(contentType: string, name: string): AttachmentKind | nul
 }
 
 // Default per-attachment extraction cap. Callers that summarize a single open
-// email pass a much larger budget (Kimi K2.6 has a 256k-token context), while
+// email pass a much larger budget (Kimi K2.7 has a 256k-token context), while
 // read_email_attachments / meeting prep keep this moderate default so reading
 // several attachments at once doesn't blow the context window.
 const MAX_TEXT_LENGTH = 30000;

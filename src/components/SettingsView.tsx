@@ -13,7 +13,9 @@ import {
 } from "@fluentui/react-components";
 import { Settings24Regular, Checkmark24Regular } from "@fluentui/react-icons";
 import { config } from "../config";
-import { saveRcpSettings, loadRcpSettings } from "../services/rcpApiService";
+import { saveRcpSettings, loadRcpSettings, isThinkingEnabled, setThinkingEnabled } from "../services/rcpApiService";
+import { persistSetting } from "../services/settingsStore";
+import { isUltraEngine, setUltraEngine, getUltraBackendUrl } from "../services/glmAgentService";
 import {
   isAuthenticated,
   isUsingNaa,
@@ -24,12 +26,6 @@ import {
   reconnect,
   onAuthStateChanged,
 } from "../services/authService";
-
-const AVAILABLE_MODELS = [
-  "moonshotai/Kimi-K2.6",
-  "mistralai/Mistral-Small-3.2-24B-Instruct-2506-bfloat16",
-  "openai/gpt-oss-120b",
-];
 
 const useStyles = makeStyles({
   container: { display: "flex", flexDirection: "column", gap: "16px" },
@@ -65,16 +61,20 @@ const useStyles = makeStyles({
   },
 });
 
-const CUSTOM_MODEL_VALUE = "__custom__";
+// Trois profils sur un modèle unique (GLM-5.3-Flash), comme Personal RAG :
+//   standard  réflexion réduite (`reasoning_effort: low`)
+//   advanced  réflexion libre
+//   ultra     onglet Assistant délégué au backend agent (glm-agent-server/,
+//             harness OpenHands), réflexion libre ; les autres onglets
+//             appellent RCP en direct.
+type AssistantProfile = "standard" | "advanced" | "ultra";
 
 export const SettingsView: React.FC = () => {
   const styles = useStyles();
   const [rcpUrl, setRcpUrl] = useState("");
   const [rcpKey, setRcpKey] = useState("");
-  const [rcpModel, setRcpModel] = useState("");
   const [customPrompt, setCustomPrompt] = useState("");
-  // True when the user picked "Autre…" to type a model not in the preset list.
-  const [customModelMode, setCustomModelMode] = useState(false);
+  const [profile, setProfile] = useState<AssistantProfile>("standard");
   // Auth status is module-level state in authService — re-render when it changes.
   const [, setAuthTick] = useState(0);
   const [connecting, setConnecting] = useState(false);
@@ -94,11 +94,11 @@ export const SettingsView: React.FC = () => {
     const settings = loadRcpSettings();
     setRcpUrl(settings.baseUrl);
     setRcpKey(settings.apiKey);
-    setRcpModel(settings.model);
     setCustomPrompt(settings.customPrompt);
     setOcrEnabled(localStorage.getItem("ocr_enabled") !== "false");
     const self = localStorage.getItem("meeting_self_default");
     setMeetingSelfDefault(self === "include" || self === "exclude" ? self : "unset");
+    setProfile(isUltraEngine() ? "ultra" : isThinkingEnabled() ? "advanced" : "standard");
     loadedRef.current = true;
   }, []);
 
@@ -108,17 +108,17 @@ export const SettingsView: React.FC = () => {
   // Auto-save on every change once the initial values are loaded.
   useEffect(() => {
     if (!loadedRef.current) return;
-    saveRcpSettings(rcpUrl, rcpKey, rcpModel, customPrompt);
+    saveRcpSettings(rcpUrl, rcpKey, config.rcp.defaultModel, customPrompt);
     // Store only the "off" state — absence of the key means OCR is on (default).
-    if (ocrEnabled) localStorage.removeItem("ocr_enabled");
-    else localStorage.setItem("ocr_enabled", "false");
+    persistSetting("ocr_enabled", ocrEnabled ? null : "false");
     // Absence of the key means "unset" (the assistant asks before scheduling).
-    if (meetingSelfDefault === "unset") localStorage.removeItem("meeting_self_default");
-    else localStorage.setItem("meeting_self_default", meetingSelfDefault);
+    persistSetting("meeting_self_default", meetingSelfDefault === "unset" ? null : meetingSelfDefault);
+    setUltraEngine(profile === "ultra");
+    setThinkingEnabled(profile !== "standard");
     setSaved(true);
     clearTimeout(savedTimer.current);
     savedTimer.current = setTimeout(() => setSaved(false), 1500);
-  }, [rcpUrl, rcpKey, rcpModel, customPrompt, ocrEnabled, meetingSelfDefault]);
+  }, [rcpUrl, rcpKey, customPrompt, ocrEnabled, meetingSelfDefault, profile]);
 
   const handleSignIn = async () => {
     setConnecting(true);
@@ -355,38 +355,27 @@ export const SettingsView: React.FC = () => {
         </div>
 
         <div className={styles.field}>
-          <Label htmlFor="rcp-model" size="small">
-            Modèle
+          <Label htmlFor="rcp-profile" size="small">
+            Profil de l'assistant
           </Label>
           <select
-            id="rcp-model"
+            id="rcp-profile"
             className={styles.select}
-            value={customModelMode || (rcpModel && !AVAILABLE_MODELS.includes(rcpModel)) ? CUSTOM_MODEL_VALUE : rcpModel}
-            onChange={(e) => {
-              const v = e.target.value;
-              if (v === CUSTOM_MODEL_VALUE) {
-                setCustomModelMode(true);
-              } else {
-                setCustomModelMode(false);
-                setRcpModel(v);
-              }
-            }}
+            value={profile}
+            onChange={(e) => setProfile(e.target.value as AssistantProfile)}
           >
-            {AVAILABLE_MODELS.map((model) => (
-              <option key={model} value={model}>
-                {model}
-              </option>
-            ))}
-            <option value={CUSTOM_MODEL_VALUE}>Autre (personnalisé)…</option>
+            <option value="standard">Standard — réflexion réduite, rapide</option>
+            <option value="advanced">Advanced — réflexion approfondie, plus lent</option>
+            <option value="ultra">⚡ Ultra — agent autonome (expérimental)</option>
           </select>
-          {(customModelMode || (rcpModel && !AVAILABLE_MODELS.includes(rcpModel))) && (
-            <Input
-              aria-label="Modèle personnalisé"
-              placeholder="Saisir un identifiant de modèle"
-              value={rcpModel}
-              onChange={(_, data) => setRcpModel(data.value)}
-            />
-          )}
+          <Text size={200}>
+            {profile === "standard" &&
+              "Un seul modèle, GLM-5.3-Flash, qui réfléchit peu avant de répondre : aussi bon pour lire vos emails et documents, et bien plus rapide."}
+            {profile === "advanced" &&
+              "Le même modèle, GLM-5.3-Flash, laissé libre de réfléchir avant de répondre : meilleur sur les questions qui demandent de trier et recouper, mais plus lent. Vaut pour tous les onglets."}
+            {profile === "ultra" &&
+              `L'onglet Assistant passe par le backend agent (${getUltraBackendUrl()}) : GLM-5.3-Flash en réflexion libre, dans le harness agentique open source OpenHands. Les autres onglets (Réunion, résumés…) appellent le modèle directement, en réflexion libre aussi.`}
+          </Text>
         </div>
 
         <div className={styles.field}>
@@ -422,6 +411,20 @@ export const SettingsView: React.FC = () => {
             )}
           </Text>
         </div>
+      </div>
+
+      {/* Retours utilisateurs */}
+      <div className={styles.section}>
+        <Text weight="semibold" size={200}>
+          Vos retours
+        </Text>
+        <Text size={200}>
+          Un bug, une suggestion, un cas d'usage qui manque ? Écrivez-nous à{" "}
+          <a href="mailto:feedback_genai@epfl.ch?subject=EPFL%20Mail%20AI%20%E2%80%94%20retour">
+            feedback_genai@epfl.ch
+          </a>
+          . Vos retours orientent directement les prochaines versions.
+        </Text>
       </div>
 
       {/* Version déployée — permet de vérifier que le cache est à jour */}

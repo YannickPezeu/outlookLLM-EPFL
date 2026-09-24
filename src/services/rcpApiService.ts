@@ -1,4 +1,5 @@
 import { config } from "../config";
+import { persistSetting } from "./settingsStore";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -52,22 +53,50 @@ export interface ToolCallResponse {
 
 // ─── RCP API Client ──────────────────────────────────────────────────
 
+// Le modèle n'est plus un choix de l'usager (24.09.2026) : un seul modèle,
+// GLM-5.3-Flash, pour toutes les fonctions. Un `rcp_model` resté en
+// localStorage (Kimi, Mistral, gpt-oss, saisie libre) est ignoré.
 function getRcpConfig() {
   // Allow runtime override from localStorage (user settings in UI)
   const storedUrl = localStorage.getItem("rcp_base_url");
   const storedKey = localStorage.getItem("rcp_api_key");
-  const storedModel = localStorage.getItem("rcp_model");
 
   return {
     baseUrl: storedUrl || config.rcp.baseUrl,
     apiKey: storedKey || config.rcp.apiKey,
-    model: storedModel || config.rcp.defaultModel,
+    model: config.rcp.defaultModel,
   };
 }
 
+// ─── Profil de réflexion ─────────────────────────────────────────────
+// Standard (défaut) : réflexion réduite. Advanced et Ultra : réflexion libre.
+// Même compromis que Personal RAG, mesuré par DPO-Agent/docs/loadtest/
+// resultats-2026-09-15.md : `low` ne coûte rien en lecture de document pour
+// sept fois moins de jetons, et 0,19 point sur les questions de recherche.
+const THINKING_KEY = "assistant_thinking";
+
+export function isThinkingEnabled(): boolean {
+  return localStorage.getItem(THINKING_KEY) === "on";
+}
+
+export function setThinkingEnabled(enabled: boolean): void {
+  // Absence de la clé = réflexion réduite (défaut).
+  persistSetting(THINKING_KEY, enabled ? "on" : null);
+}
+
+// Réflexion libre : jetons réservés à la réflexion EN PLUS du plafond de
+// réponse demandé par l'appelant, pour qu'elle ne mange pas la réponse (les
+// appels JSON à 2-4k jetons rendraient sinon un contenu vide). Le profil libre
+// produit ~4 300 jetons par réponse en moyenne au banc de DPO-Agent.
+const THINKING_HEADROOM_TOKENS = 24_576;
+
 // Max context window (tokens) per model family — probed on RCP (2026-06):
-// Kimi-K2.6 = 262144, gpt-oss-120b = 131072, Mistral-Small-3.2 = 131072.
+// Kimi-K2.7-Code = 262144, gpt-oss-120b = 131072, Mistral-Small-3.2 = 131072.
 const MODEL_CONTEXT_TOKENS: Array<[RegExp, number]> = [
+  // GLM-5.3-Flash sert 1 048 576 jetons (mesuré sur RCP le 22.09.2026), mais on
+  // plafonne volontairement au budget de Kimi : à un million de jetons, le seul
+  // prefill prend ~87 s. La réunion et les résumés gardent leur comportement.
+  [/glm-5/i, 262144],
   [/kimi-k2/i, 262144],
   [/gpt-oss/i, 131072],
   [/mistral-small|ministral|magistral|devstral/i, 131072],
@@ -156,9 +185,27 @@ function truncateMessagesToBudget<T extends { content: string | null }>(
 // is silently ignored by Kimi). Each model family has its own key, so we scope by
 // model name. Verified on RCP 2026-05-28 (DPO-Agent probe_kimi_thinking.py):
 // chat_template_kwargs.thinking=false → 0 reasoning chars, ~1s vs 2-4s.
+//
+// ⚠️ Scoped to K2.5/K2.6 ONLY. Re-probed on K2.7-Code 2026-07-30: there the flag
+// does not suppress reasoning, it MOVES it out of reasoning_content (which our
+// SSE parser drops) and into content (which we render). Same one-answer question:
+// 273 chars of rambling instead of 12, and slower (16.7s vs 13.9s at 200k tokens).
+// Left alone, K2.7-Code keeps its reasoning in reasoning_content — exactly what we
+// want. Do not widen this regex to new Kimi releases without re-running the probe.
 function applyModelTweaks(body: Record<string, unknown>): Record<string, unknown> {
   const model = typeof body.model === "string" ? body.model : "";
-  if (/kimi-k2/i.test(model)) {
+  // GLM-5.x : `reasoning_effort: "low"` est le SEUL levier qui coupe la
+  // réflexion. ⚠️ `chat_template_kwargs.enable_thinking: false` ne la coupe
+  // pas : il la déverse dans `content` à la place de la réponse, sans erreur.
+  if (/glm-5/i.test(model)) {
+    if (isThinkingEnabled()) {
+      body.max_tokens = (body.max_tokens as number) + THINKING_HEADROOM_TOKENS;
+    } else {
+      body.reasoning_effort = "low";
+    }
+    return body;
+  }
+  if (/kimi-k2\.[56]/i.test(model)) {
     const existing = (body.chat_template_kwargs as Record<string, unknown>) ?? {};
     body.chat_template_kwargs = { ...existing, thinking: false };
     // Moonshot's published spec for NON-thinking mode requires these sampling
@@ -171,6 +218,30 @@ function applyModelTweaks(body: Record<string, unknown>): Record<string, unknown
     body.presence_penalty = 0.0;
   }
   return body;
+}
+
+// ─── Comptage de tokens ──────────────────────────────────────────────
+// Listener global posé par l'UI (AssistantView) le temps d'un runAgent :
+// chaque appel RCP (stream ou non) remonte son usage. Les features hors
+// assistant (prépa réunion, résumés) ne comptent que si le listener est actif.
+
+export interface RcpUsageDelta {
+  input: number;
+  output: number;
+}
+
+let usageListener: ((delta: RcpUsageDelta) => void) | null = null;
+
+export function setRcpUsageListener(listener: ((delta: RcpUsageDelta) => void) | null): void {
+  usageListener = listener;
+}
+
+function reportUsage(usage: unknown): void {
+  if (!usageListener || !usage) return;
+  const u = usage as { prompt_tokens?: number; completion_tokens?: number };
+  const input = u.prompt_tokens || 0;
+  const output = u.completion_tokens || 0;
+  if (input || output) usageListener({ input, output });
 }
 
 /**
@@ -199,6 +270,11 @@ function buildChatBody(opts: {
     max_tokens: opts.maxTokens ?? 8192,
     stream: opts.stream,
   };
+  if (opts.stream) {
+    // Le dernier chunk SSE porte alors l'usage (prompt/completion_tokens) —
+    // consommé par reportUsage pour le compteur de tokens de l'assistant.
+    body.stream_options = { include_usage: true };
+  }
   if (opts.tools && opts.tools.length > 0) {
     body.tools = opts.tools;
     body.tool_choice = "auto";
@@ -239,7 +315,9 @@ export async function chatCompletion(
     throw new Error(`RCP API error ${response.status}: ${errorText}`);
   }
 
-  return response.json();
+  const json: ChatCompletionResponse = await response.json();
+  reportUsage((json as unknown as { usage?: unknown }).usage);
+  return json;
 }
 
 /**
@@ -309,6 +387,7 @@ export async function chatCompletionStream(
 
       try {
         const parsed = JSON.parse(data);
+        if (parsed.usage) reportUsage(parsed.usage); // dernier chunk (include_usage)
         const delta = parsed.choices?.[0]?.delta?.content;
         if (delta) {
           fullText += delta;
@@ -358,7 +437,9 @@ export async function chatCompletionWithTools(
     throw new Error(`RCP API error ${response.status}: ${errorText}`);
   }
 
-  return response.json();
+  const json: ToolCallResponse = await response.json();
+  reportUsage((json as unknown as { usage?: unknown }).usage);
+  return json;
 }
 
 /**
@@ -442,6 +523,7 @@ export async function chatCompletionWithToolsStream(
 
       try {
         const parsed = JSON.parse(data);
+        if (parsed.usage) reportUsage(parsed.usage); // dernier chunk (include_usage)
         const choice = parsed.choices?.[0];
         if (!choice) continue;
 
@@ -679,13 +761,14 @@ export function saveRcpSettings(
   model: string,
   customPrompt?: string
 ): void {
-  localStorage.setItem("rcp_base_url", baseUrl);
-  localStorage.setItem("rcp_api_key", apiKey);
-  localStorage.setItem("rcp_model", model);
+  // persistSetting écrit en localStorage ET OfficeRuntime.storage : sur Outlook
+  // desktop le localStorage seul peut être purgé au redémarrage (clé API perdue).
+  persistSetting("rcp_base_url", baseUrl);
+  persistSetting("rcp_api_key", apiKey);
+  persistSetting("rcp_model", model);
   if (typeof customPrompt === "string") {
     const trimmed = customPrompt.trim();
-    if (trimmed) localStorage.setItem("user_custom_prompt", trimmed);
-    else localStorage.removeItem("user_custom_prompt");
+    persistSetting("user_custom_prompt", trimmed || null);
   }
 }
 

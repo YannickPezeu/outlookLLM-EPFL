@@ -50,8 +50,24 @@ function notifyAuthChanged(): void {
   authListeners.forEach((l) => l());
 }
 
+// Dernier id_token Entra vu (flux OIDC). Utilisé comme token DÉLÉGUÉ pour les
+// services EPFL hors Graph (recherche KB ServiceNow via hierarchical-search,
+// modèle OBO identique à l'extension DPO-Agent). Rafraîchi à chaque acquisition.
+let lastIdToken: string | null = null;
+
+/**
+ * L'id_token Entra de l'utilisateur connecté (null en mode dev token ou si
+ * MSAL n'a pas encore émis de résultat). Expire ~1h — rafraîchi au fil des
+ * acquisitions Graph, donc valide tant que la session l'est.
+ */
+export function getIdToken(): string | null {
+  const fromAccount = (getAccount() as { idToken?: string } | null)?.idToken;
+  return fromAccount || lastIdToken;
+}
+
 /** Record a successful token acquisition and surface the account to MSAL's cache. */
 function markAuthenticated(result: AuthenticationResult): void {
+  if (result.idToken) lastIdToken = result.idToken;
   const wasAuthenticated = tokenAuthenticated && !userSignedOut && !authFailed;
   tokenAuthenticated = true;
   userSignedOut = false;

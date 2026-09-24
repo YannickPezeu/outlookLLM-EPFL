@@ -28,7 +28,10 @@ export const config = {
       ? "https://expert-finder.epfl.ch/outlook/api/rcp"
       : "https://inference.rcp.epfl.ch/v1",
     apiKey: "", // User sets this in the UI settings, or stored in localStorage
-    defaultModel: "moonshotai/Kimi-K2.6",
+    // Modèle UNIQUE depuis le 24.09.2026, comme Personal RAG (DPO-Agent) : les
+    // profils Standard / Advanced ne changent que la réflexion accordée (cf.
+    // rcpApiService.isThinkingEnabled), Ultra passe par le backend agent.
+    defaultModel: "zai-org/GLM-5.3-Flash",
     embeddingModel: "Qwen/Qwen3-Embedding-8B",
     // Vision-LLM OCR for scanned PDF attachments (image-only pages). Same RCP
     // endpoint/key as chat — see attachmentService. PaddleOCR-VL handles accented

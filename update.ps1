@@ -16,15 +16,24 @@ $env:ENTRA_TENANT_ID = "f6c2556a-c4fb-4ab1-a2c7-9e220df11c43"
 $BUILD_TIME = Get-Date -Format "o"
 Write-Host "Build time: $BUILD_TIME" -ForegroundColor DarkGray
 
+# Tests unitaires d'abord : rien ne part si l'un échoue.
+# (Un échec de commande native n'arrête PAS PowerShell malgré
+# $ErrorActionPreference : d'où les tests explicites de $LASTEXITCODE.)
+Write-Host "=== 0/4 Tests ===" -ForegroundColor Cyan
+npm test
+if ($LASTEXITCODE -ne 0) { throw "npm test failed" }
+
 Write-Host "=== 1/4 Building Docker image ===" -ForegroundColor Cyan
 docker build `
   --build-arg ENTRA_CLIENT_ID=$env:ENTRA_CLIENT_ID `
   --build-arg ENTRA_TENANT_ID=$env:ENTRA_TENANT_ID `
   --build-arg BUILD_TIME=$BUILD_TIME `
   -t $IMAGE .
+if ($LASTEXITCODE -ne 0) { throw "docker build failed" }
 
 Write-Host "=== 2/4 Pushing image ===" -ForegroundColor Cyan
 docker push $IMAGE
+if ($LASTEXITCODE -ne 0) { throw "docker push failed" }
 
 Write-Host "=== 3/4 Restarting deployment ===" -ForegroundColor Cyan
 kubectl rollout restart deployment/$DEPLOYMENT -n $NAMESPACE

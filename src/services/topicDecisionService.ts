@@ -49,7 +49,7 @@ const ATTACH_BUDGET_SOFT = 2000; // smaller portion kept per item (soft / quick 
 const MAX_MAJOR_SOURCES_FOR_DETAIL = 12; // source items fed to the detail LLM call
 const PER_MAIL_BODY_CHARS = 16000; // cap per cleaned body (most emails fit in full)
 const BATCH_MAX_MAILS = 20; // "20 par 20"
-// Per-batch char ceiling. Kimi K2.6 has a 256k-token window (~900k chars), so
+// Per-batch char ceiling. Kimi K2.7 has a 256k-token window (~900k chars), so
 // 450k chars (~130k tokens) leaves ample room for the system prompt + output.
 // With the 20-mail cap and 16k/mail above, a worst-case batch ≈ 320k chars, so
 // this mostly acts as a safety net against a few very long threads.

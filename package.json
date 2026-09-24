@@ -10,7 +10,8 @@
     "build:k8s": "webpack --mode production --env k8s",
     "start": "webpack serve --mode development --https",
     "lint": "eslint src/**/*.{ts,tsx}",
-    "sideload": "npx office-addin-dev-certs install && webpack serve --mode development --https"
+    "sideload": "npx office-addin-dev-certs install && webpack serve --mode development --https",
+    "test": "tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@azure/msal-browser": "^3.6.0",
